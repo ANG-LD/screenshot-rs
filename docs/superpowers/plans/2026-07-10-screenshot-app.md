@@ -1053,8 +1053,9 @@ impl HotkeyService {
             .map_err(|e| AppError::Hotkey(format!("注册 alt+s 失败：{e}")))?;
 
         // 启动监听线程：把 global-hotkey 事件转成我们的 HotkeyEvent
+        let thread_tx = event_tx.clone();
         std::thread::spawn(move || {
-            let event_tx = event_tx;
+            let event_tx = thread_tx;
             loop {
                 if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
                     if event.state == HotKeyState::Pressed {
