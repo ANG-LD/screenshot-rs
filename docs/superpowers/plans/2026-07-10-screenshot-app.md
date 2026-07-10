@@ -830,7 +830,7 @@ impl ScreenCapture for PlatformScreenCapture {
         Ok(CapturedFrame {
             width: image.width(),
             height: image.height(),
-            pixels: image.into_raw(), // screenshots crate 输出 RGBA
+            pixels: image.into(), // screenshots crate 输出 RGBA
         })
     }
 
@@ -907,7 +907,7 @@ impl ScreenCapture for PlatformScreenCapture {
         Ok(CapturedFrame {
             width: image.width(),
             height: image.height(),
-            pixels: image.into_raw(),
+            pixels: image.into(),
         })
     }
 
