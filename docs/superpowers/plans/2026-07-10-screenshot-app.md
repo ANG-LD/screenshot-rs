@@ -236,7 +236,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("屏幕捕获失败：{0}")]
-    Capture(#[from] screenshots::ScreenShotError),
+    Capture(String),
 
     #[error("剪贴板写入失败：{0}")]
     Clipboard(#[from] arboard::Error),
@@ -820,13 +820,13 @@ impl PlatformScreenCapture {
 impl ScreenCapture for PlatformScreenCapture {
     fn capture_primary(&self) -> AppResult<CapturedFrame> {
         // 获取所有屏幕，取第一个作为主屏
-        let screens = Screen::all().map_err(crate::error::AppError::Capture)?;
+        let screens = Screen::all().map_err(|e| crate::error::AppError::Capture(e.to_string()))?;
         let screen = screens
             .into_iter()
             .next()
             .ok_or_else(|| crate::error::AppError::Window("未检测到任何显示器".into()))?;
 
-        let image = screen.capture().map_err(crate::error::AppError::Capture)?;
+        let image = screen.capture().map_err(|e| crate::error::AppError::Capture(e.to_string()))?;
         Ok(CapturedFrame {
             width: image.width(),
             height: image.height(),
