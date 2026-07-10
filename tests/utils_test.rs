@@ -39,3 +39,53 @@ fn bounds_clamp_inside_limits() {
     assert_eq!(b.size.x, 100.0);
     assert_eq!(b.size.y, 100.0);
 }
+
+use screenshot_rs::utils::color::{hsv_to_rgb, rgb_to_hsv};
+
+#[test]
+fn hsv_red_is_pure_red() {
+    let (r, g, b) = hsv_to_rgb(0.0, 1.0, 1.0);
+    assert_eq!(r, 255);
+    assert_eq!(g, 0);
+    assert_eq!(b, 0);
+}
+
+#[test]
+fn hsv_green_is_pure_green() {
+    let (r, g, b) = hsv_to_rgb(120.0, 1.0, 1.0);
+    assert_eq!(r, 0);
+    assert_eq!(g, 255);
+    assert_eq!(b, 0);
+}
+
+#[test]
+fn hsv_blue_is_pure_blue() {
+    let (r, g, b) = hsv_to_rgb(240.0, 1.0, 1.0);
+    assert_eq!(r, 0);
+    assert_eq!(g, 0);
+    assert_eq!(b, 255);
+}
+
+#[test]
+fn hsv_white_is_pure_white() {
+    let (r, g, b) = hsv_to_rgb(0.0, 0.0, 1.0);
+    assert_eq!(r, 255);
+    assert_eq!(g, 255);
+    assert_eq!(b, 255);
+}
+
+#[test]
+fn hsv_black_is_pure_black() {
+    let (r, g, b) = hsv_to_rgb(0.0, 0.0, 0.0);
+    assert_eq!(r, 0);
+    assert_eq!(g, 0);
+    assert_eq!(b, 0);
+}
+
+#[test]
+fn rgb_to_hsv_roundtrip_red() {
+    let (h, s, v) = rgb_to_hsv(255, 0, 0);
+    assert!((h - 0.0).abs() < 0.01);
+    assert!((s - 1.0).abs() < 0.01);
+    assert!((v - 1.0).abs() < 0.01);
+}
