@@ -8,6 +8,7 @@ use crate::clipboard::ClipboardService;
 use crate::error::AppResult;
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::tray::{TrayMenuEvent, TrayService};
+use crate::utils::bounds::{Bounds, Point};
 
 /// 应用主状态
 pub struct AppState {
@@ -28,27 +29,22 @@ impl AppState {
     }
 
     /// 主事件循环（MVP 简化版）
-    ///
-    /// 监听热键和托盘事件，触发截图。
-    /// 实际 GPUI 窗口创建在 `run_overlay` 中处理（本任务只搭骨架）。
     pub fn run(&self) -> AppResult<()> {
         loop {
-            // 优先处理热键事件
             if let Some(event) = self.hotkey.try_recv() {
                 match event {
                     HotkeyEvent::TriggerScreenshot => {
                         tracing::info!("热键触发：开始截图");
-                        // TODO Task 13+: 调用 overlay::run_overlay
-                        // 临时仅打印日志
+                        self.trigger_screenshot()?;
                     }
                 }
             }
 
-            // 处理托盘事件
             if let Some(event) = self.tray.try_recv() {
                 match event {
                     TrayMenuEvent::TriggerScreenshot => {
                         tracing::info!("托盘触发：开始截图");
+                        self.trigger_screenshot()?;
                     }
                     TrayMenuEvent::Quit => {
                         tracing::info!("托盘触发：退出");
@@ -57,8 +53,34 @@ impl AppState {
                 }
             }
 
-            // 避免空转
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// 触发一次截图：捕获屏幕 → 打开覆盖窗口 → 取选区 → 复制到剪贴板
+    fn trigger_screenshot(&self) -> AppResult<()> {
+        let frame = self.capture.capture_primary()?;
+        let screen_bounds = Bounds::new(
+            Point::ZERO,
+            Point::new(frame.width as f32, frame.height as f32),
+        );
+
+        // 真实实现需要在 GPUI 主线程中运行 run_overlay
+        // MVP 阶段：仅记录日志，暂未集成 GPUI 窗口
+        tracing::info!(
+            "捕获到 {}x{} 帧，覆盖窗口 bounds={:?}",
+            frame.width,
+            frame.height,
+            screen_bounds
+        );
+
+        // TODO: 接入 GPUI 事件循环
+        // let region = run_overlay(...);
+        // if let Some(r) = region {
+        //     let clipped = frame.clip_region(r.origin.x as u32, r.origin.y as u32, r.size.x as u32, r.size.y as u32)?;
+        //     self.clipboard.write_frame(&clipped)?;
+        // }
+
+        Ok(())
     }
 }
