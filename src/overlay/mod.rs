@@ -1,12 +1,21 @@
-//! 截图选区遮罩模块
+//! 截图覆盖窗口模块
 //!
-//! 使用 GPUI 渲染全屏半透明遮罩窗口，覆盖在所有屏幕之上。
-//! 用户通过鼠标拖拽选择截图区域，并显示浮动工具栏。
-//!
-//! 计划：
-//! - 全屏遮罩窗口（Task 14：GPUI 渲染入口）
-//! - 选区拖拽逻辑（Task 13：鼠标事件处理）
-//! - 浮动工具栏（Task 15：保存 / 复制 / 取消）
-//! - 状态机与窗口工厂（Task 12）
-//!
-//! 完整实现在后续 Task 12-15 中完成。
+//! 状态机：`Idle → Selecting → Editing → Idle`
+//! GPUI 渲染层入口 `run_overlay` 在 `selection.rs` 中实现（Task 14）。
+
+pub mod drawing;
+pub mod selection;
+pub mod toolbar;
+
+/// 覆盖窗口状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayState {
+    /// 待命：窗口未创建
+    Idle,
+    /// 选区拖拽中：显示 dim 背景 + 选区矩形
+    Selecting,
+    /// 工具栏编辑：显示选区边框 + 工具栏
+    Editing,
+    /// 关闭中：清理资源
+    Closing,
+}
