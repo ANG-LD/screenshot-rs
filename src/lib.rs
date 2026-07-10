@@ -1,0 +1,12 @@
+//! screenshot-rs 库入口
+//!
+//! 暴露所有子模块给集成测试和外部调用者。
+
+pub mod app;
+pub mod capture;
+pub mod clipboard;
+pub mod error;
+pub mod hotkey;
+pub mod overlay;
+pub mod tray;
+pub mod utils;
