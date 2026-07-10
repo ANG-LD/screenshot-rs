@@ -1140,14 +1140,14 @@ impl TrayService {
         let menu = Menu::new();
         let screenshot_item = MenuItem::new("截图", true, None);
         let quit_item = MenuItem::new("退出", true, None);
-        menu.append(&screenshot_item).map_err(AppError::Tray)?;
-        menu.append(&quit_item).map_err(AppError::Tray)?;
+        menu.append(&screenshot_item).map_err(|e| AppError::Tray(e.to_string()))?;
+        menu.append(&quit_item).map_err(|e| AppError::Tray(e.to_string()))?;
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("screenshot-rs")
             .build()
-            .map_err(AppError::Tray)?;
+            .map_err(|e| AppError::Tray(e.to_string()))?;
 
         // 监听菜单点击事件
         let (event_tx, event_rx): (Sender<TrayMenuEvent>, Receiver<TrayMenuEvent>) =
