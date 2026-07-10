@@ -1,9 +1,30 @@
-//! 统一错误类型模块
+//! 应用统一错误类型
 //!
-//! 使用 `thiserror` 定义项目统一的错误枚举 `AppError`，
-//! 覆盖截图、剪贴板、文件 IO、配置等领域的失败场景。
-//!
-//! 占位 - Task 2 填充完整实现：
-//! - `AppError` 枚举与 `Result<T>` 类型别名
-//! - 各子模块（capture / clipboard / tray 等）的错误转换
-//! - 与 `anyhow` 的协同使用策略
+//! 所有模块的错误通过 `AppError` 向上传播。库代码使用 `Result<T, AppError>`，
+//! 入口 `main.rs` 用 `anyhow::Result` 兜底。
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum AppError {
+    #[error("屏幕捕获失败：{0}")]
+    Capture(String),
+
+    #[error("剪贴板写入失败：{0}")]
+    Clipboard(#[from] arboard::Error),
+
+    #[error("热键注册失败：{0}")]
+    Hotkey(String),
+
+    #[error("托盘创建失败：{0}")]
+    Tray(String),
+
+    #[error("窗口操作失败：{0}")]
+    Window(String),
+
+    #[error("GPUI 错误：{0}")]
+    Gpui(String),
+}
+
+/// 应用统一 Result 别名
+pub type AppResult<T> = Result<T, AppError>;
