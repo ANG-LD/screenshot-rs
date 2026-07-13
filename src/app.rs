@@ -35,7 +35,9 @@ impl AppState {
                 match event {
                     HotkeyEvent::TriggerScreenshot => {
                         tracing::info!("热键触发：开始截图");
-                        self.trigger_screenshot()?;
+                        if let Err(e) = self.trigger_screenshot() {
+                            tracing::error!("截图失败：{e}");
+                        }
                     }
                 }
             }
@@ -44,7 +46,9 @@ impl AppState {
                 match event {
                     TrayMenuEvent::TriggerScreenshot => {
                         tracing::info!("托盘触发：开始截图");
-                        self.trigger_screenshot()?;
+                        if let Err(e) = self.trigger_screenshot() {
+                            tracing::error!("截图失败：{e}");
+                        }
                     }
                     TrayMenuEvent::Quit => {
                         tracing::info!("托盘触发：退出");
@@ -64,22 +68,31 @@ impl AppState {
             Point::ZERO,
             Point::new(frame.width as f32, frame.height as f32),
         );
+        tracing::info!("捕获到 {}x{} 帧", frame.width, frame.height);
 
-        // 真实实现需要在 GPUI 主线程中运行 run_overlay
-        // MVP 阶段：仅记录日志，暂未集成 GPUI 窗口
+        // GPUI 覆盖层（阻塞直到用户选完/取消）
+        let Some(region) = crate::overlay::window::run_blocking(frame.clone(), screen_bounds)
+        else {
+            tracing::info!("用户取消截图");
+            return Ok(());
+        };
         tracing::info!(
-            "捕获到 {}x{} 帧，覆盖窗口 bounds={:?}",
-            frame.width,
-            frame.height,
-            screen_bounds
+            "选区 origin=({}, {}) size={}x{}",
+            region.origin.x,
+            region.origin.y,
+            region.size.x,
+            region.size.y
         );
 
-        // TODO: 接入 GPUI 事件循环
-        // let region = run_overlay(...);
-        // if let Some(r) = region {
-        //     let clipped = frame.clip_region(r.origin.x as u32, r.origin.y as u32, r.size.x as u32, r.size.y as u32)?;
-        //     self.clipboard.write_frame(&clipped)?;
-        // }
+        // 裁剪并写入剪贴板
+        let clipped = frame.clip_region(
+            region.origin.x as u32,
+            region.origin.y as u32,
+            region.size.x as u32,
+            region.size.y as u32,
+        )?;
+        self.clipboard.write_frame(&clipped)?;
+        tracing::info!("截图已复制到剪贴板（{}x{}）", clipped.width, clipped.height);
 
         Ok(())
     }

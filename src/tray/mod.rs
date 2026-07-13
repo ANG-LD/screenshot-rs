@@ -97,6 +97,7 @@ impl TrayService {
             .with_tooltip("screenshot-rs")
             .build()
             .map_err(|e| AppError::Tray(e.to_string()))?;
+        tracing::info!("系统托盘图标创建成功（菜单：截图 / 退出）");
 
         // 创建业务层 mpsc channel，用于把 tray-icon 的全局 MenuEvent
         // 转换成自定义的 TrayMenuEvent。

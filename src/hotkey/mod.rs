@@ -58,6 +58,7 @@ impl HotkeyService {
         // 1. 创建底层全局热键管理器
         let manager = GlobalHotKeyManager::new()
             .map_err(|e| AppError::Hotkey(format!("创建全局热键管理器失败：{e}")))?;
+        tracing::info!("全局热键管理器创建成功");
 
         // 2. 创建自有事件通道（监听线程 → 业务侧）
         let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -68,6 +69,7 @@ impl HotkeyService {
         manager
             .register(hotkey)
             .map_err(|e| AppError::Hotkey(format!("注册 alt+s 失败：{e}")))?;
+        tracing::info!("已注册全局热键：alt+s（hotkey id = {}）", screenshot_id);
 
         // 4. 启动监听线程
         //    把底层 global-hotkey 事件转成我们自己的 HotkeyEvent
@@ -79,6 +81,11 @@ impl HotkeyService {
             let event_tx = tx_for_thread;
             loop {
                 if let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                    tracing::debug!(
+                        "热键事件：id={:?} state={:?}",
+                        event.id,
+                        event.state
+                    );
                     // 只关心按键按下事件（松开不重复触发）
                     if event.state == HotKeyState::Pressed {
                         // 这里目前只有一个热键（alt+s），因此直接发出截图事件；
