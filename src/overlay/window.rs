@@ -9,9 +9,9 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    Pixels, Point, Render, RenderImage, Size, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
+    App, Bounds, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, Point, Render, RenderImage, Size, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
@@ -31,6 +31,8 @@ pub struct OverlayView {
     selection: SelectionState,
     /// 选区结果回调
     tx: Sender<Option<ub::Bounds>>,
+    /// 键盘焦点句柄（让 Esc / Enter 能路由到这里）
+    focus_handle: FocusHandle,
 }
 
 impl OverlayView {
@@ -38,21 +40,21 @@ impl OverlayView {
         frame: &CapturedFrame,
         screen_bounds: ub::Bounds,
         tx: Sender<Option<ub::Bounds>>,
+        cx: &mut Context<Self>,
     ) -> Self {
         Self {
             frame_image: build_render_image(frame),
             screen_bounds,
             selection: SelectionState::new(screen_bounds),
             tx,
+            focus_handle: cx.focus_handle(),
         }
     }
 
     /// 发送结果并关闭窗口
-    fn commit(&self, result: Option<ub::Bounds>, window: &mut Window, cx: &mut Context<Self>) {
+    fn commit(&self, result: Option<ub::Bounds>, window: &mut Window) {
         let _ = self.tx.send(result);
         window.remove_window();
-        // 兜底：如果 remove_window 因为平台原因没让 app 退出，主动 quit
-        let _ = cx;
     }
 }
 
@@ -242,8 +244,10 @@ impl Render for OverlayView {
             },
         );
 
-        // Canvas 自身不能挂鼠标 handler；外面包一层 div 来接收事件
+        // Canvas 自身不能挂鼠标 handler；外面包一层 div 来接收事件。
+        // track_focus 让 Esc/Enter 能路由到 on_key_down 监听器。
         div()
+            .track_focus(&self.focus_handle)
             .size_full()
             .child(paint_canvas.size_full())
             .on_mouse_down(
@@ -258,25 +262,20 @@ impl Render for OverlayView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
+                cx.listener(|this, _, window, _cx| {
                     this.selection.mouse_up();
-                    let result = this
-                        .selection
-                        .current()
-                        .filter(|b| b.size.x >= 2.0 && b.size.y >= 2.0);
-                    this.commit(result, window, cx);
+                    // 任意大小选区都接受（clip_region 自然处理 < 1 像素情况）
+                    let result = this.selection.current();
+                    this.commit(result, window);
                 }),
             )
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {
                 if ev.keystroke.key == "escape" {
-                    this.commit(None, window, cx);
+                    this.commit(None, window);
                 } else if ev.keystroke.key == "enter" {
-                    let cur = this.selection.current();
-                    let result = match cur {
-                        Some(b) if b.size.x >= 2.0 && b.size.y >= 2.0 => Some(b),
-                        _ => Some(this.screen_bounds),
-                    };
-                    this.commit(result, window, cx);
+                    // Enter 直接确认当前选区；没有选区则全屏
+                    let result = this.selection.current().or(Some(this.screen_bounds));
+                    this.commit(result, window);
                 }
             }))
     }
@@ -308,7 +307,14 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> Option<u
                     focus: true,
                     ..Default::default()
                 },
-                move |_window, cx| cx.new(|_| OverlayView::new(&frame, screen_bounds, tx)),
+                move |window, cx| {
+                    let view = cx.new(|cx| OverlayView::new(&frame, screen_bounds, tx, cx));
+                    // 主动把焦点给到 view 自己的 focus_handle，
+                    // 这样 track_focus 的 div 能收到键盘事件
+                    let handle = view.read(cx).focus_handle.clone();
+                    handle.focus(window, cx);
+                    view
+                },
             )
             .expect("open_window 失败");
 
