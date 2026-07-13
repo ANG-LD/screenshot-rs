@@ -6,6 +6,7 @@
 pub mod drawing;
 pub mod selection;
 pub mod toolbar;
+pub mod window;
 
 /// 覆盖窗口状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
