@@ -71,26 +71,39 @@ impl AppState {
         tracing::info!("捕获到 {}x{} 帧", frame.width, frame.height);
 
         // GPUI 覆盖层（阻塞直到用户选完/取消）
-        let Some(region) = crate::overlay::window::run_blocking(frame.clone(), screen_bounds)
-        else {
+        let result = crate::overlay::window::run_blocking(frame.clone(), screen_bounds);
+        let Some(region) = result.selection else {
             tracing::info!("用户取消截图");
             return Ok(());
         };
         tracing::info!(
-            "选区 origin=({}, {}) size={}x{}",
+            "选区 origin=({}, {}) size={}x{}；标注 {} 笔",
             region.origin.x,
             region.origin.y,
             region.size.x,
-            region.size.y
+            region.size.y,
+            result.commands.len()
         );
 
         // 裁剪并写入剪贴板
-        let clipped = frame.clip_region(
+        let mut clipped = frame.clip_region(
             region.origin.x as u32,
             region.origin.y as u32,
             region.size.x as u32,
             region.size.y as u32,
         )?;
+
+        // 把可见的 DrawCommand 应用到裁剪后的 frame 上
+        // 命令的坐标是屏幕坐标，需要平移到 clipped 局部坐标
+        if !result.commands.is_empty() {
+            crate::overlay::commands::apply_commands(
+                &mut clipped,
+                region.origin.x,
+                region.origin.y,
+                &result.commands,
+            )?;
+        }
+
         self.clipboard.write_frame(&clipped)?;
         tracing::info!("截图已复制到剪贴板（{}x{}）", clipped.width, clipped.height);
 

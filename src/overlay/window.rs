@@ -13,12 +13,19 @@ use gpui::{
     MouseMoveEvent, Pixels, Point, Render, RenderImage, Size, Window, WindowBackgroundAppearance,
     WindowBounds, WindowKind, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
+use gpui_component::button::Button;
+use gpui_component::button::ButtonVariants;
+use gpui_component::Disableable;
+use gpui_component::IconName;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
 
 use crate::capture::CapturedFrame;
+use crate::overlay::drawing::{DrawCommand, DrawingState, RGBA};
+use crate::overlay::palette;
 use crate::overlay::selection::SelectionState;
+use crate::overlay::toolbar::{ToolButton, ToolbarState};
 use crate::utils::bounds::{self as ub, Point as BoundsPoint};
 
 /// 覆盖窗口交互状态机
@@ -39,18 +46,33 @@ pub struct OverlayView {
     /// 选区状态机
     selection: SelectionState,
     /// 选区结果回调
-    tx: Sender<Option<ub::Bounds>>,
+    tx: Sender<OverlayResult>,
     /// 键盘焦点句柄（让 Esc / Enter 能路由到这里）
     focus_handle: FocusHandle,
     /// 窗口交互模式：Selecting 还是 Editing
     mode: OverlayMode,
+    /// 工具栏状态：当前选中的工具 / 颜色 / 线宽
+    toolbar: ToolbarState,
+    /// 标注历史：含 undo / redo
+    drawing: DrawingState,
+    /// 当前正在画的一笔（mouse_down 到 mouse_up 之间）
+    in_progress: Option<DrawCommand>,
+}
+
+/// 覆盖窗口完成后回传给主线程的结果
+///
+/// `selection` 为 None 表示用户取消；否则 `selection` 是选区 bounds，
+/// `commands` 是 DrawingState 中所有可见（未撤销）的标注命令。
+pub struct OverlayResult {
+    pub selection: Option<ub::Bounds>,
+    pub commands: Vec<DrawCommand>,
 }
 
 impl OverlayView {
     fn new(
         frame: &CapturedFrame,
         screen_bounds: ub::Bounds,
-        tx: Sender<Option<ub::Bounds>>,
+        tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -60,18 +82,271 @@ impl OverlayView {
             tx,
             focus_handle: cx.focus_handle(),
             mode: OverlayMode::Selecting,
+            toolbar: ToolbarState::default(),
+            drawing: DrawingState::new(),
+            in_progress: None,
         }
     }
 
     /// 发送结果并关闭窗口
-    fn commit(&self, result: Option<ub::Bounds>, window: &mut Window) {
+    fn commit(&self, result: OverlayResult, window: &mut Window) {
         let _ = self.tx.send(result);
         window.remove_window();
+    }
+
+    /// 在 Editing 模式下，按当前 active_tool 启动一个新 DrawCommand
+    ///
+    /// 仅在 toolbar.active_tool 是绘图工具时被调用（调用方应已检查）。
+    /// Text 工具的 content 暂留空字符串，等 Phase 3 文字输入接入；当前
+    /// mouse_up 时空 content 会被忽略。
+    fn begin_draw(&mut self, p: BoundsPoint) {
+        let Some(tool) = self.toolbar.active_tool else { return };
+        let color = self.toolbar.current_color;
+        let lw = self.toolbar.line_width;
+        let dp = crate::overlay::drawing::Point::new(p.x, p.y);
+        self.in_progress = Some(match tool {
+            ToolButton::Rectangle => DrawCommand::Rectangle {
+                rect: (dp, dp),
+                color,
+                line_width: lw,
+            },
+            ToolButton::Arrow => DrawCommand::Arrow {
+                from: dp,
+                to: dp,
+                color,
+                line_width: lw,
+            },
+            ToolButton::Freehand => DrawCommand::Freehand {
+                points: vec![dp],
+                color,
+                line_width: lw,
+            },
+            ToolButton::Text => DrawCommand::Text {
+                anchor: dp,
+                content: String::new(),
+                font_size: 16.0,
+                color,
+            },
+            ToolButton::Mosaic => DrawCommand::Mosaic {
+                rect: (dp, dp),
+                block_size: 12,
+            },
+            // 非绘图工具忽略
+            ToolButton::ColorPicker | ToolButton::Undo | ToolButton::Redo
+            | ToolButton::Finish | ToolButton::Cancel => return,
+        });
+    }
+
+    /// 推进 in_progress 的当前点（鼠标拖动时调用）
+    fn update_in_progress(&mut self, p: BoundsPoint) {
+        let Some(cmd) = self.in_progress.as_mut() else { return };
+        let dp = crate::overlay::drawing::Point::new(p.x, p.y);
+        match cmd {
+            DrawCommand::Rectangle { rect, .. } | DrawCommand::Mosaic { rect, .. } => {
+                rect.1 = dp;
+            }
+            DrawCommand::Arrow { to, .. } => {
+                *to = dp;
+            }
+            DrawCommand::Freehand { points, .. } => {
+                points.push(dp);
+            }
+            // Text 暂不支持拖拽改内容
+            DrawCommand::Text { .. } => {}
+        }
+    }
+
+    /// 结束 in_progress：归一化 rect，过滤太小的图形，push 到 DrawingState
+    fn finish_draw(&mut self) {
+        let Some(cmd) = self.in_progress.take() else { return };
+        let valid = match &cmd {
+            DrawCommand::Rectangle { rect, .. } | DrawCommand::Mosaic { rect, .. } => {
+                let w = (rect.0.x - rect.1.x).abs();
+                let h = (rect.0.y - rect.1.y).abs();
+                w >= 2.0 && h >= 2.0
+            }
+            DrawCommand::Arrow { from, to, .. } => {
+                (from.x - to.x).abs() >= 2.0 || (from.y - to.y).abs() >= 2.0
+            }
+            DrawCommand::Freehand { points, .. } => points.len() >= 2,
+            DrawCommand::Text { content, .. } => !content.is_empty(),
+        };
+        if !valid { return; }
+        // 归一化 Rectangle/Mosaic 的 rect 为 (左上, 右下)
+        let normalized = match cmd {
+            DrawCommand::Rectangle { rect, color, line_width } => {
+                let a = rect.0;
+                let b = rect.1;
+                DrawCommand::Rectangle {
+                    rect: (
+                        crate::overlay::drawing::Point::new(a.x.min(b.x), a.y.min(b.y)),
+                        crate::overlay::drawing::Point::new(a.x.max(b.x), a.y.max(b.y)),
+                    ),
+                    color,
+                    line_width,
+                }
+            }
+            DrawCommand::Mosaic { rect, block_size } => {
+                let a = rect.0;
+                let b = rect.1;
+                DrawCommand::Mosaic {
+                    rect: (
+                        crate::overlay::drawing::Point::new(a.x.min(b.x), a.y.min(b.y)),
+                        crate::overlay::drawing::Point::new(a.x.max(b.x), a.y.max(b.y)),
+                    ),
+                    block_size,
+                }
+            }
+            other => other,
+        };
+        self.drawing.push(normalized);
+    }
+
+    /// 渲染浮动工具栏（在 Editing 模式下挂在选区上方）
+    ///
+    /// `sel` 是当前选区 bounds（screen 坐标），工具栏固定在选区上沿 + OFFSET_Y 处，
+    /// 左对齐选区左沿；调用方负责只在 Editing 模式下挂载此节点。
+    fn render_toolbar(
+        &self,
+        sel: ub::Bounds,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active_tool = self.toolbar.active_tool;
+        let can_undo = self.drawing.history_index > 0;
+        let can_redo = self.drawing.history_index < self.drawing.commands.len();
+
+        let mut row = div().flex().gap(px(TOOLBAR_GAP)).items_center();
+
+        for &btn in ToolButton::ORDER {
+            let on_click = cx.listener(move |this, _ev, _window, cx| match btn {
+                ToolButton::Rectangle | ToolButton::Arrow | ToolButton::Freehand
+                | ToolButton::Text | ToolButton::Mosaic => {
+                    this.toolbar.active_tool = if this.toolbar.active_tool == Some(btn) {
+                        None
+                    } else {
+                        Some(btn)
+                    };
+                    cx.notify();
+                }
+                ToolButton::ColorPicker => {
+                    // 每次点击 → 在 HSV 12 色调色板中循环下一个颜色
+                    let swatch = palette::default_palette();
+                    let cur = this.toolbar.current_color;
+                    let idx = swatch.iter().position(|c| *c == cur).unwrap_or(0);
+                    let next = (idx + 1) % swatch.len();
+                    this.toolbar.current_color = swatch[next];
+                    cx.notify();
+                }
+                ToolButton::Undo => {
+                    this.drawing.undo();
+                    cx.notify();
+                }
+                ToolButton::Redo => {
+                    this.drawing.redo();
+                    cx.notify();
+                }
+                ToolButton::Finish => {
+                    let s = this.selection.current().or(Some(this.screen_bounds));
+                    let cmds: Vec<DrawCommand> =
+                        this.drawing.visible_commands().cloned().collect();
+                    this.commit(OverlayResult { selection: s, commands: cmds }, _window);
+                }
+                ToolButton::Cancel => {
+                    this.commit(
+                        OverlayResult {
+                            selection: None,
+                            commands: vec![],
+                        },
+                        _window,
+                    );
+                }
+            });
+
+            let (active, disabled) = match btn {
+                ToolButton::Rectangle | ToolButton::Arrow | ToolButton::Freehand
+                | ToolButton::Text | ToolButton::Mosaic => (active_tool == Some(btn), false),
+                ToolButton::Undo => (false, !can_undo),
+                ToolButton::Redo => (false, !can_redo),
+                _ => (false, false),
+            };
+
+            row = row.child(render_tool_button(btn, active, disabled, on_click));
+        }
+
+        // 工具栏位置：选区上沿之上，左对齐选区左沿
+        let toolbar_y = sel.origin.y - TOOLBAR_OFFSET_Y - TOOLBAR_BTN_SIZE - TOOLBAR_PAD * 2.0;
+        let toolbar_y = toolbar_y.max(TOOLBAR_OFFSET_Y); // 不要跑出屏幕顶部
+        let toolbar_x = sel.origin.x;
+
+        div()
+            .absolute()
+            .top(px(toolbar_y))
+            .left(px(toolbar_x))
+            .bg(gpui::rgba(0x202020EE))
+            .rounded_md()
+            .p(px(TOOLBAR_PAD))
+            .child(row)
     }
 }
 
 /// handle 视觉尺寸：边长（像素）
 const HANDLE_VISUAL_SIZE: f32 = 8.0;
+/// handle 命中容差的一半（与 selection::HANDLE_HALF_SIZE 保持一致）
+const HANDLE_HIT_HALF: f32 = 8.0;
+
+/// 工具栏按钮视觉尺寸（正方形边长，px）
+const TOOLBAR_BTN_SIZE: f32 = 36.0;
+/// 工具栏按钮之间间距
+const TOOLBAR_GAP: f32 = 4.0;
+/// 工具栏整体内边距
+const TOOLBAR_PAD: f32 = 6.0;
+/// 工具栏距离选区上沿的距离（px）
+const TOOLBAR_OFFSET_Y: f32 = 8.0;
+
+/// 把 ToolButton 映射到 gpui-component 的 Lucide 图标名
+///
+/// 找不到完美匹配时选语义最接近的。Pencil 等图标本组件未自带，
+/// 用 Frame / Asterisk / LayoutDashboard 等近似替代。
+fn icon_for(btn: ToolButton) -> IconName {
+    match btn {
+        ToolButton::Rectangle => IconName::Frame,
+        ToolButton::Arrow => IconName::ArrowUp,
+        ToolButton::Freehand => IconName::Asterisk,
+        ToolButton::Text => IconName::SquareTerminal,
+        ToolButton::Mosaic => IconName::LayoutDashboard,
+        ToolButton::ColorPicker => IconName::Palette,
+        ToolButton::Undo => IconName::Undo,
+        ToolButton::Redo => IconName::Redo,
+        ToolButton::Finish => IconName::Check,
+        ToolButton::Cancel => IconName::Close,
+    }
+}
+
+/// 渲染单个工具栏按钮
+///
+/// - active=true 时用 ButtonVariants::primary() 高亮
+/// - disabled=true 时按钮变灰（不影响点击穿透，但视觉上提示不可用）
+fn render_tool_button(
+    btn: ToolButton,
+    active: bool,
+    disabled: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    let icon = icon_for(btn);
+    let label = btn.label();
+    let mut b = Button::new(("toolbar", btn as usize))
+        .icon(icon)
+        .tooltip(label)
+        .compact()
+        .on_click(on_click);
+    if disabled {
+        b = b.disabled(true);
+    }
+    if active {
+        b = b.primary();
+    }
+    b
+}
 
 /// RGBA → BGRA 通道 swap（GPUI RenderImage 用 BGRA）
 fn rgba_to_bgra(pixels: &mut [u8]) {
@@ -93,6 +368,115 @@ fn to_bounds_point(p: Point<Pixels>) -> BoundsPoint {
     BoundsPoint::new(f32::from(p.x), f32::from(p.y))
 }
 
+/// RGBA → GPUI rgba u32（0xRRGGBBAA）
+fn rgba_u32(c: RGBA) -> u32 {
+    (u32::from(c.r) << 24)
+        | (u32::from(c.g) << 16)
+        | (u32::from(c.b) << 8)
+        | u32::from(c.a)
+}
+
+/// 画一条指定粗细的实线（轴对齐 bounding box 实现，preview 用，不抗锯齿）
+///
+/// 严格意义上不是真正的"线"（是矩形），但对工具栏交互的视觉反馈够用。
+fn paint_thick_line(x1: f32, y1: f32, x2: f32, y2: f32, lw: f32, color: RGBA, window: &mut Window) {
+    let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
+    let half = (lw / 2.0).max(0.5);
+    let min_x = x1.min(x2) - half;
+    let min_y = y1.min(y2) - half;
+    let w = (x1.max(x2) - x1.min(x2)) + lw;
+    let h = (y1.max(y2) - y1.min(y2)) + lw;
+    window.paint_quad(gpui::quad(
+        Bounds {
+            origin: gpui::point(gpui::px(min_x), gpui::px(min_y)),
+            size: Size::new(gpui::px(w), gpui::px(h)),
+        },
+        gpui::px(0.),
+        hsla,
+        gpui::px(0.),
+        gpui::transparent_black(),
+        Default::default(),
+    ));
+}
+
+/// 画空心矩形边框（4 条粗线）
+fn paint_rect_outline(x: f32, y: f32, w: f32, h: f32, lw: f32, color: RGBA, window: &mut Window) {
+    paint_thick_line(x, y, x + w, y, lw, color, window);
+    paint_thick_line(x, y + h, x + w, y + h, lw, color, window);
+    paint_thick_line(x, y, x, y + h, lw, color, window);
+    paint_thick_line(x + w, y, x + w, y + h, lw, color, window);
+}
+
+/// 把一个 DrawCommand 渲染到 window 上（Phase 3 preview，Phase 4 也会复用）
+fn paint_command(cmd: &DrawCommand, window: &mut Window) {
+    match *cmd {
+        DrawCommand::Rectangle { rect, color, line_width } => {
+            let a = rect.0;
+            let b = rect.1;
+            let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
+            let w = (b.x - a.x).abs();
+            let h = (b.y - a.y).abs();
+            paint_rect_outline(x1, y1, w, h, line_width, color, window);
+        }
+        DrawCommand::Arrow { from, to, color, line_width } => {
+            // 主线
+            paint_thick_line(from.x, from.y, to.x, to.y, line_width, color, window);
+            // 箭头三角：to → 后退 head_len，再分别往左右垂直方向偏 head_w
+            let dx = to.x - from.x;
+            let dy = to.y - from.y;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1.0 { return; }
+            let ux = dx / len;
+            let uy = dy / len;
+            let head_len = (line_width * 6.0).max(8.0);
+            let head_w = (line_width * 3.0).max(4.0);
+            let bx = to.x - ux * head_len;
+            let by = to.y - uy * head_len;
+            let px = -uy;
+            let py = ux;
+            let p1x = bx + px * head_w;
+            let p1y = by + py * head_w;
+            let p2x = bx - px * head_w;
+            let p2y = by - py * head_w;
+            paint_thick_line(to.x, to.y, p1x, p1y, line_width, color, window);
+            paint_thick_line(to.x, to.y, p2x, p2y, line_width, color, window);
+            paint_thick_line(p1x, p1y, p2x, p2y, line_width, color, window);
+        }
+        DrawCommand::Freehand { ref points, color, line_width } => {
+            for w in points.windows(2) {
+                paint_thick_line(w[0].x, w[0].y, w[1].x, w[1].y, line_width, color, window);
+            }
+        }
+        DrawCommand::Text { anchor, ref content, font_size, color } => {
+            // Phase 3 简化：画一个文字占位框（按字符数估算宽度）
+            let char_w = font_size * 0.6;
+            let w = char_w * content.chars().count().max(1) as f32;
+            let h = font_size;
+            paint_rect_outline(anchor.x, anchor.y, w, h, 1.0, color, window);
+        }
+        DrawCommand::Mosaic { rect, block_size } => {
+            // Phase 3 简化：画斜线网格（实际栅格化在 Phase 4 做）
+            let a = rect.0;
+            let b = rect.1;
+            let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
+            let w = (b.x - a.x).abs();
+            let h = (b.y - a.y).abs();
+            let bs = block_size.max(2) as f32;
+            let grid_color = RGBA::new(0xFF, 0xFF, 0xFF, 0xC0);
+            let mut x = x1;
+            while x < x1 + w {
+                paint_thick_line(x, y1, x, y1 + h, 1.0, grid_color, window);
+                x += bs;
+            }
+            let mut y = y1;
+            while y < y1 + h {
+                paint_thick_line(x1, y, x1 + w, y, 1.0, grid_color, window);
+                y += bs;
+            }
+        }
+    }
+}
+
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_image = self.frame_image.clone();
@@ -106,9 +490,14 @@ impl Render for OverlayView {
         let screen_w = px(screen_bounds.size.x);
         let screen_h = px(screen_bounds.size.y);
 
+        // 收集 in_progress + 可见命令给 canvas paint 闭包用
+        let in_progress = self.in_progress.clone();
+        let visible_cmds: Vec<DrawCommand> =
+            self.drawing.visible_commands().cloned().collect();
+
         let paint_canvas = canvas(
-            move |_, _, _| {},
-            move |_, _, window, _| {
+            move |_, _, _| (in_progress, visible_cmds),
+            move |_, (in_progress, visible_cmds), window, _| {
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景
@@ -190,6 +579,14 @@ impl Render for OverlayView {
                             gpui::transparent_black(),
                             Default::default(),
                         ));
+                    }
+
+                    // 2.5) 可见的 DrawCommand + 当前 in_progress（在 dim 之上、border 之下）
+                    for cmd in &visible_cmds {
+                        paint_command(cmd, window);
+                    }
+                    if let Some(ref ip) = in_progress {
+                        paint_command(ip, window);
                     }
 
                     // 3) 选区边框（4 条 1px 蓝绿色 quad）
@@ -283,23 +680,61 @@ impl Render for OverlayView {
 
         // Canvas 自身不能挂鼠标 handler；外面包一层 div 来接收事件。
         // track_focus 让 Esc/Enter 能路由到 on_key_down 监听器。
-        div()
+        let mut root = div()
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(paint_canvas.size_full())
+            .child(paint_canvas.size_full());
+
+        // Editing 模式下挂浮动工具栏；选区是 None 时仍可挂，但 render_toolbar
+        // 用的是 selection.current()，工具栏会贴在 None 处 → 等 Editing 时一定存在
+        if mode == OverlayMode::Editing {
+            if let Some(sel) = self.selection.current() {
+                root = root.child(self.render_toolbar(sel, cx));
+            }
+        }
+
+        root
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, _| {
-                    this.selection.mouse_down(to_bounds_point(ev.position));
+                    let p = to_bounds_point(ev.position);
+                    // Editing 模式下分发：handle 命中 → 交给 SelectionState
+                    // (Resizing)；active_tool 已选 + 点在选区内 → 开始绘图；
+                    // 其他情况 → 交给 SelectionState (Moving / Creating)
+                    if this.mode == OverlayMode::Editing {
+                        if let Some(sel) = this.selection.current() {
+                            // handle 命中（即使没 active_tool 也优先 resize）
+                            if sel.hit_handle(p, HANDLE_HIT_HALF).is_some() {
+                                this.selection.mouse_down(p);
+                                return;
+                            }
+                            // active_tool 选了绘图工具 + 点在选区内 → 开始绘图
+                            if this.toolbar.active_tool.is_some() && sel.contains(p) {
+                                this.begin_draw(p);
+                                return;
+                            }
+                        }
+                    }
+                    this.selection.mouse_down(p);
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                this.selection.mouse_move(to_bounds_point(ev.position));
+                let p = to_bounds_point(ev.position);
+                if this.in_progress.is_some() {
+                    this.update_in_progress(p);
+                } else {
+                    this.selection.mouse_move(p);
+                }
                 cx.notify();
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _cx| {
+                    // 先结束正在画的那一笔
+                    if this.in_progress.is_some() {
+                        this.finish_draw();
+                        return;
+                    }
                     this.selection.mouse_up();
                     // 任意大小选区都接受（clip_region 自然处理 < 1 像素情况）
                     match this.mode {
@@ -321,18 +756,36 @@ impl Render for OverlayView {
                     }
                     // Selecting 模式下若松手无有效选区则 commit 当前 bounds（兼容老路径）
                     if this.mode == OverlayMode::Selecting {
-                        let result = this.selection.current();
-                        this.commit(result, window);
+                        let sel = this.selection.current();
+                        let cmds: Vec<DrawCommand> = this
+                            .drawing
+                            .visible_commands()
+                            .cloned()
+                            .collect();
+                        this.commit(OverlayResult { selection: sel, commands: cmds }, window);
                     }
                 }),
             )
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    this.commit(None, window);
+                    this.commit(OverlayResult { selection: None, commands: vec![] }, window);
                 } else if ev.keystroke.key == "enter" {
                     // Enter 直接确认当前选区；没有选区则全屏
-                    let result = this.selection.current().or(Some(this.screen_bounds));
-                    this.commit(result, window);
+                    let sel = this.selection.current().or(Some(this.screen_bounds));
+                    let cmds: Vec<DrawCommand> = this
+                        .drawing
+                        .visible_commands()
+                        .cloned()
+                        .collect();
+                    this.commit(OverlayResult { selection: sel, commands: cmds }, window);
+                } else if ev.keystroke.key == "z" && ev.keystroke.modifiers.control {
+                    // Ctrl+Z 撤销 / Ctrl+Shift+Z 重做
+                    if ev.keystroke.modifiers.shift {
+                        this.drawing.redo();
+                    } else {
+                        this.drawing.undo();
+                    }
+                    cx.notify();
                 }
             }))
     }
@@ -340,13 +793,14 @@ impl Render for OverlayView {
 
 /// 在新线程里跑 GPUI 覆盖窗口，阻塞到用户完成/取消。
 ///
-/// 返回值：
-/// - `Some(bounds)`：用户确认（拖拽后松开 / 按 Enter）
-/// - `None`：用户取消（按 Esc / 关闭窗口 / 选区过小）
-pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> Option<ub::Bounds> {
+/// 返回值：完整会话结果（选区 + 可见的 DrawCommand 列表）；取消时 selection=None。
+pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayResult {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         application().run(move |cx: &mut App| {
+            // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
+            gpui_component::init(cx);
+
             // 用主屏尺寸作为窗口尺寸
             let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
                 origin: point(px(0.), px(0.)),
@@ -383,6 +837,9 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> Option<u
             .detach();
         });
     });
-    // 主线程阻塞等结果；GPUI 线程退出时 Sender 被 drop，本端 recv 返回 Err 当作取消
-    rx.recv().ok().flatten()
+    // 主线程阻塞等结果；GPUI 线程退出时 Sender 被 drop，本端 recv 返回 Err → 视为取消
+    rx.recv().unwrap_or(OverlayResult {
+        selection: None,
+        commands: vec![],
+    })
 }
