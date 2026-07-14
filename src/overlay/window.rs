@@ -202,10 +202,10 @@ impl OverlayView {
         self.drawing.push(normalized);
     }
 
-    /// 渲染浮动工具栏（在 Editing 模式下挂在选区上方）
+    /// 渲染浮动工具栏（在 Editing 模式下挂在选区下方）
     ///
-    /// `sel` 是当前选区 bounds（screen 坐标），工具栏固定在选区上沿 + OFFSET_Y 处，
-    /// 左对齐选区左沿；调用方负责只在 Editing 模式下挂载此节点。
+    /// `sel` 是当前选区 bounds（screen 坐标），工具栏默认在选区下沿 + OFFSET_Y 处，
+    /// 放不下时翻到选区上方；左对齐选区左沿。调用方负责只在 Editing 模式下挂载此节点。
     fn render_toolbar(
         &self,
         sel: ub::Bounds,
@@ -273,9 +273,21 @@ impl OverlayView {
             row = row.child(render_tool_button(btn, active, disabled, on_click));
         }
 
-        // 工具栏位置：选区上沿之上，左对齐选区左沿
-        let toolbar_y = sel.origin.y - TOOLBAR_OFFSET_Y - TOOLBAR_BTN_SIZE - TOOLBAR_PAD * 2.0;
-        let toolbar_y = toolbar_y.max(TOOLBAR_OFFSET_Y); // 不要跑出屏幕顶部
+        // 工具栏位置：选区下沿之下，左对齐选区左沿
+        // 如果跑出屏幕底部 → 翻到选区上沿之上
+        let screen_h = self.screen_bounds.origin.y + self.screen_bounds.size.y;
+        let toolbar_h = TOOLBAR_BTN_SIZE + TOOLBAR_PAD * 2.0;
+        let toolbar_y_below = sel.origin.y + sel.size.y + TOOLBAR_OFFSET_Y;
+        let toolbar_y_above =
+            sel.origin.y - TOOLBAR_OFFSET_Y - toolbar_h;
+        let toolbar_y = if toolbar_y_below + toolbar_h + TOOLBAR_OFFSET_Y <= screen_h {
+            toolbar_y_below
+        } else if toolbar_y_above >= TOOLBAR_OFFSET_Y {
+            toolbar_y_above
+        } else {
+            // 两边都放不下时强行贴屏幕底部
+            (screen_h - toolbar_h - TOOLBAR_OFFSET_Y).max(TOOLBAR_OFFSET_Y)
+        };
         let toolbar_x = sel.origin.x;
 
         div()
@@ -326,6 +338,12 @@ fn icon_for(btn: ToolButton) -> IconName {
 ///
 /// - active=true 时用 ButtonVariants::primary() 高亮
 /// - disabled=true 时按钮变灰（不影响点击穿透，但视觉上提示不可用）
+///
+/// 关键点：gpui-component 的 Button 渲染是 `icon + label` 两段都
+/// `when_some` 加进 h_flex；只设 `.icon()` 时只有图标，但不少主题
+/// 下 compact 模式只放图标会因内容过窄而看不出 icon（icon 文字色 +
+/// 主题 bg 接近时也容易"看着像空白"）。这里同时设 `.icon()` 和
+/// `.label()`，让按钮始终有可见文本兜底。
 fn render_tool_button(
     btn: ToolButton,
     active: bool,
@@ -336,6 +354,7 @@ fn render_tool_button(
     let label = btn.label();
     let mut b = Button::new(("toolbar", btn as usize))
         .icon(icon)
+        .label(label)
         .tooltip(label)
         .compact()
         .on_click(on_click);
