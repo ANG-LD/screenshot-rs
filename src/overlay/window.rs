@@ -21,6 +21,15 @@ use crate::capture::CapturedFrame;
 use crate::overlay::selection::SelectionState;
 use crate::utils::bounds::{self as ub, Point as BoundsPoint};
 
+/// 覆盖窗口交互状态机
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayMode {
+    /// 还没选 / 正在拖一个新选区
+    Selecting,
+    /// 已选完，可调大小 / 标注 / 完成
+    Editing,
+}
+
 /// GPUI 视图：覆盖窗口内容
 pub struct OverlayView {
     /// 捕获帧的 GPUI 渲染图（已转 BGRA）
@@ -33,6 +42,8 @@ pub struct OverlayView {
     tx: Sender<Option<ub::Bounds>>,
     /// 键盘焦点句柄（让 Esc / Enter 能路由到这里）
     focus_handle: FocusHandle,
+    /// 窗口交互模式：Selecting 还是 Editing
+    mode: OverlayMode,
 }
 
 impl OverlayView {
@@ -48,6 +59,7 @@ impl OverlayView {
             selection: SelectionState::new(screen_bounds),
             tx,
             focus_handle: cx.focus_handle(),
+            mode: OverlayMode::Selecting,
         }
     }
 
@@ -57,6 +69,9 @@ impl OverlayView {
         window.remove_window();
     }
 }
+
+/// handle 视觉尺寸：边长（像素）
+const HANDLE_VISUAL_SIZE: f32 = 8.0;
 
 /// RGBA → BGRA 通道 swap（GPUI RenderImage 用 BGRA）
 fn rgba_to_bgra(pixels: &mut [u8]) {
@@ -83,6 +98,7 @@ impl Render for OverlayView {
         let frame_image = self.frame_image.clone();
         let selection_bounds = self.selection.current();
         let screen_bounds = self.screen_bounds;
+        let mode = self.mode;
 
         // 把屏幕 f32 边界转成 GPUI Pixels（用于 dim 矩形）
         let screen_x = px(screen_bounds.origin.x);
@@ -227,6 +243,27 @@ impl Render for OverlayView {
                         border,
                         Default::default(),
                     ));
+
+                    // 4) Editing 模式下额外画 8 个 handle（小白方 + 蓝边）
+                    if mode == OverlayMode::Editing {
+                        let handle_fill = Hsla::from(rgba(0xFFFFFFFFu32));
+                        let handle_border = Hsla::from(rgba(0x0066CCFFu32));
+                        let half = px(HANDLE_VISUAL_SIZE / 2.0);
+                        let edge = px(HANDLE_VISUAL_SIZE);
+                        for hp in sel.handle_positions() {
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(px(hp.x) - half, px(hp.y) - half),
+                                    size: Size::new(edge, edge),
+                                },
+                                px(0.),
+                                handle_fill,
+                                px(1.0),
+                                handle_border,
+                                Default::default(),
+                            ));
+                        }
+                    }
                 } else {
                     // 没选区：整屏 dim（提示用户拖拽）
                     window.paint_quad(quad(
@@ -265,8 +302,28 @@ impl Render for OverlayView {
                 cx.listener(|this, _, window, _cx| {
                     this.selection.mouse_up();
                     // 任意大小选区都接受（clip_region 自然处理 < 1 像素情况）
-                    let result = this.selection.current();
-                    this.commit(result, window);
+                    match this.mode {
+                        OverlayMode::Selecting => {
+                            // 第一次选完：如果选区 > 0 进入 Editing 状态
+                            //（Editing 模式才能看到 handle、调整大小、调用工具栏）
+                            if let Some(b) = this.selection.current() {
+                                if b.size.x > 1.0 && b.size.y > 1.0 {
+                                    this.mode = OverlayMode::Editing;
+                                    return;
+                                }
+                            }
+                            // 没有有效选区 → 保持 Selecting（等用户继续拖）
+                        }
+                        OverlayMode::Editing => {
+                            // 在 Editing 模式下松开只是结束 resize / moving，
+                            // 不 commit；用户必须点"完成"或按 Enter 才确认
+                        }
+                    }
+                    // Selecting 模式下若松手无有效选区则 commit 当前 bounds（兼容老路径）
+                    if this.mode == OverlayMode::Selecting {
+                        let result = this.selection.current();
+                        this.commit(result, window);
+                    }
                 }),
             )
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _cx| {

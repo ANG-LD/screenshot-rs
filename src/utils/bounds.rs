@@ -2,6 +2,35 @@
 //!
 //! 设计为 GPUI 无关的纯逻辑，方便单元测试。
 
+/// 选区四周的 8 个 resize handle
+///
+/// 索引顺序对应 `SelectionState` 中已有的 `DragState::Resizing::handle: u8`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handle {
+    TopLeft = 0,
+    Top = 1,
+    TopRight = 2,
+    Left = 3,
+    Right = 4,
+    BottomLeft = 5,
+    Bottom = 6,
+    BottomRight = 7,
+}
+
+impl Handle {
+    /// 全部 8 个 handle 的数组（按 `as u8` 索引顺序）
+    pub const ALL: [Handle; 8] = [
+        Handle::TopLeft,
+        Handle::Top,
+        Handle::TopRight,
+        Handle::Left,
+        Handle::Right,
+        Handle::BottomLeft,
+        Handle::Bottom,
+        Handle::BottomRight,
+    ];
+}
+
 /// 二维坐标点，浮点精度（屏幕坐标）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -85,5 +114,36 @@ impl Bounds<Point> {
             b.size.y = (max_y - b.origin.y).max(0.0);
         }
         b
+    }
+
+    /// 8 个 resize handle 的中心点（顺时针从左上开始）
+    pub fn handle_positions(self) -> [Point; 8] {
+        let l = self.origin.x;
+        let t = self.origin.y;
+        let r = self.origin.x + self.size.x;
+        let b = self.origin.y + self.size.y;
+        let mx = self.origin.x + self.size.x / 2.0;
+        let my = self.origin.y + self.size.y / 2.0;
+        [
+            Point::new(l, t),     // TopLeft
+            Point::new(mx, t),    // Top
+            Point::new(r, t),     // TopRight
+            Point::new(l, my),    // Left
+            Point::new(r, my),    // Right
+            Point::new(l, b),     // BottomLeft
+            Point::new(mx, b),    // Bottom
+            Point::new(r, b),     // BottomRight
+        ]
+    }
+
+    /// 判断点是否落在某个 handle 的容差范围内（容差为 ±half_size 像素的方框）
+    pub fn hit_handle(self, p: Point, half_size: f32) -> Option<Handle> {
+        let positions = self.handle_positions();
+        for (i, hp) in positions.iter().enumerate() {
+            if (p.x - hp.x).abs() <= half_size && (p.y - hp.y).abs() <= half_size {
+                return Some(Handle::ALL[i]);
+            }
+        }
+        None
     }
 }

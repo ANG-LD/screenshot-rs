@@ -3,7 +3,7 @@
 //! `SelectionState` 是纯逻辑状态机（不依赖 GPUI），方便测试。
 //! 实际的鼠标事件分发由 Task 14 的 GPUI 渲染层处理。
 
-use crate::utils::bounds::{Bounds, Point};
+use crate::utils::bounds::{Bounds, Handle, Point};
 
 /// 选区拖拽状态
 ///
@@ -20,12 +20,12 @@ pub enum DragState {
         /// 鼠标按下点相对选区原点的偏移（grab point）
         grab_offset: Point,
     },
-    /// 拖拽某个手柄调整大小（0=左上, 1=上, 2=右上, 3=右, 4=右下, 5=下, 6=左下, 7=左）
+    /// 拖拽某个手柄调整大小
     ///
-    /// MVP 暂不实现，仅保留数据结构以便后续扩展。
+    /// `grab_offset` = 鼠标按下点相对手柄中心的偏移；mouse_move 时
+    /// 手柄跟随 `mouse - grab_offset`，从而手柄不会"跳"到鼠标位置。
     Resizing {
-        /// 手柄索引（0..8）
-        handle: u8,
+        handle: Handle,
         /// 鼠标按下点相对手柄位置的偏移
         grab_offset: Point,
     },
@@ -60,10 +60,22 @@ impl SelectionState {
     /// 鼠标按下
     ///
     /// 行为：
-    /// - 如果当前已有选区且点击点在选区内 → 进入 `Moving` 状态，记录 grab_offset
+    /// - 如果当前已有选区且点击点在某个 handle 容差范围内 → 进入 `Resizing`，记录 grab_offset
+    /// - 否则如果点击点在选区内 → 进入 `Moving` 状态，记录 grab_offset
     /// - 否则 → 进入 `Creating` 状态，并把 bounds 初始化为零大小的矩形（按下点=当前点）
     pub fn mouse_down(&mut self, p: Point) {
         if let Some(existing) = self.bounds {
+            // 8 个 handle 优先于"在选区内"判定，否则在 handle 上点击会触发 Moving
+            if let Some(handle) = existing.hit_handle(p, HANDLE_HALF_SIZE) {
+                let positions = existing.handle_positions();
+                let hp = positions[handle as usize];
+                self.drag = DragState::Resizing {
+                    handle,
+                    grab_offset: Point::new(p.x - hp.x, p.y - hp.y),
+                };
+                self.drag_start = p;
+                return;
+            }
             if existing.contains(p) {
                 // 在已有选区内点击 → 移动
                 // grab_offset 用于在 mouse_move 时让选区跟随鼠标而不"跳"到鼠标位置
@@ -87,7 +99,7 @@ impl SelectionState {
     /// - `Idle`：忽略
     /// - `Creating`：用 drag_start 和当前点构造矩形
     /// - `Moving`：用 grab_offset 计算新原点，并裁剪到屏幕边界内
-    /// - `Resizing`：MVP 暂不实现（保留占位）
+    /// - `Resizing`：用 grab_offset 计算新 handle 位置，按 handle 类型更新 bounds，裁剪到屏幕内
     pub fn mouse_move(&mut self, p: Point) {
         match self.drag {
             DragState::Idle => {}
@@ -115,8 +127,11 @@ impl SelectionState {
                 }
             }
             DragState::Resizing { handle, grab_offset } => {
-                // MVP 暂不实现手柄调整大小
-                let _ = (handle, grab_offset);
+                if let Some(b) = self.bounds {
+                    // 手柄当前位置 + 偏移 = 鼠标；反过来新手柄位置 = 鼠标 - 偏移
+                    let new_handle = Point::new(p.x - grab_offset.x, p.y - grab_offset.y);
+                    self.bounds = Some(apply_resize(b, handle, new_handle, self.screen_bounds));
+                }
             }
         }
     }
@@ -134,4 +149,61 @@ impl SelectionState {
     pub fn current(&self) -> Option<Bounds> {
         self.bounds
     }
+}
+
+/// resize handle 命中容差的一半（正方形 ±HANDLE_HALF_SIZE 像素）
+///
+/// 8 像素容差在 HiDPI（2x）下视觉上是 4 逻辑像素，仍然容易点中又不会误触。
+const HANDLE_HALF_SIZE: f32 = 8.0;
+
+/// 给定旧 bounds、被拖动的 handle 和 handle 的新位置，返回新的 bounds
+///
+/// 实现要点：每个 handle 拖动时"对侧"保持固定。例如 TopLeft 拖动 → 右下角固定；
+/// Bottom 拖动 → 上边固定。完成后用 `clamp_inside` 限制在屏幕内，
+/// 用 `normalize` 保证 size 为正。
+fn apply_resize(
+    bounds: Bounds,
+    handle: Handle,
+    new_handle_pos: Point,
+    screen_bounds: Bounds,
+) -> Bounds {
+    let mut new = bounds;
+    let right = bounds.origin.x + bounds.size.x;
+    let bottom = bounds.origin.y + bounds.size.y;
+
+    match handle {
+        Handle::TopLeft => {
+            new.origin = new_handle_pos;
+            new.size = Point::new(right - new.origin.x, bottom - new.origin.y);
+        }
+        Handle::Top => {
+            new.origin.y = new_handle_pos.y;
+            new.size.y = bottom - new.origin.y;
+        }
+        Handle::TopRight => {
+            new.origin.y = new_handle_pos.y;
+            new.size = Point::new(new_handle_pos.x - bounds.origin.x, bottom - new.origin.y);
+        }
+        Handle::Left => {
+            new.origin.x = new_handle_pos.x;
+            new.size.x = right - new.origin.x;
+        }
+        Handle::Right => {
+            new.size.x = new_handle_pos.x - bounds.origin.x;
+        }
+        Handle::BottomLeft => {
+            new.origin.x = new_handle_pos.x;
+            new.size = Point::new(right - new.origin.x, new_handle_pos.y - bounds.origin.y);
+        }
+        Handle::Bottom => {
+            new.size.y = new_handle_pos.y - bounds.origin.y;
+        }
+        Handle::BottomRight => {
+            new.size = Point::new(
+                new_handle_pos.x - bounds.origin.x,
+                new_handle_pos.y - bounds.origin.y,
+            );
+        }
+    }
+    new.normalize().clamp_inside(screen_bounds)
 }

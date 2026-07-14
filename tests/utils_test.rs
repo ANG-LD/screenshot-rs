@@ -89,3 +89,37 @@ fn rgb_to_hsv_roundtrip_red() {
     assert!((s - 1.0).abs() < 0.01);
     assert!((v - 1.0).abs() < 0.01);
 }
+
+#[test]
+fn bounds_handle_positions_match_corners_and_midpoints() {
+    let b = Bounds::new(Point::new(10.0, 20.0), Point::new(110.0, 70.0));
+    let h = b.handle_positions();
+    assert_eq!(h[0], Point::new(10.0, 20.0)); // TopLeft
+    assert_eq!(h[1], Point::new(60.0, 20.0)); // Top
+    assert_eq!(h[2], Point::new(110.0, 20.0)); // TopRight
+    assert_eq!(h[3], Point::new(10.0, 45.0)); // Left
+    assert_eq!(h[4], Point::new(110.0, 45.0)); // Right
+    assert_eq!(h[5], Point::new(10.0, 70.0)); // BottomLeft
+    assert_eq!(h[6], Point::new(60.0, 70.0)); // Bottom
+    assert_eq!(h[7], Point::new(110.0, 70.0)); // BottomRight
+}
+
+#[test]
+fn bounds_hit_handle_in_tolerance_window() {
+    let b = Bounds::new(Point::new(0.0, 0.0), Point::new(100.0, 100.0));
+    // 严格命中
+    assert_eq!(b.hit_handle(Point::new(0.0, 0.0), 4.0), Some(screenshot_rs::utils::bounds::Handle::TopLeft));
+    // 容差内
+    assert_eq!(b.hit_handle(Point::new(3.0, 3.0), 4.0), Some(screenshot_rs::utils::bounds::Handle::TopLeft));
+    // 容差外
+    assert_eq!(b.hit_handle(Point::new(20.0, 20.0), 4.0), None);
+    // 中点
+    assert_eq!(b.hit_handle(Point::new(50.0, 0.0), 4.0), Some(screenshot_rs::utils::bounds::Handle::Top));
+}
+
+#[test]
+fn bounds_hit_handle_returns_none_outside_tolerance() {
+    let b = Bounds::new(Point::new(0.0, 0.0), Point::new(100.0, 100.0));
+    // 9 像素远、半径 4 → 不命中
+    assert_eq!(b.hit_handle(Point::new(9.0, 0.0), 4.0), None);
+}
