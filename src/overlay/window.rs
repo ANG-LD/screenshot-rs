@@ -135,7 +135,7 @@ impl OverlayView {
             },
             // 非绘图工具忽略
             ToolButton::ColorPicker | ToolButton::Undo | ToolButton::Redo
-            | ToolButton::Finish | ToolButton::Cancel => return,
+            | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel => return,
         });
     }
 
@@ -220,6 +220,13 @@ impl OverlayView {
         let mut row = div().flex().gap(px(TOOLBAR_GAP)).items_center();
 
         for &btn in ToolButton::ORDER {
+            // Bold 单独走 render_bold_toggle（toggle 样式 + primary 高亮），
+            // 不走统一的 render_tool_button 路径。
+            if btn == ToolButton::Bold {
+                row = row.child(render_bold_toggle(self, cx));
+                continue;
+            }
+
             let on_click = cx.listener(move |this, _ev, _window, cx| match btn {
                 ToolButton::Rectangle | ToolButton::Arrow | ToolButton::Freehand
                 | ToolButton::Text | ToolButton::Mosaic => {
@@ -245,6 +252,19 @@ impl OverlayView {
                 }
                 ToolButton::Redo => {
                     this.drawing.redo();
+                    cx.notify();
+                }
+                ToolButton::Bold => {
+                    // Bold 按钮本身由 render_bold_toggle 处理；这里只在
+                    // 退路路径（未走独立渲染）时被调用。切换 Normal/Bold。
+                    this.toolbar.current_weight = match this.toolbar.current_weight {
+                        crate::overlay::drawing::FontWeight::Normal => {
+                            crate::overlay::drawing::FontWeight::Bold
+                        }
+                        crate::overlay::drawing::FontWeight::Bold => {
+                            crate::overlay::drawing::FontWeight::Normal
+                        }
+                    };
                     cx.notify();
                 }
                 ToolButton::Finish => {
@@ -274,6 +294,9 @@ impl OverlayView {
 
             row = row.child(render_tool_button(btn, active, disabled, on_click));
         }
+
+        // 字号选择器（Bold 按钮之后、Finish 之前）
+        row = row.child(render_size_dropdown(self, cx));
 
         // 工具栏位置：选区下沿之下，左对齐选区左沿
         // 如果跑出屏幕底部 → 翻到选区上沿之上
@@ -333,6 +356,9 @@ fn icon_for(btn: ToolButton) -> IconName {
         ToolButton::Redo => IconName::Redo,
         ToolButton::Finish => IconName::Check,
         ToolButton::Cancel => IconName::Close,
+        // gpui-component 自带 icons 目录里没有 bold.svg；用 Asterisk 作占位
+        // （按钮同时带 "B" 文字标签兜底，看图仍是"加粗"语义）
+        ToolButton::Bold => IconName::Asterisk,
     }
 }
 
@@ -367,6 +393,73 @@ fn render_tool_button(
         b = b.primary();
     }
     b
+}
+
+/// 渲染 Bold 切换按钮
+///
+/// 点击切换 `toolbar.current_weight` Normal ↔ Bold；当前为 Bold 时用 primary 高亮。
+/// 单独走这条路径而不是通用 render_tool_button，是因为：
+/// 1) Bold 没有"active 工具"语义（active_tool 标记绘图工具，Bold 是文字属性开关）
+/// 2) 需要独立计算 active 状态（current_weight == Bold）
+/// 3) 后面紧跟字号下拉（B + 字号构成"文字属性"子组），不需要通用按钮间距
+fn render_bold_toggle(
+    view: &OverlayView,
+    cx: &mut Context<OverlayView>,
+) -> Button {
+    let on_click = cx.listener(|this, _ev, _window, cx| {
+        this.toolbar.current_weight = match this.toolbar.current_weight {
+            crate::overlay::drawing::FontWeight::Normal => {
+                crate::overlay::drawing::FontWeight::Bold
+            }
+            crate::overlay::drawing::FontWeight::Bold => {
+                crate::overlay::drawing::FontWeight::Normal
+            }
+        };
+        cx.notify();
+    });
+    let mut b = Button::new("toolbar-bold")
+        .icon(IconName::Asterisk)
+        .label("B")
+        .tooltip("切换粗体")
+        .compact()
+        .on_click(on_click);
+    if view.toolbar.current_weight == crate::overlay::drawing::FontWeight::Bold {
+        b = b.primary();
+    }
+    b
+}
+
+/// 渲染字号选择器（v0.2 简化为一行紧凑按钮组）
+///
+/// gpui-component 的 `Select` 需要一个 `Entity<SelectState<...>>` + 复杂
+/// `SearchableListDelegate` 实现，引入成本远高于本工具栏的实际需求；
+/// 这里把 FONT_SIZES 每个值渲染成一个小按钮，当前选中状态用 primary 高亮。
+/// 这样免去了新建 GPUI Entity / 实现 Delegate 的复杂度，且视觉上和
+/// 工具栏其余按钮一致（与 Bold 紧挨成一组）。
+fn render_size_dropdown(
+    view: &OverlayView,
+    cx: &mut Context<OverlayView>,
+) -> impl IntoElement {
+    use crate::overlay::toolbar::FONT_SIZES;
+    let mut group = div().flex().gap(px(2.0)).items_center();
+    for &size in FONT_SIZES {
+        let label: gpui::SharedString = format!("{}px", size as i32).into();
+        let on_click = cx.listener(move |this, _ev, _window, cx| {
+            this.toolbar.current_size = size;
+            cx.notify();
+        });
+        let mut b = Button::new(("toolbar-size", size as usize))
+            .label(label.clone())
+            .tooltip(label)
+            .compact()
+            .on_click(on_click);
+        // 当前选中的字号高亮
+        if (view.toolbar.current_size - size).abs() < f32::EPSILON {
+            b = b.primary();
+        }
+        group = group.child(b);
+    }
+    group
 }
 
 /// RGBA → BGRA 通道 swap（GPUI RenderImage 用 BGRA）
