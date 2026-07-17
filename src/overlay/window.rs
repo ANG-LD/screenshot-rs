@@ -124,10 +124,10 @@ impl OverlayView {
             ToolButton::Text => DrawCommand::Text {
                 anchor: dp,
                 content: String::new(),
-                font_size: 16.0,
-                color,
-                max_width: None,
-                weight: crate::overlay::drawing::FontWeight::Normal,
+                font_size: self.toolbar.current_size,
+                color: self.toolbar.current_color,
+                max_width: self.selection.current().map(|sel| sel.size.x),
+                weight: self.toolbar.current_weight,
             },
             ToolButton::Mosaic => DrawCommand::Mosaic {
                 rect: (dp, dp),
@@ -561,8 +561,11 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window) {
                 paint_thick_line(w[0].x, w[0].y, w[1].x, w[1].y, line_width, color, window);
             }
         }
-        DrawCommand::Text { anchor, ref content, font_size, color, .. } => {
+        DrawCommand::Text { anchor, ref content, font_size, color, weight, .. } => {
             // Phase 3 简化：画一个文字占位框（按字符数估算宽度）
+            // `weight` 仅作元数据保留 — GPUI paint 阶段不支持 weight，
+            // 真正按 weight 栅格化在 CPU 阶段（commands.rs::rasterize_text）。
+            let _ = weight;
             let char_w = font_size * 0.6;
             let w = char_w * content.chars().count().max(1) as f32;
             let h = font_size;
