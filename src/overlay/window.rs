@@ -126,6 +126,8 @@ impl OverlayView {
                 content: String::new(),
                 font_size: 16.0,
                 color,
+                max_width: None,
+                weight: crate::overlay::drawing::FontWeight::Normal,
             },
             ToolButton::Mosaic => DrawCommand::Mosaic {
                 rect: (dp, dp),
@@ -466,7 +468,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window) {
                 paint_thick_line(w[0].x, w[0].y, w[1].x, w[1].y, line_width, color, window);
             }
         }
-        DrawCommand::Text { anchor, ref content, font_size, color } => {
+        DrawCommand::Text { anchor, ref content, font_size, color, .. } => {
             // Phase 3 简化：画一个文字占位框（按字符数估算宽度）
             let char_w = font_size * 0.6;
             let w = char_w * content.chars().count().max(1) as f32;
