@@ -3,4 +3,6 @@ Cargo.lock.bak
 *.swp
 .DS_Store
 .idea/
-.vscode/
+.vscode
+assets/fonts/*.otf
+assets/fonts/*.ttf
