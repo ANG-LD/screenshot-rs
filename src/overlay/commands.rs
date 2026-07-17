@@ -16,8 +16,29 @@
 
 use crate::capture::CapturedFrame;
 use crate::error::{AppError, AppResult};
-use crate::overlay::drawing::{DrawCommand, Point as DrawPoint, RGBA};
+use crate::overlay::drawing::{DrawCommand, FontWeight, Point as DrawPoint, RGBA};
+#[allow(unused_imports)] // v0.2 stub: cosmic-text imports consumed in T5 (rasterize_text real impl)
+use cosmic_text::{Attrs, Buffer, Family, Style};
+#[allow(unused_imports)] // v0.2 stub: font pool accessors consumed in T5
+use crate::overlay::font::{with_font_system, with_swash_cache};
 use image::imageops::FilterType;
+
+/// 把 Text 命令栅格化到 frame（v0.2 stub 版，Task 5 替换为真实现）
+///
+/// 当前 stub 行为：什么都不做，返回 Ok。等价于"清空 overlay 的选区文字预览"，
+/// 让下游编译过 + 测试通过；Task 5 会替换为 cosmic-text Buffer + SwashCache 真实现。
+#[allow(unused_variables)]
+pub fn rasterize_text(
+    _frame: &mut CapturedFrame,
+    _anchor: (f32, f32),
+    _content: &str,
+    _font_size: f32,
+    _color: RGBA,
+    _max_width: Option<f32>,
+    _weight: FontWeight,
+) -> AppResult<()> {
+    Ok(())
+}
 
 /// 把 commands 列表应用到 frame 的指定子区域
 ///
@@ -69,15 +90,9 @@ pub fn apply_commands(
                     draw_thick_line(frame, p1.0, p1.1, p2.0, p2.1, *line_width, *color)?;
                 }
             }
-            DrawCommand::Text { anchor, content: _, font_size, color } => {
-                // v0.1 简化：用半透明色块占位（v0.2 接 ab_glyph + Noto CJK）
+            DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
-                let char_w = font_size * 0.6;
-                // 按字体平均字符宽度估算；content 长度未知，暂用 4 字符宽度避免越界
-                let w = char_w * 4.0;
-                let h = *font_size;
-                let placeholder = RGBA::new(color.r, color.g, color.b, (color.a / 2).max(0x40));
-                fill_rect_blend(frame, a.0, a.1, w, h, placeholder)?;
+                rasterize_text(frame, a, content, *font_size, *color, *max_width, *weight)?;
             }
             DrawCommand::Mosaic { rect, block_size } => {
                 let a = translate(rect.0, region_origin_x, region_origin_y);
