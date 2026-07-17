@@ -5,6 +5,7 @@
 
 pub mod commands;
 pub mod drawing;
+pub mod font;
 pub mod palette;
 pub mod selection;
 pub mod toolbar;
