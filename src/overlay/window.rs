@@ -9,7 +9,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
+    App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, Pixels, Point, Render, RenderImage, Size, Window, WindowBackgroundAppearance,
     WindowBounds, WindowKind, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
@@ -17,6 +17,7 @@ use gpui_component::button::Button;
 use gpui_component::button::ButtonVariants;
 use gpui_component::Disableable;
 use gpui_component::IconName;
+use gpui_component::Sizable;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
@@ -57,6 +58,22 @@ pub struct OverlayView {
     drawing: DrawingState,
     /// 当前正在画的一笔（mouse_down 到 mouse_up 之间）
     in_progress: Option<DrawCommand>,
+
+    /// Text 工具：是否正在编辑一段文字
+    ///
+    /// Text 的交互模式与 Rectangle/Arrow/Freehand 不同：
+    /// Rectangle/Arrow/Freehand 是"按下→拖动→松开"的一次性画图；
+    /// Text 是"点击→弹输入→输入文字→Enter 提交"。
+    /// 因此用独立 state 跟踪文字编辑会话，不复用 `in_progress`。
+    ///
+    /// 用 gpui_component::input::InputState 而不是手撸 String 拼接：
+    /// InputState 自带 IME 合成支持，能正确处理中文输入法（拼音/五笔等）
+    /// 的组合过程——手撸 on_key_down 只能捕获单个按键事件，IME 合成期间
+    /// 的事件（Process、compositionstart 等）全部丢失。
+    text_input: Option<Entity<gpui_component::input::InputState>>,
+
+    /// Text 工具：文字锚点（屏幕坐标，物理像素）—— Text 命令的 anchor
+    text_input_anchor: BoundsPoint,
 }
 
 /// 覆盖窗口完成后回传给主线程的结果
@@ -85,6 +102,8 @@ impl OverlayView {
             toolbar: ToolbarState::default(),
             drawing: DrawingState::new(),
             in_progress: None,
+            text_input: None,
+            text_input_anchor: BoundsPoint::ZERO,
         }
     }
 
@@ -97,8 +116,8 @@ impl OverlayView {
     /// 在 Editing 模式下，按当前 active_tool 启动一个新 DrawCommand
     ///
     /// 仅在 toolbar.active_tool 是绘图工具时被调用（调用方应已检查）。
-    /// Text 工具的 content 暂留空字符串，等 Phase 3 文字输入接入；当前
-    /// mouse_up 时空 content 会被忽略。
+    /// Text 工具走独立的 `open_text_input` 流程（on_mouse_down 已拦截），
+    /// 不在这里创建空 Text 命令——空 content 会被 finish_draw 过滤，等于死代码。
     fn begin_draw(&mut self, p: BoundsPoint) {
         let Some(tool) = self.toolbar.active_tool else { return };
         let color = self.toolbar.current_color;
@@ -121,20 +140,13 @@ impl OverlayView {
                 color,
                 line_width: lw,
             },
-            ToolButton::Text => DrawCommand::Text {
-                anchor: dp,
-                content: String::new(),
-                font_size: self.toolbar.current_size,
-                color: self.toolbar.current_color,
-                max_width: self.selection.current().map(|sel| sel.size.x),
-                weight: self.toolbar.current_weight,
-            },
             ToolButton::Mosaic => DrawCommand::Mosaic {
                 rect: (dp, dp),
                 block_size: 12,
             },
-            // 非绘图工具忽略
-            ToolButton::ColorPicker | ToolButton::Undo | ToolButton::Redo
+            // Text 走 open_text_input（on_mouse_down 已拦截），
+            // 其余非绘图工具忽略。
+            ToolButton::Text | ToolButton::ColorPicker | ToolButton::Undo | ToolButton::Redo
             | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel => return,
         });
     }
@@ -202,6 +214,81 @@ impl OverlayView {
             other => other,
         };
         self.drawing.push(normalized);
+    }
+
+    /// 打开文字输入（Text 工具 + 选区内点击 → 弹一个 inline 输入框）
+    ///
+    /// 与 Rectangle/Arrow/Freehand 的"按下→拖动→松开"不同，Text 是
+    /// "点击→弹输入→输入→Enter 提交"。所以这里不写 `in_progress`，
+    /// 而是把 InputState 实体存在 `self.text_input` 里。
+    ///
+    /// InputState 自带 IME 支持，能正确处理中文输入法（拼音/五笔等）
+    /// 的组合过程——手撸 on_key_down 只能捕获单个按键事件，IME 合成期间
+    /// 的事件（Process、compositionstart 等）全部丢失。
+    fn open_text_input(
+        &mut self,
+        p: BoundsPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::{InputEvent, InputState};
+        self.text_input_anchor = p;
+        tracing::info!("open_text_input: anchor=({:.1}, {:.1})", p.x, p.y);
+
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入文字…"));
+        // 立即 focus，让键盘事件路由到这里（IME 组合也走 focus handle）
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+
+        // 订阅 InputState 事件：
+        //   PressEnter → 提交（push Text 命令）
+        //   Blur       → 用户点击外部也提交（避免半截文字丢失）
+        //   Change     → 通知重绘（输入框内容变化→重渲染）
+        cx.subscribe_in(&input, window, |this, state, event, _window, cx| match event {
+            InputEvent::PressEnter { .. } => {
+                this.finalize_text_input(state, cx);
+            }
+            InputEvent::Blur => {
+                if this.text_input.is_some() {
+                    this.finalize_text_input(state, cx);
+                }
+            }
+            InputEvent::Change => {
+                cx.notify();
+            }
+            InputEvent::Focus => {
+                // Focus 由 open_text_input 主动触发，无需额外处理
+            }
+        })
+        .detach();
+
+        self.text_input = Some(input);
+        cx.notify();
+    }
+
+    /// 把 text_input 当前内容提交成 DrawCommand::Text 并清理状态
+    fn finalize_text_input(
+        &mut self,
+        state: &gpui::Entity<gpui_component::input::InputState>,
+        cx: &mut Context<Self>,
+    ) {
+        let value = state.read(cx).value();
+        if !value.is_empty() {
+            let anchor = self.text_input_anchor;
+            // SharedString 没有 Display impl；用 String::from 走 From<SharedString>
+            let content: String = String::from(value);
+            self.drawing.push(DrawCommand::Text {
+                anchor: crate::overlay::drawing::Point::new(anchor.x, anchor.y),
+                content,
+                font_size: self.toolbar.current_size,
+                color: self.toolbar.current_color,
+                max_width: self.selection.current().map(|sel| sel.size.x),
+                weight: self.toolbar.current_weight,
+            });
+        }
+        self.text_input = None;
+        cx.notify();
     }
 
     /// 渲染浮动工具栏（在 Editing 模式下挂在选区下方）
@@ -595,7 +682,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window) {
 }
 
 impl Render for OverlayView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_image = self.frame_image.clone();
         let selection_bounds = self.selection.current();
         let screen_bounds = self.screen_bounds;
@@ -810,16 +897,43 @@ impl Render for OverlayView {
             }
         }
 
+        // 渲染活动文字输入（gpui-component Input，自带 IME 支持）
+        // anchor 是屏幕物理像素，div 用 logical px，所以除以 scale_factor。
+        if let Some(ref input) = self.text_input {
+            let anchor = self.text_input_anchor;
+            let scale = window.scale_factor();
+            let lp_x = px(anchor.x / scale);
+            let lp_y = px(anchor.y / scale);
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(lp_y)
+                    .left(lp_x)
+                    .min_w(px(200.0 / scale))
+                    .child(
+                        gpui_component::input::Input::new(input)
+                            .small()
+                            .bordered(true),
+                    ),
+            );
+        }
+
         root
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     let p = to_bounds_point(ev.position);
                     // Editing 模式下分发：handle 命中 → 交给 SelectionState
                     // (Resizing)；active_tool 已选 + 点在选区内 → 开始绘图；
                     // 其他情况 → 交给 SelectionState (Moving / Creating)
                     if this.mode == OverlayMode::Editing {
                         if let Some(sel) = this.selection.current() {
+                            // Text 工具 + 选区内点击 → 打开 inline 输入（自带 IME）
+                            // 早 return，避免被下面的 begin_draw 分支抢走
+                            if this.toolbar.active_tool == Some(ToolButton::Text) && sel.contains(p) {
+                                this.open_text_input(p, window, cx);
+                                return;
+                            }
                             // handle 命中（即使没 active_tool 也优先 resize）
                             if sel.hit_handle(p, HANDLE_HIT_HALF).is_some() {
                                 this.selection.mouse_down(p);
