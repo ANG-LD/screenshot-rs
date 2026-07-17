@@ -68,9 +68,28 @@ pub enum DrawCommand {
         content: String,
         font_size: f32,
         color: RGBA,
+        max_width: Option<f32>,
+        weight: FontWeight,
     },
     /// 马赛克：把选区局部图像缩放到 block_size×block_size 再放大回原尺寸
     Mosaic { rect: Rect, block_size: u32 },
+}
+
+/// 文字粗细 (v0.2 新增)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FontWeight {
+    Normal,
+    Bold,
+}
+
+impl FontWeight {
+    /// 选对应字体的 OTF 字节
+    pub fn font_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Normal => include_bytes!("../../assets/fonts/NotoSansSC-Regular.otf"),
+            Self::Bold   => include_bytes!("../../assets/fonts/NotoSansSC-Bold.otf"),
+        }
+    }
 }
 
 /// 绘图状态：维护命令列表 + 历史索引，支持撤销/重做
@@ -128,5 +147,19 @@ impl DrawingState {
     pub fn visible_commands(&self) -> impl Iterator<Item = &DrawCommand> {
         let inactive_prefix = self.commands.len().saturating_sub(self.history_index);
         self.commands.iter().skip(inactive_prefix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_weight_font_bytes_returns_nonempty_for_both_variants() {
+        let regular = FontWeight::Normal.font_bytes();
+        let bold = FontWeight::Bold.font_bytes();
+        assert!(!regular.is_empty(), "Regular OTF 不能为空");
+        assert!(!bold.is_empty(), "Bold OTF 不能为空");
+        assert_ne!(regular.as_ptr(), bold.as_ptr(), "Regular/Bold 必须指向不同字节");
     }
 }
