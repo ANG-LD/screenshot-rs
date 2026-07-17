@@ -11,33 +11,151 @@
 //!   抗锯齿，但对 MVP 视觉可接受）
 //! - Mosaic：把 frame 对应区域 downscale 到 (w/block_size, h/block_size) 再
 //!   nearest-neighbor upscale 回原尺寸
-//! - Text：v0.1 暂画一个半透明色块作为占位（不接字体，避免引入 TTF 子集依赖）；
-//!   v0.2 接入 Noto Sans CJK SC 子集后再做真正的文字光栅化
+//! - Text（v0.2）：cosmic-text Buffer + SwashCache 拿到每个 glyph 的 alpha
+//!   mask，按 SourceOver 合成到 frame；越界裁剪不报错
 
 use crate::capture::CapturedFrame;
 use crate::error::{AppError, AppResult};
 use crate::overlay::drawing::{DrawCommand, FontWeight, Point as DrawPoint, RGBA};
-#[allow(unused_imports)] // v0.2 stub: cosmic-text imports consumed in T5 (rasterize_text real impl)
-use cosmic_text::{Attrs, Buffer, Family, Style};
-#[allow(unused_imports)] // v0.2 stub: font pool accessors consumed in T5
+use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Weight};
 use crate::overlay::font::{with_font_system, with_swash_cache};
 use image::imageops::FilterType;
 
-/// 把 Text 命令栅格化到 frame（v0.2 stub 版，Task 5 替换为真实现）
+/// 把 Text 命令栅格化到 frame（v0.2 真实现）
 ///
-/// 当前 stub 行为：什么都不做，返回 Ok。等价于"清空 overlay 的选区文字预览"，
-/// 让下游编译过 + 测试通过；Task 5 会替换为 cosmic-text Buffer + SwashCache 真实现。
-#[allow(unused_variables)]
+/// - `anchor` 是 **frame 局部坐标**（已 -region_origin，由调用方 translate）
+/// - `font_size` 是 **物理像素**（不随 scale_factor 倍乘，与 overlay 预览一致）
+/// - 越界部分（frame 外）裁掉，不报错
+///
+/// cosmic-text 流程：
+/// 1. `Buffer::new` + `set_text` + `set_size(Some(max_width))` 控制折行
+/// 2. `shape_until_scroll` → `layout_runs`
+/// 3. 每 glyph `LayoutGlyph::physical` 拿 cache_key → `SwashCache::get_image` 拿 alpha mask
+/// 4. `blend_mask_to_frame` 写入像素 (SourceOver + mask alpha)
 pub fn rasterize_text(
-    _frame: &mut CapturedFrame,
-    _anchor: (f32, f32),
-    _content: &str,
-    _font_size: f32,
-    _color: RGBA,
-    _max_width: Option<f32>,
-    _weight: FontWeight,
+    frame: &mut CapturedFrame,
+    anchor: (f32, f32),
+    content: &str,
+    font_size: f32,
+    color: RGBA,
+    max_width: Option<f32>,
+    weight: FontWeight,
 ) -> AppResult<()> {
+    if content.is_empty() || font_size <= 0.0 {
+        return Ok(());
+    }
+    let (anchor_x, anchor_y) = anchor;
+    let weight_attr = if weight == FontWeight::Normal {
+        Weight::NORMAL
+    } else {
+        Weight::BOLD
+    };
+    // cosmic-text: Some(0.0) 会 panic，0 宽度当 None 走（不折行）
+    let max_w = max_width.filter(|&w| w > 0.0);
+
+    // 阶段 1：layout。只借用 font_system，产出每个 glyph 的 (gx, gy, cache_key)。
+    // 用物理坐标（以 anchor 为原点）；line_y 由 cosmic-text 通过 (0, run.line_y) 传给 physical。
+    let physical_glyphs: Vec<(f32, f32, cosmic_text::CacheKey)> = with_font_system(|font_system| {
+        let metrics = Metrics::new(font_size, font_size * 1.4);
+        let mut buffer = Buffer::new(font_system, metrics);
+        let attrs = Attrs::new()
+            .family(Family::Name("Noto Sans SC"))
+            .weight(weight_attr);
+        buffer.set_text(content, &attrs, Shaping::Advanced, None);
+        buffer.set_size(max_w, None);
+        buffer.shape_until_scroll(font_system, false);
+
+        let mut out = Vec::new();
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                // glyph.physical：offset 是 line 起点 (0, line_y)；scale=1
+                let phys = glyph.physical((0.0, run.line_y), 1.0);
+                out.push((phys.x as f32, phys.y as f32, phys.cache_key));
+            }
+        }
+        out
+    });
+
+    // 阶段 2：rasterize。每个 glyph 单独进入 swash_cache；为避开
+    // 同时借用 font_system + swash_cache 两个 RefCell 的问题，
+    // swash_cache 闭包内再开一个 with_font_system（不同 thread_local，无重叠）。
+    for (gx, gy, cache_key) in physical_glyphs {
+        let mask_opt = with_swash_cache(|swash| {
+            with_font_system(|fs| swash.get_image(fs, cache_key).as_ref().cloned())
+        });
+        let Some(mask) = mask_opt else {
+            // 字体无法栅格化该 glyph（极少见：缺字形、emoji、彩色位图等），静默跳过
+            continue;
+        };
+        blend_mask_to_frame(frame, &mask, anchor_x + gx, anchor_y + gy, color);
+    }
     Ok(())
+}
+
+/// 把一张灰度 alpha mask 写到 frame 的指定位置
+///
+/// mask 数据排布：单字节每像素 (0..=255 alpha)，width × height
+/// SwashImage.placement.{left,top} 是相对锚点 (baseline) 的 bearing 偏移：
+///   - `placement.left`：glyph 左缘到 baseline 原点的水平 bearing（正向 = 右）
+///   - `placement.top`：glyph 顶到 baseline 的**向上**距离（cosmic-text 渲染时取负）
+///
+/// 参考 cosmic-text::swash::with_pixels 的写法：x 直接加，y 取负再加
+fn blend_mask_to_frame(
+    frame: &mut CapturedFrame,
+    mask: &cosmic_text::SwashImage,
+    target_x: f32,
+    target_y: f32,
+    color: RGBA,
+) {
+    let w_px = frame.width as i32;
+    let h_px = frame.height as i32;
+    // placement.top 是"距离 baseline 向上多少"，所以减
+    let start_x = (target_x + mask.placement.left as f32) as i32;
+    let start_y = (target_y - mask.placement.top as f32) as i32;
+    let mask_w = mask.placement.width as i32;
+    let mask_h = mask.placement.height as i32;
+    if mask_w <= 0 || mask_h <= 0 {
+        return;
+    }
+    for sy in 0..mask_h {
+        let py = start_y + sy;
+        if py < 0 || py >= h_px {
+            continue;
+        }
+        for sx in 0..mask_w {
+            let px = start_x + sx;
+            if px < 0 || px >= w_px {
+                continue;
+            }
+            let m_idx = (sy * mask_w + sx) as usize;
+            if m_idx >= mask.data.len() {
+                continue;
+            }
+            let mask_a = mask.data[m_idx] as u32;
+            if mask_a == 0 {
+                continue;
+            }
+            let f_idx = ((py * w_px + px) as usize) * 4;
+            if f_idx + 3 >= frame.pixels.len() {
+                continue;
+            }
+            blend_pixel_with_text_mask(&mut frame.pixels[f_idx..f_idx + 4], color, mask_a);
+        }
+    }
+}
+
+/// 文字专用 SourceOver：复合 mask alpha 与 color.a
+///   eff_a = (color.a / 255) * (mask / 255)
+///   rgb_out = text_rgb * eff_a + dst_rgb * (1 - eff_a)
+fn blend_pixel_with_text_mask(dst: &mut [u8], text_color: RGBA, mask_a: u32) {
+    let eff_a = (text_color.a as u32 * mask_a) / 255;
+    let inv = 255 - eff_a;
+    for i in 0..3 {
+        let s = [text_color.r, text_color.g, text_color.b][i] as u32;
+        let d = dst[i] as u32;
+        dst[i] = ((s * eff_a + d * inv) / 255) as u8;
+    }
+    dst[3] = eff_a.max(dst[3] as u32) as u8;
 }
 
 /// 把 commands 列表应用到 frame 的指定子区域
@@ -387,5 +505,92 @@ mod tests {
         // (0..10, 0..10) 区域应该还是 0
         let idx = (5 * 20 + 5) * 4;
         assert_eq!(f.pixels[idx], 0, "r at (5,5) should be 0, got {}", f.pixels[idx]);
+    }
+
+    // ====== T5: rasterize_text 真实现测试 ======
+
+    #[test]
+    fn rasterize_text_empty_content_noop() {
+        let mut f = empty_frame(50, 30);
+        let baseline = f.pixels.clone();
+        rasterize_text(
+            &mut f, (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal,
+        )
+        .unwrap();
+        assert_eq!(f.pixels, baseline, "空 content 不能改 frame");
+    }
+
+    #[test]
+    fn rasterize_text_out_of_frame_anchor_does_not_panic() {
+        let mut f = empty_frame(20, 20);
+        rasterize_text(
+            &mut f, (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal,
+        )
+        .unwrap();
+        assert_eq!(f.width, 20);
+        assert_eq!(f.height, 20);
+    }
+
+    #[test]
+    fn rasterize_text_basic_writes_some_pixels() {
+        let mut f = empty_frame(200, 60);
+        rasterize_text(
+            &mut f,
+            (10.0, 10.0),
+            "Hi 你好",
+            32.0,
+            RGBA::new(0xFF, 0x00, 0x00, 0xFF),
+            None,
+            FontWeight::Normal,
+        )
+        .unwrap();
+        let non_zero = f.pixels.iter().filter(|&&p| p != 0).count();
+        assert!(non_zero > 10, "应至少写 10 个非 0 像素: actual={}", non_zero);
+        let red_count = (0..f.pixels.len() / 4)
+            .filter(|&i| f.pixels[i * 4] > 100)
+            .count();
+        assert!(red_count > 0, "应至少有一个明显的红色像素");
+    }
+
+    #[test]
+    fn rasterize_text_multi_line_when_max_width_small() {
+        let mut f = empty_frame(80, 200);
+        let content: String = "你好世界ABCDEFGHIJ".repeat(6);
+        rasterize_text(
+            &mut f,
+            (0.0, 0.0),
+            &content,
+            24.0,
+            RGBA::RED,
+            Some(50.0),
+            FontWeight::Normal,
+        )
+        .unwrap();
+        // 60 字 / 50px 约每行 5-6 字 → 应至少跑出 3 行
+        let bottom_written = (100..200).any(|row| {
+            (0..80).any(|col| f.pixels[(row * 80 + col) * 4] != 0)
+        });
+        assert!(bottom_written, "max_width=50 应迫使文字折多行，下半部分应有像素");
+    }
+
+    #[test]
+    fn rasterize_text_bold_changes_at_least_one_pixel() {
+        let mut normal = empty_frame(120, 60);
+        let mut bold = empty_frame(120, 60);
+        rasterize_text(
+            &mut normal, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal,
+        )
+        .unwrap();
+        rasterize_text(
+            &mut bold, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold,
+        )
+        .unwrap();
+        let diff = normal
+            .pixels
+            .iter()
+            .zip(bold.pixels.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(diff > 0, "Normal 和 Bold 应至少 1 像素不同: diff={}", diff);
     }
 }
