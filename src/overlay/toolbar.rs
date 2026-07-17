@@ -4,7 +4,12 @@
 //! 实际的 GPUI Button 渲染依赖 gpui-component crate 接入，留到后续迭代完善。
 
 // 引入 RGBA 颜色类型，用于表示工具栏中当前选中的颜色状态
-use crate::overlay::drawing::RGBA;
+use crate::overlay::drawing::{FontWeight, RGBA};
+
+/// 字号档位（v0.2 工具栏下拉用）
+///
+/// 单位：物理像素（与 font_size 字段一致，不随 scale_factor 倍乘）
+pub const FONT_SIZES: &[f32] = &[16.0, 20.0, 24.0, 32.0, 48.0];
 
 /// 工具栏按钮类型
 ///
@@ -28,6 +33,8 @@ pub enum ToolButton {
     Undo,
     /// 重做被撤销的操作
     Redo,
+    /// 切换文字粗体（v0.2 新增）
+    Bold,
     /// 确认并保存截图标注
     Finish,
     /// 取消当前编辑会话
@@ -49,6 +56,7 @@ impl ToolButton {
         ToolButton::ColorPicker,
         ToolButton::Undo,
         ToolButton::Redo,
+        ToolButton::Bold,
         ToolButton::Finish,
         ToolButton::Cancel,
     ];
@@ -67,6 +75,7 @@ impl ToolButton {
             ToolButton::ColorPicker => "颜色",
             ToolButton::Undo => "撤销",
             ToolButton::Redo => "重做",
+            ToolButton::Bold => "B",
             ToolButton::Finish => "完成",
             ToolButton::Cancel => "取消",
         }
@@ -75,7 +84,7 @@ impl ToolButton {
 
 /// 工具栏状态
 ///
-/// 保存工具栏当前的交互状态，包括选中的工具、当前颜色、线宽等。
+/// 保存工具栏当前的交互状态，包括选中的工具、当前颜色、字号等。
 /// 此结构由上层（如 OverlayWindow）持有，工具栏组件通过引用读取与更新。
 pub struct ToolbarState {
     /// 当前选中的工具
@@ -91,6 +100,14 @@ pub struct ToolbarState {
     ///
     /// 绘制矩形边框、箭头、画图笔触的线宽（单位：像素）。
     pub line_width: f32,
+    /// 当前字号（v0.2 新增）
+    ///
+    /// 绘制文本标注时的字号（单位：物理像素，不随 scale_factor 倍乘）。
+    pub current_size: f32,
+    /// 当前字重（v0.2 新增）
+    ///
+    /// 绘制文本标注时的粗细，Normal/Bold 切换由 Bold 按钮触发。
+    pub current_weight: FontWeight,
 }
 
 impl Default for ToolbarState {
@@ -99,6 +116,27 @@ impl Default for ToolbarState {
             active_tool: None,
             current_color: RGBA::RED,
             line_width: 2.0,
+            current_size: 18.0,
+            current_weight: FontWeight::Normal,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_default_state_has_expected_size_and_weight() {
+        let s = ToolbarState::default();
+        assert_eq!(s.current_size, 18.0);
+        assert_eq!(s.current_weight, FontWeight::Normal);
+    }
+
+    #[test]
+    fn font_sizes_constant_includes_recommended_values() {
+        assert!(FONT_SIZES.contains(&16.0));
+        assert!(FONT_SIZES.contains(&48.0));
+        assert_eq!(FONT_SIZES.len(), 5);
     }
 }
