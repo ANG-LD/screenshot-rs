@@ -1055,7 +1055,16 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
                     // 这样 track_focus 的 div 能收到键盘事件
                     let handle = view.read(cx).focus_handle.clone();
                     handle.focus(window, cx);
-                    view
+                    // 必须用 gpui_component::Root 包一层：
+                    // gpui-component 的 Input 在 blur 时会调
+                    // `Root::update(window, cx, ...)` 去清 `focused_input`，
+                    // 找不到 Root 会 panic "BUG: window first layer should be
+                    // a gpui_component::Root." → 整个 GPUI 线程 panic →
+                    // 覆盖窗口闪退（用户报告的"切图框消失"）。
+                    // toolbar / Button 不需要 Root（它们不调 Root::update），
+                    // 但 Input 需要，所以开了 Text 工具 + 点击输入框后任何
+                    // blur 路径（按 Enter、点外面）都会触发 panic。
+                    cx.new(|cx| gpui_component::Root::new(view, window, cx))
                 },
             )
             .expect("open_window 失败");
