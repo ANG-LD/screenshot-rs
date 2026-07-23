@@ -53,6 +53,7 @@ fn drawing_state_redo_restores() {
     assert!(state.is_visible(0));
 }
 
+/// LIFO 语义：undo 隐藏最后一条命令，push 后截断已撤销的尾部。
 #[test]
 fn drawing_state_new_push_drops_redo_history() {
     let mut state = DrawingState::new();
@@ -61,14 +62,16 @@ fn drawing_state_new_push_drops_redo_history() {
         color: rgba(255, 0, 0, 255),
         line_width: 2.0,
     });
+    // Undo：隐藏第一条
     state.undo();
+    assert_eq!(state.history_index, 0);
+    // Push 新命令：截断已撤销的旧命令
     state.push(DrawCommand::Rectangle {
         rect: (DrawPoint::new(0.0, 0.0), DrawPoint::new(20.0, 20.0)),
         color: rgba(0, 255, 0, 255),
         line_width: 2.0,
     });
     assert_eq!(state.history_index, 1);
-    assert_eq!(state.commands.len(), 2);
-    assert!(!state.is_visible(0));
-    assert!(state.is_visible(1));
+    assert_eq!(state.commands.len(), 1); // 旧命令已被截断
+    assert!(state.is_visible(0)); // 新命令可见
 }

@@ -161,7 +161,7 @@ const HANDLE_HALF_SIZE: f32 = 8.0;
 /// 实现要点：每个 handle 拖动时"对侧"保持固定。例如 TopLeft 拖动 → 右下角固定；
 /// Bottom 拖动 → 上边固定。完成后用 `clamp_inside` 限制在屏幕内，
 /// 用 `normalize` 保证 size 为正。
-fn apply_resize(
+pub(crate) fn apply_resize(
     bounds: Bounds,
     handle: Handle,
     new_handle_pos: Point,

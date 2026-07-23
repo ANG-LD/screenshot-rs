@@ -96,6 +96,11 @@ impl AppState {
         // 把可见的 DrawCommand 应用到裁剪后的 frame 上
         // 命令的坐标是屏幕坐标，需要平移到 clipped 局部坐标
         if !result.commands.is_empty() {
+            tracing::info!(
+                "apply_commands: clipped={}x{} region_origin=({},{}) commands={}",
+                clipped.width, clipped.height, region.origin.x, region.origin.y,
+                result.commands.len()
+            );
             crate::overlay::commands::apply_commands(
                 &mut clipped,
                 region.origin.x,

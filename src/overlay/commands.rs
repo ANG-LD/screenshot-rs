@@ -180,25 +180,29 @@ pub fn apply_commands(
             DrawCommand::Arrow { from, to, color, line_width } => {
                 let f = translate(*from, region_origin_x, region_origin_y);
                 let t = translate(*to, region_origin_x, region_origin_y);
-                draw_thick_line(frame, f.0, f.1, t.0, t.1, *line_width, *color)?;
-                // 箭头三角
                 let dx = t.0 - f.0;
                 let dy = t.1 - f.1;
                 let len = (dx * dx + dy * dy).sqrt();
                 if len >= 1.0 {
                     let ux = dx / len;
                     let uy = dy / len;
-                    let head_len = (line_width * 6.0).max(8.0);
-                    let head_w = (line_width * 3.0).max(4.0);
+                    let head_len = (line_width * 7.0).max(14.0);
+                    let head_w = (line_width * 2.0).max(4.0);
                     let bx = t.0 - ux * head_len;
                     let by = t.1 - uy * head_len;
+                    // 主线：从起点窄到箭头底部宽，渐变过渡
+                    let start_lw = (line_width * 0.3).max(1.0);
+                    draw_tapered_line(frame, f.0, f.1, bx, by, start_lw, *line_width, *color)?;
+                    // 箭头：两条短边从 to 张开成 V 字（不画底边 p1→p2）
                     let px = -uy;
                     let py = ux;
                     let p1 = (bx + px * head_w, by + py * head_w);
                     let p2 = (bx - px * head_w, by - py * head_w);
                     draw_thick_line(frame, t.0, t.1, p1.0, p1.1, *line_width, *color)?;
                     draw_thick_line(frame, t.0, t.1, p2.0, p2.1, *line_width, *color)?;
-                    draw_thick_line(frame, p1.0, p1.1, p2.0, p2.1, *line_width, *color)?;
+                } else {
+                    // 极短线：至少画一个点
+                    draw_thick_line(frame, f.0, f.1, t.0, t.1, *line_width, *color)?;
                 }
             }
             DrawCommand::Freehand { points, color, line_width } => {
@@ -210,7 +214,12 @@ pub fn apply_commands(
             }
             DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
+                tracing::info!(
+                    "apply_commands Text: local_anchor=({}, {}) content={:?} size={} weight={:?} max_width={:?}",
+                    a.0, a.1, content, font_size, weight, max_width
+                );
                 rasterize_text(frame, a, content, *font_size, *color, *max_width, *weight)?;
+                tracing::info!("apply_commands Text: rasterize_text done");
             }
             DrawCommand::Mosaic { rect, block_size } => {
                 let a = translate(rect.0, region_origin_x, region_origin_y);
@@ -238,7 +247,46 @@ fn normalize_rect(a: (f32, f32), b: (f32, f32)) -> (f32, f32, f32, f32) {
     )
 }
 
-/// 画一条指定粗细的实线（轴对齐 bounding box）
+/// 像素到线段的垂距
+fn point_to_segment_distance(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 0.001 {
+        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
+    }
+    let t = ((px - x1) * dx + (py - y1) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let proj_x = x1 + t * dx;
+    let proj_y = y1 + t * dy;
+    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+}
+
+/// 像素在线段上的投影参数 t ∈ [0, 1]
+fn project_on_segment(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 0.001 {
+        return 0.0;
+    }
+    ((px - x1) * dx + (py - y1) * dy) / len_sq
+}
+
+/// smoothstep: 在 edge0..edge1 之间平滑过渡
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 画一条指定粗细的实线（距离反走样）
+///
+/// 对线段附近每个像素计算到线段的垂距 d：
+/// - d ≤ half-0.5 → 完全不透明（线内部）
+/// - half-0.5 < d ≤ half+0.5 → smoothstep 过渡（1px 反走样边缘）
+/// - d > half+0.5 → 跳过
+///
+/// 相比之前的重叠软圆方案，内部像素只写一次，不再因多次叠加变糊。
 fn draw_thick_line(
     frame: &mut CapturedFrame,
     x1: f32,
@@ -249,11 +297,258 @@ fn draw_thick_line(
     color: RGBA,
 ) -> AppResult<()> {
     let half = (lw / 2.0).max(0.5);
-    let min_x = x1.min(x2) - half;
-    let min_y = y1.min(y2) - half;
-    let max_x = x1.max(x2) + half;
-    let max_y = y1.max(y2) + half;
-    fill_rect_blend(frame, min_x, min_y, max_x - min_x, max_y - min_y, color)
+    let aa = 0.5_f32;
+    let r = half + aa;
+
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+
+    // 退化到点
+    if len_sq < 0.01 {
+        return fill_round_dot(frame, x1, y1, half, color);
+    }
+    let len = len_sq.sqrt();
+
+    let w_px = frame.width as i32;
+    let h_px = frame.height as i32;
+
+    let min_y = ((y1.min(y2) - r).floor() as i32).max(0);
+    let max_y = ((y1.max(y2) + r).ceil() as i32).min(h_px - 1);
+
+    for scan_y in min_y..=max_y {
+        let py = scan_y as f32 + 0.5;
+
+        // — 计算当前扫描行 x 范围 —
+        let mut x_min = f32::MAX;
+        let mut x_max = f32::MIN;
+
+        // 端点 A 的圆帽
+        let dya = py - y1;
+        if dya.abs() < r {
+            let c = (r * r - dya * dya).sqrt();
+            x_min = x_min.min(x1 - c);
+            x_max = x_max.max(x1 + c);
+        }
+        // 端点 B 的圆帽
+        let dyb = py - y2;
+        if dyb.abs() < r {
+            let c = (r * r - dyb * dyb).sqrt();
+            x_min = x_min.min(x2 - c);
+            x_max = x_max.max(x2 + c);
+        }
+
+        // 线段主体（两条平行边界线与扫描行的交点）
+        if dy.abs() > 0.001 {
+            let ux = dx / len;
+            let uy = dy / len;
+            // 上边界 L+: A + t*D + r*P,  其中 P = (-uy, ux)
+            let t_plus = (py - y1 - r * ux) / dy;
+            if (0.0..=1.0).contains(&t_plus) {
+                let xx = x1 + t_plus * dx - r * uy;
+                x_min = x_min.min(xx);
+                x_max = x_max.max(xx);
+            }
+            // 下边界 L-: A + t*D - r*P
+            let t_minus = (py - y1 + r * ux) / dy;
+            if (0.0..=1.0).contains(&t_minus) {
+                let xx = x1 + t_minus * dx + r * uy;
+                x_min = x_min.min(xx);
+                x_max = x_max.max(xx);
+            }
+        } else {
+            // 水平线：整行都在主体内
+            if (py - y1).abs() <= r {
+                x_min = x_min.min(x1.min(x2));
+                x_max = x_max.max(x1.max(x2));
+            }
+        }
+
+        if x_min > x_max {
+            continue;
+        }
+
+        let px0 = (x_min.floor() as i32).max(0);
+        let px1 = (x_max.ceil() as i32).min(w_px - 1);
+
+        for scan_x in px0..=px1 {
+            let px = scan_x as f32 + 0.5;
+            let d = point_to_segment_distance(px, py, x1, y1, x2, y2);
+
+            let coverage = if d <= half {
+                1.0
+            } else if d >= r {
+                continue;
+            } else {
+                1.0 - smoothstep(half, r, d)
+            };
+
+            let alpha = ((color.a as f32) * coverage).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let soft = RGBA { r: color.r, g: color.g, b: color.b, a: alpha.min(255) as u8 };
+            let idx = ((scan_y * w_px + scan_x) as usize) * 4;
+            blend_pixel(&mut frame.pixels[idx..idx + 4], soft);
+        }
+    }
+    Ok(())
+}
+
+/// 画宽度渐变的线段（窄→宽），用于箭头主线
+///
+/// 每像素投影到线段上，按投影位置插值半宽，再按垂距计算覆盖率。
+fn draw_tapered_line(
+    frame: &mut CapturedFrame,
+    x1: f32, y1: f32,
+    x2: f32, y2: f32,
+    start_lw: f32,
+    end_lw: f32,
+    color: RGBA,
+) -> AppResult<()> {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+
+    if len_sq < 0.01 {
+        let half = (end_lw / 2.0).max(0.5);
+        return fill_round_dot(frame, x1, y1, half, color);
+    }
+    let len = len_sq.sqrt();
+
+    let aa = 0.5_f32;
+    let start_half = (start_lw / 2.0).max(0.5);
+    let end_half = (end_lw / 2.0).max(0.5);
+    // 使用最大半径做扫描行裁剪
+    let max_half = start_half.max(end_half);
+    let r = max_half + aa;
+
+    let w_px = frame.width as i32;
+    let h_px = frame.height as i32;
+
+    let min_y = ((y1.min(y2) - r).floor() as i32).max(0);
+    let max_y = ((y1.max(y2) + r).ceil() as i32).min(h_px - 1);
+
+    for scan_y in min_y..=max_y {
+        let py = scan_y as f32 + 0.5;
+
+        let mut x_min = f32::MAX;
+        let mut x_max = f32::MIN;
+
+        // 端点圆帽（用各自半宽）
+        let dya = py - y1;
+        let ra = start_half + aa;
+        if dya.abs() < ra {
+            let c = (ra * ra - dya * dya).sqrt();
+            x_min = x_min.min(x1 - c);
+            x_max = x_max.max(x1 + c);
+        }
+        let dyb = py - y2;
+        let rb = end_half + aa;
+        if dyb.abs() < rb {
+            let c = (rb * rb - dyb * dyb).sqrt();
+            x_min = x_min.min(x2 - c);
+            x_max = x_max.max(x2 + c);
+        }
+
+        // 主体
+        if dy.abs() > 0.001 {
+            let ux = dx / len;
+            let uy = dy / len;
+            let t_plus = (py - y1 - r * ux) / dy;
+            if (0.0..=1.0).contains(&t_plus) {
+                let xx = x1 + t_plus * dx - r * uy;
+                x_min = x_min.min(xx);
+                x_max = x_max.max(xx);
+            }
+            let t_minus = (py - y1 + r * ux) / dy;
+            if (0.0..=1.0).contains(&t_minus) {
+                let xx = x1 + t_minus * dx + r * uy;
+                x_min = x_min.min(xx);
+                x_max = x_max.max(xx);
+            }
+        } else {
+            if (py - y1).abs() <= r {
+                x_min = x_min.min(x1.min(x2));
+                x_max = x_max.max(x1.max(x2));
+            }
+        }
+
+        if x_min > x_max {
+            continue;
+        }
+
+        let px0 = (x_min.floor() as i32).max(0);
+        let px1 = (x_max.ceil() as i32).min(w_px - 1);
+
+        for scan_x in px0..=px1 {
+            let px = scan_x as f32 + 0.5;
+            let t = project_on_segment(px, py, x1, y1, x2, y2).clamp(0.0, 1.0);
+            let half = start_half + (end_half - start_half) * t;
+            let d = point_to_segment_distance(px, py, x1, y1, x2, y2);
+
+            let r_local = half + aa;
+            let coverage = if d <= half {
+                1.0
+            } else if d >= r_local {
+                continue;
+            } else {
+                1.0 - smoothstep(half, r_local, d)
+            };
+
+            let alpha = ((color.a as f32) * coverage).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let soft = RGBA { r: color.r, g: color.g, b: color.b, a: alpha.min(255) as u8 };
+            let idx = ((scan_y * w_px + scan_x) as usize) * 4;
+            blend_pixel(&mut frame.pixels[idx..idx + 4], soft);
+        }
+    }
+    Ok(())
+}
+
+/// 画一个反走样圆点（退化用）
+fn fill_round_dot(
+    frame: &mut CapturedFrame,
+    cx: f32,
+    cy: f32,
+    half: f32,
+    color: RGBA,
+) -> AppResult<()> {
+    if half <= 0.5 {
+        return fill_rect_blend(frame, cx - 0.5, cy - 0.5, 1.0, 1.0, color);
+    }
+    let aa = 1.0_f32;
+    let r = half + aa;
+    let w_px = frame.width as i32;
+    let h_px = frame.height as i32;
+    let x0 = ((cx - r).floor() as i32).max(0);
+    let x1 = ((cx + r).ceil() as i32).min(w_px - 1);
+    let y0 = ((cy - r).floor() as i32).max(0);
+    let y1 = ((cy + r).ceil() as i32).min(h_px - 1);
+    for py in y0..=y1 {
+        for px in x0..=x1 {
+            let dx = (px as f32 + 0.5) - cx;
+            let dy = (py as f32 + 0.5) - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let coverage = if d <= half {
+                1.0
+            } else if d >= r {
+                continue;
+            } else {
+                1.0 - smoothstep(half, r, d)
+            };
+            let alpha = ((color.a as f32) * coverage).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let soft = RGBA { r: color.r, g: color.g, b: color.b, a: alpha.min(255) as u8 };
+            let idx = ((py * w_px + px) as usize) * 4;
+            blend_pixel(&mut frame.pixels[idx..idx + 4], soft);
+        }
+    }
+    Ok(())
 }
 
 /// 画空心矩形边框（4 条粗线）
@@ -323,9 +618,8 @@ fn blend_pixel(dst: &mut [u8], src: RGBA) {
     for i in 0..3 {
         let s = [src.r, src.g, src.b][i] as u32;
         let d = dst[i] as u32;
-        dst[i] = ((s * 255 + d * inv) / 255) as u8;
+        dst[i] = ((s * sa + d * inv) / 255) as u8;
     }
-    // alpha 通道：直接覆盖（标量源模式足够好）
     dst[3] = src.a.max(dst[3]);
 }
 
@@ -451,10 +745,11 @@ mod tests {
             "g at (0,0) = {}",
             f.pixels[idx_00 + 1]
         );
-        // 中点 (10, 10) 应该是绿色
+        // 中点 (10, 10) 应该是绿色（45° 斜线上，像素中心距线段 0.707px，
+        // 半宽 0.5px 的反走样边缘，偏透明是几何正确的）
         let idx_mid = (10 * 20 + 10) * 4;
         assert!(
-            f.pixels[idx_mid + 1] > 200,
+            f.pixels[idx_mid + 1] > 100,
             "g at (10,10) = {}",
             f.pixels[idx_mid + 1]
         );

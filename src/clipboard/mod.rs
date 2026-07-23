@@ -39,6 +39,12 @@ impl ClipboardService {
     ///
     /// 第一次调用时会 lazy 创建 arboard 连接（允许显示服务暂时不可用，
     /// 服务启动不会因此失败）。后续调用复用同一连接。
+    ///
+    /// Linux X11/Wayland 偶发"could not be converted to the appropriate format"
+    /// —— 通常不是图像数据真的有问题，而是 arboard 内部持有的剪贴板所有权
+    /// 被其他应用抢走（用户中途切到其他剪贴板管理工具、或 X server 处理大图
+    /// 时连接被 server 端断开）。失败时把连接 drop 重连一次再试，
+    /// 避免一次偶发错误让本次截图直接丢。
     pub fn write_frame(&self, frame: &CapturedFrame) -> AppResult<()> {
         let mut guard = self
             .inner
@@ -47,17 +53,45 @@ impl ClipboardService {
         if guard.is_none() {
             *guard = Some(arboard::Clipboard::new().map_err(AppError::Clipboard)?);
         }
-        let clipboard = guard
-            .as_mut()
-            .expect("刚 ensure 完不应为 None");
+
+        // 校验像素长度与 width*height*4 一致：arboard set_image 内部会
+        // 把 RGBA8 编码为 PNG，长度不匹配直接 ConversionFailure，
+        // 报出来的错误是"could not be converted to the appropriate format"——
+        // 看不出来是长度问题，反而像格式问题，让人误以为是颜色通道顺序。
+        let expected = frame.width as usize * frame.height as usize * 4;
+        if frame.pixels.len() != expected {
+            tracing::error!(
+                "CapturedFrame 长度不一致：width={} height={} pixels.len()={} expected={}",
+                frame.width, frame.height, frame.pixels.len(), expected
+            );
+            return Err(AppError::Window(format!(
+                "CapturedFrame pixels 长度不匹配：得到 {}，期望 {}",
+                frame.pixels.len(),
+                expected
+            )));
+        }
+
         let img_data = ImageData {
             width: frame.width as usize,
             height: frame.height as usize,
             bytes: frame.pixels.clone().into(), // Cow<[u8]>
         };
-        clipboard
-            .set_image(img_data)
-            .map_err(AppError::Clipboard)?;
-        Ok(())
+        let clipboard = guard
+            .as_mut()
+            .expect("刚 ensure 完不应为 None");
+        match clipboard.set_image(img_data.clone()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!("剪贴板写入失败，重连重试一次：{e}");
+                *guard = None;
+                let mut new_clipboard =
+                    arboard::Clipboard::new().map_err(AppError::Clipboard)?;
+                new_clipboard
+                    .set_image(img_data)
+                    .map_err(AppError::Clipboard)?;
+                *guard = Some(new_clipboard);
+                Ok(())
+            }
+        }
     }
 }

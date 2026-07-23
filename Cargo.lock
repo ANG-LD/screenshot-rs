@@ -6350,6 +6350,7 @@ dependencies = [
  "global-hotkey",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_macros",
  "gpui_platform",
  "gtk",

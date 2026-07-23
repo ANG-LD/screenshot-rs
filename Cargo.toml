@@ -11,6 +11,8 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac10
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "951e3de" }
+# 默认资源（图标 / 字体），与 gpui-component 同 rev 以避免 links 冲突
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "951e3de" }
 
 # 屏幕捕获（跨平台 crate）
 screenshots = "0.6"

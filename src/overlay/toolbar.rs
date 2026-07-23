@@ -11,6 +11,12 @@ use crate::overlay::drawing::{FontWeight, RGBA};
 /// 单位：物理像素（与 font_size 字段一致，不随 scale_factor 倍乘）
 pub const FONT_SIZES: &[f32] = &[16.0, 20.0, 24.0, 32.0, 48.0];
 
+/// 画笔/边框粗细档位（px）
+///
+/// 用于矩形、箭头、画笔、马赛克的边线粗细选择。
+pub const LINE_WIDTHS: &[f32] = &[2.0, 4.0, 6.0, 8.0];
+
+
 /// 工具栏按钮类型
 ///
 /// 枚举所有可出现在浮动工具栏上的工具/动作按钮。
@@ -82,9 +88,18 @@ impl ToolButton {
     }
 }
 
+/// 二级面板内容类型（点 active 绘图工具按钮二次时浮出的 popover 内容）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarPopup {
+    /// 画图类 popover：粗细档位 + 颜色
+    Stroke,
+    /// 文字 popover：字号档位 + Bold 切换 + 颜色
+    Text,
+}
+
 /// 工具栏状态
 ///
-/// 保存工具栏当前的交互状态，包括选中的工具、当前颜色、字号等。
+/// 保存工具栏当前的交互状态，包括选中的工具、当前颜色、字号、二级面板等。
 /// 此结构由上层（如 OverlayWindow）持有，工具栏组件通过引用读取与更新。
 pub struct ToolbarState {
     /// 当前选中的工具
@@ -108,6 +123,8 @@ pub struct ToolbarState {
     ///
     /// 绘制文本标注时的粗细，Normal/Bold 切换由 Bold 按钮触发。
     pub current_weight: FontWeight,
+    /// 当前展开的二级面板（None = 收起）
+    pub popup: Option<ToolbarPopup>,
 }
 
 impl Default for ToolbarState {
@@ -115,9 +132,10 @@ impl Default for ToolbarState {
         Self {
             active_tool: None,
             current_color: RGBA::RED,
-            line_width: 2.0,
-            current_size: 18.0,
+            line_width: 4.0,
+            current_size: 24.0,
             current_weight: FontWeight::Normal,
+            popup: None,
         }
     }
 }
@@ -129,8 +147,9 @@ mod tests {
     #[test]
     fn toolbar_default_state_has_expected_size_and_weight() {
         let s = ToolbarState::default();
-        assert_eq!(s.current_size, 18.0);
+        assert_eq!(s.current_size, 24.0);
         assert_eq!(s.current_weight, FontWeight::Normal);
+        assert_eq!(s.line_width, 4.0);
     }
 
     #[test]

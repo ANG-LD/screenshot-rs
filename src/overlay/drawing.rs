@@ -110,11 +110,11 @@ impl DrawingState {
 
     /// 添加新命令
     ///
-    /// 总是追加到 commands 末尾并将 history_index 增 1。
-    /// 在 redo 区非空时 push，旧 undo 命令仍会保留下来作为审计日志。
+    /// 截断已撤销的尾部命令后追加，保证 push 后 history_index == commands.len()。
     pub fn push(&mut self, cmd: DrawCommand) {
+        self.commands.truncate(self.history_index);
         self.commands.push(cmd);
-        self.history_index += 1;
+        self.history_index = self.commands.len();
     }
 
     /// 撤销：将 history_index 减 1（不会真正删除命令）
@@ -133,20 +133,29 @@ impl DrawingState {
 
     /// 判断索引 i 处的命令是否当前可见
     ///
-    /// "可见"定义为：处于 commands 末尾、且在 `history_index` 范围内的项。
-    /// 即索引 `i` 必须满足 `i >= commands.len() - history_index`。
-    /// 这样可以同时支持：
-    /// - 简单的 push/undo/redo（只有一个项目时）
-    /// - undo 后再 push（新命令可见，旧命令保留在 commands 但不可见）
+    /// LIFO 语义：`history_index` 表示从头开始的可见数量。
+    /// undo 使最后一条命令不可见，redo 恢复。
     pub fn is_visible(&self, i: usize) -> bool {
-        let inactive_prefix = self.commands.len().saturating_sub(self.history_index);
-        i >= inactive_prefix
+        i < self.history_index
     }
 
     /// 当前可见的命令迭代器
     pub fn visible_commands(&self) -> impl Iterator<Item = &DrawCommand> {
-        let inactive_prefix = self.commands.len().saturating_sub(self.history_index);
-        self.commands.iter().skip(inactive_prefix)
+        self.commands.iter().take(self.history_index)
+    }
+
+    /// 遍历可见命令及其实际索引（用于命中测试定位命令）
+    pub fn visible_commands_with_indices(&self) -> impl Iterator<Item = (usize, &DrawCommand)> {
+        self.commands.iter().enumerate().take(self.history_index)
+    }
+
+    /// 按实际索引获取可见命令的可变引用（用于原地修改）
+    pub fn get_visible_mut(&mut self, index: usize) -> Option<&mut DrawCommand> {
+        if self.is_visible(index) {
+            self.commands.get_mut(index)
+        } else {
+            None
+        }
     }
 }
 
