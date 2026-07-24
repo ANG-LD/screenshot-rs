@@ -169,8 +169,22 @@ pub fn apply_commands(
     region_origin_y: f32,
     commands: &[DrawCommand],
 ) -> AppResult<()> {
+    // 第一步：马赛克命令 — 只作用于原始截图像素，
+    // 保证矩形/箭头/文字等标注叠加在马赛克之上。
+    for cmd in commands {
+        if let DrawCommand::Mosaic { regions, block_size, color } = cmd {
+            for rect in regions {
+                let a = translate(rect.0, region_origin_x, region_origin_y);
+                let b = translate(rect.1, region_origin_x, region_origin_y);
+                let (x1, y1, x2, y2) = normalize_rect(a, b);
+                apply_mosaic(frame, x1, y1, x2, y2, *block_size, *color)?;
+            }
+        }
+    }
+    // 第二步：所有标注命令 — 绘制在马赛克之上
     for cmd in commands {
         match cmd {
+            DrawCommand::Mosaic { .. } => {} // 已在第一步处理
             DrawCommand::Rectangle { rect, color, line_width } => {
                 let a = translate(rect.0, region_origin_x, region_origin_y);
                 let b = translate(rect.1, region_origin_x, region_origin_y);
@@ -220,12 +234,6 @@ pub fn apply_commands(
                 );
                 rasterize_text(frame, a, content, *font_size, *color, *max_width, *weight)?;
                 tracing::info!("apply_commands Text: rasterize_text done");
-            }
-            DrawCommand::Mosaic { rect, block_size } => {
-                let a = translate(rect.0, region_origin_x, region_origin_y);
-                let b = translate(rect.1, region_origin_x, region_origin_y);
-                let (x1, y1, x2, y2) = normalize_rect(a, b);
-                apply_mosaic(frame, x1, y1, x2, y2, *block_size)?;
             }
         }
     }
@@ -627,7 +635,8 @@ fn blend_pixel(dst: &mut [u8], src: RGBA) {
 ///
 /// 1. 把原区域 resize 到 (w/block_size, h/block_size)（nearest-neighbor）
 /// 2. 再 resize 回原尺寸
-/// 3. 写回 frame 对应区域
+/// 3. 叠加颜色（低 alpha 模拟马赛克预览的调色效果）
+/// 4. 写回 frame 对应区域
 fn apply_mosaic(
     frame: &mut CapturedFrame,
     x1: f32,
@@ -635,6 +644,7 @@ fn apply_mosaic(
     x2: f32,
     y2: f32,
     block_size: u32,
+    color: RGBA,
 ) -> AppResult<()> {
     let bs = block_size.max(1) as i32;
     let rx = x1 as i32;
@@ -653,7 +663,6 @@ fn apply_mosaic(
     let mut small = vec![0u8; (small_w * small_h * 4) as usize];
     for sy in 0..small_h {
         for sx in 0..small_w {
-            // 取原区域 (sx*bs, sy*bs) 处的代表像素
             let src_x = (rx + sx * bs).clamp(0, w_px - 1);
             let src_y = (ry + sy * bs).clamp(0, h_px - 1);
             let src_idx = ((src_y * w_px + src_x) as usize) * 4;
@@ -662,17 +671,13 @@ fn apply_mosaic(
         }
     }
 
-    // 2) 用 imageops 把 small buffer 视为 RGBA8 图像，先压缩再放大
-    //    用两次 nearest 滤镜实现 mosaic
-    let mid_w = small_w;
-    let mid_h = small_h;
-    // small buffer → image::ImageBuffer
-    let img_small = image::RgbaImage::from_raw(mid_w as u32, mid_h as u32, small)
+    // 2) nearest 放大回原尺寸实现马赛克
+    let img_small = image::RgbaImage::from_raw(small_w as u32, small_h as u32, small)
         .ok_or_else(|| AppError::Window("mosaic 创建 ImageBuffer 失败".into()))?;
-    // nearest 放大回原尺寸
     let img_big = image::imageops::resize(&img_small, rw as u32, rh as u32, FilterType::Nearest);
 
-    // 3) 写回 frame
+    // 3) 写回 frame（像素化 + 颜色叠加）
+    let tint = RGBA::new(color.r, color.g, color.b, 0x48);
     for dy in 0..rh {
         let py = ry + dy;
         if py < 0 || py >= h_px {
@@ -687,6 +692,7 @@ fn apply_mosaic(
             let dst_idx = ((py * w_px + px) as usize) * 4;
             frame.pixels[dst_idx..dst_idx + 4]
                 .copy_from_slice(&img_big.as_raw()[src_idx..src_idx + 4]);
+            blend_pixel(&mut frame.pixels[dst_idx..dst_idx + 4], tint);
         }
     }
     Ok(())
@@ -783,23 +789,29 @@ mod tests {
         f.pixels[i + 3] = 0xFF;
 
         let cmd = DrawCommand::Mosaic {
-            rect: (DrawPoint::new(0.0, 0.0), DrawPoint::new(20.0, 20.0)),
+            regions: vec![(DrawPoint::new(0.0, 0.0), DrawPoint::new(20.0, 20.0))],
             block_size: 10,
+            color: RGBA::new(0x80, 0x80, 0x80, 0x80),
         };
         apply_commands(&mut f, 0.0, 0.0, &[cmd]).unwrap();
 
         // mosaic with block_size=10 → small buffer 2x2
         // small[1,1] samples src (10, 10) → red；其余采样 (0,0)/(10,0)/(0,10) 都是 0
         // nearest upscale 到 20x20 → (10..20, 10..20) 区域全红
+        // apply_mosaic 叠加灰色 tint（alpha=0x48），红区变暗红，黑区变暗灰
         let idx = (15 * 20 + 15) * 4;
         assert!(
-            f.pixels[idx] > 200,
+            f.pixels[idx] > 180,
             "mosaic should propagate red to (15,15), got r={}",
             f.pixels[idx]
         );
-        // (0..10, 0..10) 区域应该还是 0
+        // (0..10, 0..10) 区域原来全黑，叠加灰色 tint 后略灰
         let idx = (5 * 20 + 5) * 4;
-        assert_eq!(f.pixels[idx], 0, "r at (5,5) should be 0, got {}", f.pixels[idx]);
+        assert!(
+            f.pixels[idx] < 60,
+            "r at (5,5) should be dark (gray tint over black), got {}",
+            f.pixels[idx]
+        );
     }
 
     // ====== T5: rasterize_text 真实现测试 ======

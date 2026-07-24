@@ -18,6 +18,7 @@ use gpui_component::button::ButtonVariants;
 use gpui_component::Disableable;
 use gpui_component::IconName;
 use gpui_component::Selectable;
+use gpui_component::Sizable;
 use gpui_component::popover::Popover;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
@@ -43,7 +44,7 @@ enum OverlayMode {
 pub struct OverlayView {
     /// 捕获帧的 GPUI 渲染图（已转 BGRA）
     frame_image: Arc<RenderImage>,
-    /// 屏幕原始 f32 边界
+    /// 屏幕边界（逻辑像素，与 GPUI 坐标系一致）
     screen_bounds: ub::Bounds,
     /// 选区状态机
     selection: SelectionState,
@@ -73,11 +74,10 @@ pub struct OverlayView {
     /// 的事件（Process、compositionstart 等）全部丢失。
     text_input: Option<Entity<gpui_component::input::InputState>>,
 
-    /// Text 工具：文字锚点（屏幕坐标，物理像素）—— Text 命令的 anchor
+    /// Text 工具：文字锚点（逻辑像素）—— Text 命令的 anchor
     text_input_anchor: BoundsPoint,
 
-    /// Text 工具：输入框完整 rect（屏幕物理像素）
-    /// 拖动 / resize 时改这个，渲染时除以 scale_factor 得到 logical px
+    /// Text 工具：输入框完整 rect（逻辑像素，与 GPUI 坐标系一致）
     text_input_rect: ub::Bounds,
 
     /// Text 工具：拖动 / resize 模式（拖顶部 bar 移动整框、拖角 resize）
@@ -94,6 +94,12 @@ pub struct OverlayView {
 
     /// 对选中命令的活跃拖拽操作
     cmd_drag: Option<CmdDragState>,
+
+    /// HiDPI 缩放因子（物理像素 / 逻辑像素）。
+    ///
+    /// screen_bounds 和所有鼠标交互使用逻辑像素（与 GPUI 坐标系一致），
+    /// commit 时乘以 scale_factor 转回物理像素供 app.rs 裁剪/栅格化。
+    scale_factor: f32,
 }
 
 /// 文字输入框拖动 / resize 状态
@@ -159,6 +165,7 @@ impl OverlayView {
     fn new(
         frame: &CapturedFrame,
         screen_bounds: ub::Bounds,
+        scale_factor: f32,
         tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -179,17 +186,30 @@ impl OverlayView {
             toolbar_hovered: false,
             selected_cmd_actual_idx: None,
             cmd_drag: None,
+            scale_factor,
         }
     }
 
     /// 发送结果并关闭窗口
+    ///
+    /// 内部将 selection 和 commands 的坐标从逻辑像素转为物理像素，
+    /// 以匹配 `CapturedFrame` 的物理像素坐标系（app.rs 的 clip_region 和
+    /// commands.rs 的栅格化都用物理像素）。
     fn commit(&self, result: OverlayResult, window: &mut Window) {
+        let s = self.scale_factor;
+        let selection = result.selection.map(|b| ub::Bounds {
+            origin: ub::Point::new(b.origin.x * s, b.origin.y * s),
+            size: ub::Point::new(b.size.x * s, b.size.y * s),
+        });
+        let commands: Vec<DrawCommand> =
+            result.commands.into_iter().map(|c| scale_draw_command(c, s)).collect();
+
         tracing::info!(
             "commit: selection={:?} commands_count={}",
-            result.selection,
-            result.commands.len()
+            selection,
+            commands.len()
         );
-        for (i, c) in result.commands.iter().enumerate() {
+        for (i, c) in commands.iter().enumerate() {
             match c {
                 DrawCommand::Text { anchor, content, font_size, color, weight, max_width } => {
                     tracing::info!(
@@ -200,7 +220,7 @@ impl OverlayView {
                 _ => tracing::info!("cmd[{}] {:?}", i, c),
             }
         }
-        let _ = self.tx.send(result);
+        let _ = self.tx.send(OverlayResult { selection, commands });
         window.remove_window();
     }
 
@@ -232,10 +252,20 @@ impl OverlayView {
                 color,
                 line_width: lw,
             },
-            ToolButton::Mosaic => DrawCommand::Mosaic {
-                rect: (dp, dp),
-                block_size: 12,
-            },
+            ToolButton::Mosaic => {
+                // 将工具栏线宽档位 (2/4/6/8) 映射为画笔大小 (8/16/24/32)
+                let bs = self.toolbar.line_width * 4.0;
+                let half = bs / 2.0;
+                let stamp = (
+                    crate::overlay::drawing::Point::new(dp.x - half, dp.y - half),
+                    crate::overlay::drawing::Point::new(dp.x + half, dp.y + half),
+                );
+                DrawCommand::Mosaic {
+                    regions: vec![stamp],
+                    block_size: (self.toolbar.line_width * 2.0).max(4.0) as u32,
+                    color: self.toolbar.current_color,
+                }
+            }
             // Text 走 open_text_input（on_mouse_down 已拦截），
             // 其余非绘图工具忽略。
             ToolButton::Text | ToolButton::ColorPicker | ToolButton::Undo | ToolButton::Redo
@@ -248,7 +278,7 @@ impl OverlayView {
         let Some(cmd) = self.in_progress.as_mut() else { return };
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
         match cmd {
-            DrawCommand::Rectangle { rect, .. } | DrawCommand::Mosaic { rect, .. } => {
+            DrawCommand::Rectangle { rect, .. } => {
                 rect.1 = dp;
             }
             DrawCommand::Arrow { to, .. } => {
@@ -256,6 +286,28 @@ impl OverlayView {
             }
             DrawCommand::Freehand { points, .. } => {
                 points.push(dp);
+            }
+            DrawCommand::Mosaic { regions, block_size, .. } => {
+                // 画笔模式：仅在距上一个 stamp 足够远时才添加新 stamp（避免重叠过多）
+                let bs = self.toolbar.line_width * 4.0;
+                let spacing = bs * 0.5; // 50% 重叠保证覆盖连续
+                let half = bs / 2.0;
+                let add = match regions.last() {
+                    Some(last) => {
+                        let cx = (last.0.x + last.1.x) / 2.0;
+                        let cy = (last.0.y + last.1.y) / 2.0;
+                        ((dp.x - cx).powi(2) + (dp.y - cy).powi(2)).sqrt() >= spacing
+                    }
+                    None => true,
+                };
+                if add {
+                    let stamp = (
+                        crate::overlay::drawing::Point::new(dp.x - half, dp.y - half),
+                        crate::overlay::drawing::Point::new(dp.x + half, dp.y + half),
+                    );
+                    regions.push(stamp);
+                }
+                let _ = block_size;
             }
             // Text 暂不支持拖拽改内容
             DrawCommand::Text { .. } => {}
@@ -267,11 +319,12 @@ impl OverlayView {
         let Some(cmd) = self.in_progress.take() else { return };
         tracing::info!("finish_draw: cmd={:?}", cmd);
         let valid = match &cmd {
-            DrawCommand::Rectangle { rect, .. } | DrawCommand::Mosaic { rect, .. } => {
+            DrawCommand::Rectangle { rect, .. } => {
                 let w = (rect.0.x - rect.1.x).abs();
                 let h = (rect.0.y - rect.1.y).abs();
                 w >= 2.0 && h >= 2.0
             }
+            DrawCommand::Mosaic { regions, .. } => !regions.is_empty(),
             DrawCommand::Arrow { from, to, .. } => {
                 (from.x - to.x).abs() >= 2.0 || (from.y - to.y).abs() >= 2.0
             }
@@ -279,7 +332,7 @@ impl OverlayView {
             DrawCommand::Text { content, .. } => !content.is_empty(),
         };
         if !valid { return; }
-        // 归一化 Rectangle/Mosaic 的 rect 为 (左上, 右下)
+        // 归一化 Rectangle 的 rect 为 (左上, 右下)；Mosaic 每个 stamp 也归一化
         let normalized = match cmd {
             DrawCommand::Rectangle { rect, color, line_width } => {
                 let a = rect.0;
@@ -293,25 +346,23 @@ impl OverlayView {
                     line_width,
                 }
             }
-            DrawCommand::Mosaic { rect, block_size } => {
-                let a = rect.0;
-                let b = rect.1;
-                DrawCommand::Mosaic {
-                    rect: (
-                        crate::overlay::drawing::Point::new(a.x.min(b.x), a.y.min(b.y)),
-                        crate::overlay::drawing::Point::new(a.x.max(b.x), a.y.max(b.y)),
-                    ),
-                    block_size,
+            DrawCommand::Mosaic { mut regions, block_size, color } => {
+                // 归一化每个 stamp 为 (左上, 右下)
+                for rect in regions.iter_mut() {
+                    let a = rect.0;
+                    let b = rect.1;
+                    rect.0 = crate::overlay::drawing::Point::new(a.x.min(b.x), a.y.min(b.y));
+                    rect.1 = crate::overlay::drawing::Point::new(a.x.max(b.x), a.y.max(b.y));
                 }
+                DrawCommand::Mosaic { regions, block_size, color }
             }
             other => other,
         };
         self.drawing.push(normalized);
-        // 绘制完成后自动选中，方便用户二次编辑
+        // 绘制完成后自动选中，方便用户二次编辑（Mosaic 画笔不支持拖拽编辑）
         match &self.drawing.commands.last() {
             Some(DrawCommand::Rectangle { .. })
-            | Some(DrawCommand::Arrow { .. })
-            | Some(DrawCommand::Mosaic { .. }) => {
+            | Some(DrawCommand::Arrow { .. }) => {
                 self.selected_cmd_actual_idx = Some(self.drawing.commands.len() - 1);
             }
             _ => {}
@@ -346,7 +397,10 @@ impl OverlayView {
         use gpui_component::input::{InputEvent, InputState};
         self.text_input_anchor = p;
         // 初始输入框大小（logical pixels），宽 300px 高 120px，auto_grow(3,8) 的 3 行
-        self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + 300.0, p.y + 120.0));
+        // 裁剪到选区范围内，防止靠近边缘时文字框/手柄超出截图区域
+        let limits = self.selection.current().unwrap_or(self.screen_bounds);
+        self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + 300.0, p.y + 120.0))
+            .clamp_inside(limits);
         tracing::info!("open_text_input: anchor=({:.1}, {:.1})", p.x, p.y);
 
         let input = cx.new(|cx| {
@@ -379,10 +433,9 @@ impl OverlayView {
                 cx.notify();
             }
             InputEvent::Blur => {
-                // 不在 Blur 时 finalize：用户可能正在点工具栏色板/加粗等，
-                // Blur 先于 swatch on_mouse_down 触发，finalize 会用到旧颜色。
-                // 改为在开始新动作时显式 finalize（on_mouse_down 中 begin_draw /
-                // open_text_input 前，以及切工具时）。
+                // 兜底：任何导致输入框失焦的操作都会把当前文字落成命令，
+                // 避免用户点击工具栏按钮后文字丢失。
+                _this.finalize_text_input_if_active(cx);
             }
             InputEvent::Change => {
                 cx.notify();
@@ -830,6 +883,7 @@ fn render_stroke_popover_content(
             .selected(is_current)
             .on_click(move |_, _, cx| {
                 let _ = weak_lw.update(cx, |this, cx| {
+                    this.finalize_text_input_if_active(cx);
                     this.toolbar.line_width = lw;
                     cx.notify();
                 });
@@ -999,7 +1053,7 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
             }
         }
     };
-    this.text_input_rect = new_rect.clamp_inside(this.screen_bounds);
+    this.text_input_rect = new_rect.clamp_inside(this.selection.current().unwrap_or(this.screen_bounds));
 }
 
 /// 检测点击是否落在已绘制命令的手柄或主体上
@@ -1052,10 +1106,13 @@ fn hit_test_cmd_drag(cmd: &DrawCommand, p: BoundsPoint) -> Option<CmdDragMode> {
 }
 
 /// 应用命令拖拽增量到 DrawingState 中的命令
+///
+/// 所有拖拽操作都裁剪到选区边界内（若选区存在），防止矩形/箭头超出截图框。
 fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
     use crate::overlay::drawing::Point as DP;
     let dx = p.x - drag.start_mouse.x;
     let dy = p.y - drag.start_mouse.y;
+    let limits = this.selection.current().unwrap_or(this.screen_bounds);
     let Some(cmd) = this.drawing.get_visible_mut(drag.cmd_index) else {
         this.cmd_drag = None;
         return;
@@ -1069,7 +1126,7 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
             let positions = bounds.handle_positions();
             let hp = positions[handle as usize];
             let new_handle = ub::Point::new(hp.x + dx, hp.y + dy);
-            let new_bounds = crate::overlay::selection::apply_resize(bounds, handle, new_handle, this.screen_bounds);
+            let new_bounds = crate::overlay::selection::apply_resize(bounds, handle, new_handle, limits);
             if let DrawCommand::Rectangle { ref mut rect, .. } = cmd {
                 rect.0 = DP::new(new_bounds.origin.x, new_bounds.origin.y);
                 rect.1 = DP::new(new_bounds.origin.x + new_bounds.size.x, new_bounds.origin.y + new_bounds.size.y);
@@ -1083,24 +1140,22 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
             let h = (b.y - a.y).abs();
             let new_origin = ub::Point::new(x1 + dx, y1 + dy);
             let new_bounds = ub::Bounds { origin: new_origin, size: ub::Point::new(w, h) }
-                .clamp_inside(this.screen_bounds);
+                .clamp_inside(limits);
             if let DrawCommand::Rectangle { ref mut rect, .. } = cmd {
                 rect.0 = DP::new(new_bounds.origin.x, new_bounds.origin.y);
                 rect.1 = DP::new(new_bounds.origin.x + new_bounds.size.x, new_bounds.origin.y + new_bounds.size.y);
             }
         }
         CmdDragMode::MoveArrowFrom { start_from, start_to: _ } => {
-            let sb = this.screen_bounds;
-            let x = (start_from.x + dx).clamp(sb.origin.x, sb.origin.x + sb.size.x);
-            let y = (start_from.y + dy).clamp(sb.origin.y, sb.origin.y + sb.size.y);
+            let x = (start_from.x + dx).clamp(limits.origin.x, limits.origin.x + limits.size.x);
+            let y = (start_from.y + dy).clamp(limits.origin.y, limits.origin.y + limits.size.y);
             if let DrawCommand::Arrow { ref mut from, .. } = cmd {
                 *from = DP::new(x, y);
             }
         }
         CmdDragMode::MoveArrowTo { start_to, .. } => {
-            let sb = this.screen_bounds;
-            let x = (start_to.x + dx).clamp(sb.origin.x, sb.origin.x + sb.size.x);
-            let y = (start_to.y + dy).clamp(sb.origin.y, sb.origin.y + sb.size.y);
+            let x = (start_to.x + dx).clamp(limits.origin.x, limits.origin.x + limits.size.x);
+            let y = (start_to.y + dy).clamp(limits.origin.y, limits.origin.y + limits.size.y);
             if let DrawCommand::Arrow { ref mut to, .. } = cmd {
                 *to = DP::new(x, y);
             }
@@ -1108,7 +1163,6 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
         CmdDragMode::MoveArrow { start_from, start_to } => {
             let new_from = ub::Point::new(start_from.x + dx, start_from.y + dy);
             let new_to = ub::Point::new(start_to.x + dx, start_to.y + dy);
-            let limits = this.screen_bounds;
             let min_x = new_from.x.min(new_to.x);
             let max_x = new_from.x.max(new_to.x);
             let min_y = new_from.y.min(new_to.y);
@@ -1165,6 +1219,45 @@ fn build_render_image(frame: &CapturedFrame) -> Arc<RenderImage> {
 /// 把 GPUI 像素坐标转成 SelectionState 用的 f32 点（utils::bounds::Point）
 fn to_bounds_point(p: Point<Pixels>) -> BoundsPoint {
     BoundsPoint::new(f32::from(p.x), f32::from(p.y))
+}
+
+/// 把 DrawCommand 中的所有坐标乘以 scale_factor（逻辑像素 → 物理像素）
+fn scale_draw_command(cmd: DrawCommand, s: f32) -> DrawCommand {
+    use crate::overlay::drawing::Point as DP;
+    let sp = |p: DP| DP::new(p.x * s, p.y * s);
+    match cmd {
+        DrawCommand::Rectangle { rect, color, line_width } => DrawCommand::Rectangle {
+            rect: (sp(rect.0), sp(rect.1)),
+            color,
+            line_width,
+        },
+        DrawCommand::Arrow { from, to, color, line_width } => DrawCommand::Arrow {
+            from: sp(from),
+            to: sp(to),
+            color,
+            line_width,
+        },
+        DrawCommand::Freehand { points, color, line_width } => DrawCommand::Freehand {
+            points: points.into_iter().map(sp).collect(),
+            color,
+            line_width,
+        },
+        DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+            DrawCommand::Text {
+                anchor: sp(anchor),
+                content,
+                font_size,
+                color,
+                max_width: max_width.map(|w| w * s),
+                weight,
+            }
+        }
+        DrawCommand::Mosaic { regions, block_size, color } => DrawCommand::Mosaic {
+            regions: regions.into_iter().map(|r| (sp(r.0), sp(r.1))).collect(),
+            block_size: (block_size as f32 * s).max(1.0) as u32,
+            color,
+        },
+    }
 }
 
 /// RGBA → GPUI rgba u32（0xRRGGBBAA）
@@ -1342,24 +1435,47 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window) {
             let h = line_h * lines.len().max(1) as f32;
             paint_rect_outline(anchor.x, anchor.y, w, h, 1.0, color, window);
         }
-        DrawCommand::Mosaic { rect, block_size } => {
-            // Phase 3 简化：画斜线网格（实际栅格化在 Phase 4 做）
-            let a = rect.0;
-            let b = rect.1;
-            let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
-            let w = (b.x - a.x).abs();
-            let h = (b.y - a.y).abs();
-            let bs = block_size.max(2) as f32;
-            let grid_color = RGBA::new(0xFF, 0xFF, 0xFF, 0xC0);
-            let mut x = x1;
-            while x < x1 + w {
-                paint_thick_line(x, y1, x, y1 + h, 1.0, grid_color, window);
-                x += bs;
-            }
-            let mut y = y1;
-            while y < y1 + h {
-                paint_thick_line(x1, y, x1 + w, y, 1.0, grid_color, window);
-                y += bs;
+        DrawCommand::Mosaic { ref regions, color, block_size } => {
+            // 用 block_size 网格模拟马赛克像素化效果
+            let bs = block_size.max(1) as f32;
+            let bright = Hsla::from(rgba((u32::from(color.r) << 24)
+                | (u32::from(color.g) << 16)
+                | (u32::from(color.b) << 8)
+                | 0x60));
+            let dim = Hsla::from(rgba((u32::from(color.r) << 24)
+                | (u32::from(color.g) << 16)
+                | (u32::from(color.b) << 8)
+                | 0x28));
+            for rect in regions {
+                let a = rect.0;
+                let b = rect.1;
+                let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
+                let w = (b.x - a.x).abs();
+                let h = (b.y - a.y).abs();
+                if w < 1.0 || h < 1.0 { continue; }
+                let cells_x = (w / bs).ceil() as i32;
+                let cells_y = (h / bs).ceil() as i32;
+                for cy in 0..cells_y {
+                    for cx in 0..cells_x {
+                        let cell_fill = if (cx + cy) % 2 == 0 { bright } else { dim };
+                        let cx1 = x1 + cx as f32 * bs;
+                        let cy1 = y1 + cy as f32 * bs;
+                        let cw = bs.min(x1 + w - cx1);
+                        let ch = bs.min(y1 + h - cy1);
+                        if cw < 1.0 || ch < 1.0 { continue; }
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: point(px(cx1), px(cy1)),
+                                size: Size::new(px(cw), px(ch)),
+                            },
+                            px(0.),
+                            cell_fill,
+                            px(0.),
+                            gpui::transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1639,8 +1755,8 @@ impl Render for OverlayView {
         }
 
         // 渲染活动文字输入（gpui-component Input，自带 IME 支持）
-        // anchor 是屏幕物理像素，div 用 logical px，所以除以 scale_factor。
-        // 多行模式（multi_line + rows=3）：Shift+Enter 插入换行；Enter 提交。
+        // text_input_rect 存储逻辑像素（与 GPUI 坐标系一致），直接用 px() 做 CSS 定位。
+        // 多行模式（auto_grow）：输入内容超过 max_rows 后内部滚动。
         // 不用 .small() —— single-line 模式下高度被钉死在 h_6=24px，
         // multi_line 自动调 h_auto()，垂直 padding 由 input_py 控制；视觉比 small 更宽松。
         if let Some(ref input) = self.text_input {
@@ -1675,7 +1791,14 @@ impl Render for OverlayView {
                                 gpui_component::input::Input::new(input)
                                     .appearance(false)
                                     .bordered(true)
-                                    .text_color(gpui::rgba(rgba_u32(self.toolbar.current_color))),
+                                    .text_color(gpui::rgba(rgba_u32(self.toolbar.current_color)))
+                                    .with_size(gpui_component::Size::Size(gpui::px(
+                                        self.toolbar.current_size / 0.875 / self.scale_factor,
+                                    )))
+                                    .font_weight(match self.toolbar.current_weight {
+                                        FontWeight::Bold => gpui::FontWeight::BOLD,
+                                        FontWeight::Normal => gpui::FontWeight::NORMAL,
+                                    }),
                             )
                             .child(make_resize_handle(
                                 "text-resize-nw",
@@ -1805,7 +1928,26 @@ impl Render for OverlayView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                let p = to_bounds_point(ev.position);
+                let mut p = to_bounds_point(ev.position);
+                // 将鼠标位置裁剪到屏幕范围内，防止所有拖拽操作超出截图区域。
+                // GPUI 在快速拖拽时可能报告窗口外的坐标。
+                p.x = p.x.clamp(
+                    this.screen_bounds.origin.x,
+                    this.screen_bounds.origin.x + this.screen_bounds.size.x,
+                );
+                p.y = p.y.clamp(
+                    this.screen_bounds.origin.y,
+                    this.screen_bounds.origin.y + this.screen_bounds.size.y,
+                );
+                // 绘制中（in_progress）/ 拖拽命令时进一步裁剪到选区边界，
+                // 防止矩形/箭头/自由画笔超出截图框进入 dim 区域。
+                let sel = this.selection.current();
+                if this.in_progress.is_some() || this.cmd_drag.is_some() {
+                    if let Some(s) = sel {
+                        p.x = p.x.clamp(s.origin.x, s.origin.x + s.size.x);
+                        p.y = p.y.clamp(s.origin.y, s.origin.y + s.size.y);
+                    }
+                }
                 // 优先处理文字输入框的拖动 / resize
                 if let Some(drag) = this.text_input_drag {
                     apply_text_drag(this, drag, p);
@@ -1933,11 +2075,22 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
             // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
             gpui_component::init(cx);
 
-            // 用主屏尺寸作为窗口尺寸
+            // screen_bounds 来自 CapturedFrame 的物理像素尺寸，但 GPUI 所有
+            // 坐标（鼠标事件、paint 定位）都使用逻辑像素。这里用主屏 bounds
+            // 与帧尺寸的比率作为 scale_factor，把 screen_bounds 转为逻辑像素，
+            // 来保证 clamp_inside 等边界检查生效。
             let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
                 origin: point(px(0.), px(0.)),
                 size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
             });
+            let scale = {
+                let w = f32::from(win_bounds.size.width);
+                if w > 0.0 { screen_bounds.size.x / w } else { 1.0 }
+            };
+            let logical_bounds = ub::Bounds::new(
+                ub::Point::ZERO,
+                ub::Point::new(screen_bounds.size.x / scale, screen_bounds.size.y / scale),
+            );
 
             cx.open_window(
                 WindowOptions {
@@ -1951,7 +2104,7 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
                     ..Default::default()
                 },
                 move |window, cx| {
-                    let view = cx.new(|cx| OverlayView::new(&frame, screen_bounds, tx, cx));
+                    let view = cx.new(|cx| OverlayView::new(&frame, logical_bounds, scale, tx, cx));
                     // 主动把焦点给到 view 自己的 focus_handle，
                     // 这样 track_focus 的 div 能收到键盘事件
                     let handle = view.read(cx).focus_handle.clone();

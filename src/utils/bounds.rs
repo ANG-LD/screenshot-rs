@@ -89,29 +89,35 @@ impl Bounds<Point> {
     }
 
     /// 将当前矩形裁剪到 `limits` 范围内（用于屏幕边界保护）
+    ///
+    /// 左右上下四个方向均裁剪，origin 和 size 最终都保证在 limits 内。
     pub fn clamp_inside(self, limits: Bounds) -> Bounds {
         let mut b = self;
+        let max_x = limits.origin.x + limits.size.x;
+        let max_y = limits.origin.y + limits.size.y;
         // 左裁剪
         if b.origin.x < limits.origin.x {
-            let dx = limits.origin.x - b.origin.x;
+            b.size.x = (b.size.x - (limits.origin.x - b.origin.x)).max(0.0);
             b.origin.x = limits.origin.x;
-            b.size.x = (b.size.x - dx).max(0.0);
         }
-        // 上裁剪
-        if b.origin.y < limits.origin.y {
-            let dy = limits.origin.y - b.origin.y;
-            b.origin.y = limits.origin.y;
-            b.size.y = (b.size.y - dy).max(0.0);
-        }
-        // 右裁剪
-        let max_x = limits.origin.x + limits.size.x;
+        // 右裁剪：先裁剪 size，再兜底裁剪 origin（防止 origin 独自超出右边界）
         if b.origin.x + b.size.x > max_x {
             b.size.x = (max_x - b.origin.x).max(0.0);
         }
+        if b.origin.x > max_x {
+            b.origin.x = max_x;
+        }
+        // 上裁剪
+        if b.origin.y < limits.origin.y {
+            b.size.y = (b.size.y - (limits.origin.y - b.origin.y)).max(0.0);
+            b.origin.y = limits.origin.y;
+        }
         // 下裁剪
-        let max_y = limits.origin.y + limits.size.y;
         if b.origin.y + b.size.y > max_y {
             b.size.y = (max_y - b.origin.y).max(0.0);
+        }
+        if b.origin.y > max_y {
+            b.origin.y = max_y;
         }
         b
     }

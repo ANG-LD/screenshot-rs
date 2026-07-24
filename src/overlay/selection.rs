@@ -104,8 +104,12 @@ impl SelectionState {
         match self.drag {
             DragState::Idle => {}
             DragState::Creating => {
-                // 从按下点 drag_start 到当前点 p 构造矩形并归一化
-                self.bounds = Some(Bounds::new(self.drag_start, p).normalize());
+                // 从按下点 drag_start 到当前点 p 构造矩形并归一化，裁剪到屏幕内
+                self.bounds = Some(
+                    Bounds::new(self.drag_start, p)
+                        .normalize()
+                        .clamp_inside(self.screen_bounds),
+                );
             }
             DragState::Moving { grab_offset } => {
                 if let Some(b) = self.bounds {

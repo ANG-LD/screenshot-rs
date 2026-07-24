@@ -71,8 +71,15 @@ pub enum DrawCommand {
         max_width: Option<f32>,
         weight: FontWeight,
     },
-    /// 马赛克：把选区局部图像缩放到 block_size×block_size 再放大回原尺寸
-    Mosaic { rect: Rect, block_size: u32 },
+    /// 马赛克画笔：沿鼠标轨迹的多个方块，每个方块内像素被 block_size 像素化
+    Mosaic {
+        /// 所有画笔方块（每个是 brush_size×brush_size 的矩形）
+        regions: Vec<Rect>,
+        /// 像素化块大小
+        block_size: u32,
+        /// 预览叠加颜色
+        color: RGBA,
+    },
 }
 
 /// 文字粗细 (v0.2 新增)
