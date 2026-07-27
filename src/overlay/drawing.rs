@@ -164,6 +164,16 @@ impl DrawingState {
             None
         }
     }
+
+    /// 移除一条可见命令并更新 history_index（用于 Text 命令的重新编辑）
+    pub fn remove_visible(&mut self, index: usize) -> Option<DrawCommand> {
+        if index >= self.history_index {
+            return None;
+        }
+        let cmd = self.commands.remove(index);
+        self.history_index -= 1;
+        Some(cmd)
+    }
 }
 
 #[cfg(test)]
