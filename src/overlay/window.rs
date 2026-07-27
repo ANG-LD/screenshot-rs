@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, Rems, Render, RenderImage, Size, Window,
+    MouseMoveEvent, Path, Pixels, Point, Rems, Render, RenderImage, Size, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, point,
     prelude::*, px, quad, rgba,
 };
@@ -253,6 +253,11 @@ impl OverlayView {
                 color,
                 line_width: lw,
             },
+            ToolButton::Ellipse => DrawCommand::Ellipse {
+                rect: (dp, dp),
+                color,
+                line_width: lw,
+            },
             ToolButton::Arrow => DrawCommand::Arrow {
                 from: dp,
                 to: dp,
@@ -290,7 +295,8 @@ impl OverlayView {
         let Some(cmd) = self.in_progress.as_mut() else { return };
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
         match cmd {
-            DrawCommand::Rectangle { rect, .. } => {
+            DrawCommand::Rectangle { rect, .. }
+            | DrawCommand::Ellipse { rect, .. } => {
                 rect.1 = dp;
             }
             DrawCommand::Arrow { to, .. } => {
@@ -331,7 +337,8 @@ impl OverlayView {
         let Some(cmd) = self.in_progress.take() else { return };
         tracing::info!("finish_draw: cmd={:?}", cmd);
         let valid = match &cmd {
-            DrawCommand::Rectangle { rect, .. } => {
+            DrawCommand::Rectangle { rect, .. }
+            | DrawCommand::Ellipse { rect, .. } => {
                 let w = (rect.0.x - rect.1.x).abs();
                 let h = (rect.0.y - rect.1.y).abs();
                 w >= 2.0 && h >= 2.0
@@ -358,6 +365,18 @@ impl OverlayView {
                     line_width,
                 }
             }
+            DrawCommand::Ellipse { rect, color, line_width } => {
+                let a = rect.0;
+                let b = rect.1;
+                DrawCommand::Ellipse {
+                    rect: (
+                        crate::overlay::drawing::Point::new(a.x.min(b.x), a.y.min(b.y)),
+                        crate::overlay::drawing::Point::new(a.x.max(b.x), a.y.max(b.y)),
+                    ),
+                    color,
+                    line_width,
+                }
+            }
             DrawCommand::Mosaic { mut regions, block_size, color } => {
                 // 归一化每个 stamp 为 (左上, 右下)
                 for rect in regions.iter_mut() {
@@ -374,6 +393,7 @@ impl OverlayView {
         // 绘制完成后自动选中，方便用户二次编辑（Mosaic 画笔不支持拖拽编辑）
         match &self.drawing.commands.last() {
             Some(DrawCommand::Rectangle { .. })
+            | Some(DrawCommand::Ellipse { .. })
             | Some(DrawCommand::Arrow { .. }) => {
                 self.selected_cmd_actual_idx = Some(self.drawing.commands.len() - 1);
             }
@@ -554,7 +574,7 @@ impl OverlayView {
     ///
     /// popover 内容由 active_tool 决定：
     /// - Text → 字号档位 + Bold + 颜色
-    /// - Rectangle/Arrow/Freehand/Mosaic → 粗细档位 + 颜色
+    /// - Rectangle/Ellipse/Arrow/Freehand/Mosaic → 粗细档位 + 颜色
     ///
     /// 鼠标点击落在工具栏 div 上时由 root.on_mouse_down 默认 swallow（return）
     /// 阻止 selection.mouse_down 把选区打散，让 Button.on_click 正常触发。
@@ -575,11 +595,18 @@ impl OverlayView {
             .flex()
             .gap(px(TOOLBAR_GAP))
             .items_center()
-            // 1) 绘图工具按钮组：5 个工具按钮，每个都是 Popover trigger
+            // 1) 绘图工具按钮组：6 个工具按钮，每个都是 Popover trigger
             //    (active_tool 在 Popover 内根据当前选中状态确定 popover kind)
             .child(render_tool_button_with_popover(
                 ToolButton::Rectangle,
                 active_tool == Some(ToolButton::Rectangle),
+                weak.clone(),
+                self,
+                cx,
+            ))
+            .child(render_tool_button_with_popover(
+                ToolButton::Ellipse,
+                active_tool == Some(ToolButton::Ellipse),
                 weak.clone(),
                 self,
                 cx,
@@ -684,6 +711,7 @@ const TOOLBAR_OFFSET_Y: f32 = 8.0;
 fn icon_for(btn: ToolButton) -> IconName {
     match btn {
         ToolButton::Rectangle => IconName::Frame,
+        ToolButton::Ellipse => IconName::CircleX,
         ToolButton::Arrow => IconName::ArrowUp,
         ToolButton::Freehand => IconName::Asterisk,
         ToolButton::Text => IconName::SquareTerminal,
@@ -720,8 +748,8 @@ fn compute_toolbar_bounds(
         (screen_h - toolbar_h - TOOLBAR_OFFSET_Y).max(TOOLBAR_OFFSET_Y)
     };
     let toolbar_x = sel.origin.x;
-    // 主行 9 项（5 绘图 + Undo + Redo + Cancel + Finish）按 32 + 间距 4
-    let toolbar_w = TOOLBAR_BTN_SIZE * 9.0 + TOOLBAR_GAP * 8.0 + TOOLBAR_PAD * 2.0;
+    // 主行 10 项（6 绘图 + Undo + Redo + Cancel + Finish）按 32 + 间距 4
+    let toolbar_w = TOOLBAR_BTN_SIZE * 10.0 + TOOLBAR_GAP * 9.0 + TOOLBAR_PAD * 2.0;
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
 }
 
@@ -1127,7 +1155,8 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
 /// 检测点击是否落在已绘制命令的手柄或主体上
 fn hit_test_cmd_drag(cmd: &DrawCommand, p: BoundsPoint) -> Option<CmdDragMode> {
     match cmd {
-        DrawCommand::Rectangle { rect, .. } => {
+        DrawCommand::Rectangle { rect, .. }
+        | DrawCommand::Ellipse { rect, .. } => {
             let a = rect.0;
             let b = rect.1;
             let bounds = ub::Bounds::new(
@@ -1224,7 +1253,8 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
             let hp = positions[handle as usize];
             let new_handle = ub::Point::new(hp.x + dx, hp.y + dy);
             let new_bounds = crate::overlay::selection::apply_resize(bounds, handle, new_handle, limits);
-            if let DrawCommand::Rectangle { ref mut rect, .. } = cmd {
+            if let DrawCommand::Rectangle { ref mut rect, .. }
+                 | DrawCommand::Ellipse { ref mut rect, .. } = cmd {
                 rect.0 = DP::new(new_bounds.origin.x, new_bounds.origin.y);
                 rect.1 = DP::new(new_bounds.origin.x + new_bounds.size.x, new_bounds.origin.y + new_bounds.size.y);
             }
@@ -1238,7 +1268,8 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
             let new_origin = ub::Point::new(x1 + dx, y1 + dy);
             let new_bounds = ub::Bounds { origin: new_origin, size: ub::Point::new(w, h) }
                 .clamp_inside(limits);
-            if let DrawCommand::Rectangle { ref mut rect, .. } = cmd {
+            if let DrawCommand::Rectangle { ref mut rect, .. }
+                 | DrawCommand::Ellipse { ref mut rect, .. } = cmd {
                 rect.0 = DP::new(new_bounds.origin.x, new_bounds.origin.y);
                 rect.1 = DP::new(new_bounds.origin.x + new_bounds.size.x, new_bounds.origin.y + new_bounds.size.y);
             }
@@ -1330,6 +1361,11 @@ fn scale_draw_command(cmd: DrawCommand, s: f32) -> DrawCommand {
             color,
             line_width,
         },
+        DrawCommand::Ellipse { rect, color, line_width } => DrawCommand::Ellipse {
+            rect: (sp(rect.0), sp(rect.1)),
+            color,
+            line_width,
+        },
         DrawCommand::Arrow { from, to, color, line_width } => DrawCommand::Arrow {
             from: sp(from),
             to: sp(to),
@@ -1367,20 +1403,18 @@ fn rgba_u32(c: RGBA) -> u32 {
         | u32::from(c.a)
 }
 
-/// 画一条指定粗细的实线（preview 用，不抗锯齿）
+/// 画一条指定粗细的实线，使用 Path 抗锯齿渲染
 ///
-/// 沿线段以 1 像素步长采样点，每点画一个 lw × lw 的 quad 叠加 ——
-/// 视觉上是真线段，对角线不会变成 bbox 大方块。旧实现 fill 整个 bbox，
-/// 对水平/垂直线 OK，对对角线（Arrow 主线、Freehand 折线相邻两点连线）
-/// 会画成大方块，用户反馈"画出来是个框"。
+/// 把线段表示为旋转矩形（2 个三角形），交给 GPUI 的 Path（底层 Lyon 剖分）
+/// 渲染，消除旧实现中逐个正方形叠加产生的锯齿。
 fn paint_thick_line(x1: f32, y1: f32, x2: f32, y2: f32, lw: f32, color: RGBA, window: &mut Window) {
-    let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
-    let half = (lw / 2.0).max(0.5);
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len = (dx * dx + dy * dy).sqrt();
+    let half = (lw / 2.0).max(0.5);
     if len < 0.5 {
         // 极短线段：一个 quad 兜底
+        let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
         window.paint_quad(gpui::quad(
             Bounds {
                 origin: gpui::point(gpui::px(x1 - half), gpui::px(y1 - half)),
@@ -1394,28 +1428,31 @@ fn paint_thick_line(x1: f32, y1: f32, x2: f32, y2: f32, lw: f32, color: RGBA, wi
         ));
         return;
     }
-    let steps = len.ceil() as usize;
+    // 旋转矩形：沿线段方向的条带
     let ux = dx / len;
     let uy = dy / len;
-    for i in 0..=steps {
-        let t = i as f32;
-        let cx = x1 + ux * t;
-        let cy = y1 + uy * t;
-        window.paint_quad(gpui::quad(
-            Bounds {
-                origin: gpui::point(gpui::px(cx - half), gpui::px(cy - half)),
-                size: Size::new(gpui::px(lw), gpui::px(lw)),
-            },
-            gpui::px(0.),
-            hsla,
-            gpui::px(0.),
-            gpui::transparent_black(),
-            Default::default(),
-        ));
-    }
+    // 法向量（逆时针旋转 90°）× 半宽
+    let nx = -uy * half;
+    let ny = ux * half;
+    let p0 = point(px(x1 + nx), px(y1 + ny));
+    let p1 = point(px(x1 - nx), px(y1 - ny));
+    let p2 = point(px(x2 - nx), px(y2 - ny));
+    let p3 = point(px(x2 + nx), px(y2 + ny));
+    let mut path = Path::new(p0);
+    // 三角形 1: p0→p1→p2
+    path.push_triangle(
+        (p0, p1, p2),
+        (point(0., 1.), point(0., 1.), point(0., 1.)),
+    );
+    // 三角形 2: p0→p2→p3
+    path.push_triangle(
+        (p0, p2, p3),
+        (point(0., 1.), point(0., 1.), point(0., 1.)),
+    );
+    window.paint_path(path, gpui::rgba(rgba_u32(color)));
 }
 
-/// 画一条宽度渐变的线段（preview 用，不抗锯齿）
+/// 画一条宽度渐变的线段，使用 Path 抗锯齿渲染
 fn paint_tapered_line(
     x1: f32, y1: f32,
     x2: f32, y2: f32,
@@ -1424,12 +1461,12 @@ fn paint_tapered_line(
     color: RGBA,
     window: &mut Window,
 ) {
-    let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len = (dx * dx + dy * dy).sqrt();
     if len < 0.5 {
         let half = (end_lw / 2.0).max(0.5);
+        let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
         window.paint_quad(gpui::quad(
             Bounds {
                 origin: gpui::point(gpui::px(x1 - half), gpui::px(y1 - half)),
@@ -1445,28 +1482,22 @@ fn paint_tapered_line(
     }
     let ux = dx / len;
     let uy = dy / len;
-    let start_half = (start_lw / 2.0).max(0.5);
-    let end_half = (end_lw / 2.0).max(0.5);
-    let steps = len.ceil() as usize;
-    for i in 0..=steps {
-        let t = i as f32;
-        let frac = (t / len).min(1.0);
-        let half = start_half + (end_half - start_half) * frac;
-        let lw = half * 2.0;
-        let cx = x1 + ux * t;
-        let cy = y1 + uy * t;
-        window.paint_quad(gpui::quad(
-            Bounds {
-                origin: gpui::point(gpui::px(cx - half), gpui::px(cy - half)),
-                size: Size::new(gpui::px(lw), gpui::px(lw)),
-            },
-            gpui::px(0.),
-            hsla,
-            gpui::px(0.),
-            gpui::transparent_black(),
-            Default::default(),
-        ));
-    }
+    let sh = (start_lw / 2.0).max(0.5);
+    let eh = (end_lw / 2.0).max(0.5);
+    let p0 = point(px(x1 - uy * sh), px(y1 + ux * sh));
+    let p1 = point(px(x1 + uy * sh), px(y1 - ux * sh));
+    let p2 = point(px(x2 + uy * eh), px(y2 - ux * eh));
+    let p3 = point(px(x2 - uy * eh), px(y2 + ux * eh));
+    let mut path = Path::new(p0);
+    path.push_triangle(
+        (p0, p1, p2),
+        (point(0., 1.), point(0., 1.), point(0., 1.)),
+    );
+    path.push_triangle(
+        (p0, p2, p3),
+        (point(0., 1.), point(0., 1.), point(0., 1.)),
+    );
+    window.paint_path(path, gpui::rgba(rgba_u32(color)));
 }
 
 /// 画空心矩形边框（4 条粗线）
@@ -1475,6 +1506,25 @@ fn paint_rect_outline(x: f32, y: f32, w: f32, h: f32, lw: f32, color: RGBA, wind
     paint_thick_line(x, y + h, x + w, y + h, lw, color, window);
     paint_thick_line(x, y, x, y + h, lw, color, window);
     paint_thick_line(x + w, y, x + w, y + h, lw, color, window);
+}
+
+/// 画空心椭圆边框（用 64 段折线近似椭圆轮廓）
+fn paint_ellipse_outline(x: f32, y: f32, w: f32, h: f32, lw: f32, color: RGBA, window: &mut Window) {
+    let cx = x + w / 2.0;
+    let cy = y + h / 2.0;
+    let rx = w / 2.0;
+    let ry = h / 2.0;
+    let n = 64;
+    let mut prev: Option<(f32, f32)> = None;
+    for i in 0..=n {
+        let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+        let px = cx + rx * theta.cos();
+        let py = cy + ry * theta.sin();
+        if let Some((px0, py0)) = prev {
+            paint_thick_line(px0, py0, px, py, lw, color, window);
+        }
+        prev = Some((px, py));
+    }
 }
 
 /// 把一个 DrawCommand 渲染到 window 上（Phase 3 preview，Phase 4 也会复用）
@@ -1487,6 +1537,14 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
             let w = (b.x - a.x).abs();
             let h = (b.y - a.y).abs();
             paint_rect_outline(x1, y1, w, h, *line_width, *color, window);
+        }
+        DrawCommand::Ellipse { rect, color, line_width } => {
+            let a = rect.0;
+            let b = rect.1;
+            let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
+            let w = (b.x - a.x).abs();
+            let h = (b.y - a.y).abs();
+            paint_ellipse_outline(x1, y1, w, h, *line_width, *color, window);
         }
         DrawCommand::Arrow { from, to, color, line_width } => {
             let dx = to.x - from.x;
@@ -1749,7 +1807,8 @@ impl Render for OverlayView {
                             let half = px(HANDLE_VISUAL_SIZE / 2.0);
                             let edge = px(HANDLE_VISUAL_SIZE);
                             match cmd {
-                                DrawCommand::Rectangle { rect, .. } => {
+                                DrawCommand::Rectangle { rect, .. }
+                                | DrawCommand::Ellipse { rect, .. } => {
                                     let a = rect.0;
                                     let b = rect.1;
                                     let bounds = ub::Bounds::new(

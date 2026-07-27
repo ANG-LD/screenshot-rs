@@ -49,6 +49,12 @@ pub enum DrawCommand {
         color: RGBA,
         line_width: f32,
     },
+    /// 椭圆（空心描边，外接矩形与 Rectangle 一致）
+    Ellipse {
+        rect: Rect,
+        color: RGBA,
+        line_width: f32,
+    },
     /// 直线箭头（带箭头头部）
     Arrow {
         from: Point,

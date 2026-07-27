@@ -191,6 +191,12 @@ pub fn apply_commands(
                 let (x1, y1, x2, y2) = normalize_rect(a, b);
                 draw_rect_outline(frame, x1, y1, x2, y2, *line_width, *color)?;
             }
+            DrawCommand::Ellipse { rect, color, line_width } => {
+                let a = translate(rect.0, region_origin_x, region_origin_y);
+                let b = translate(rect.1, region_origin_x, region_origin_y);
+                let (x1, y1, x2, y2) = normalize_rect(a, b);
+                draw_ellipse_outline(frame, x1, y1, x2, y2, *line_width, *color)?;
+            }
             DrawCommand::Arrow { from, to, color, line_width } => {
                 let f = translate(*from, region_origin_x, region_origin_y);
                 let t = translate(*to, region_origin_x, region_origin_y);
@@ -555,6 +561,34 @@ fn fill_round_dot(
             let idx = ((py * w_px + px) as usize) * 4;
             blend_pixel(&mut frame.pixels[idx..idx + 4], soft);
         }
+    }
+    Ok(())
+}
+
+/// 画空心椭圆边框（用 64 段折线近似椭圆轮廓）
+fn draw_ellipse_outline(
+    frame: &mut CapturedFrame,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    lw: f32,
+    color: RGBA,
+) -> AppResult<()> {
+    let cx = (x1 + x2) / 2.0;
+    let cy = (y1 + y2) / 2.0;
+    let rx = (x2 - x1) / 2.0;
+    let ry = (y2 - y1) / 2.0;
+    let n = 64;
+    let mut prev: Option<(f32, f32)> = None;
+    for i in 0..=n {
+        let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+        let px = cx + rx * theta.cos();
+        let py = cy + ry * theta.sin();
+        if let Some((px0, py0)) = prev {
+            draw_thick_line(frame, px0, py0, px, py, lw, color)?;
+        }
+        prev = Some((px, py));
     }
     Ok(())
 }

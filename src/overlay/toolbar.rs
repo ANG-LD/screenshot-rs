@@ -25,6 +25,8 @@ pub const LINE_WIDTHS: &[f32] = &[2.0, 4.0, 6.0, 8.0];
 pub enum ToolButton {
     /// 矩形选区/标注工具
     Rectangle,
+    /// 椭圆标注工具
+    Ellipse,
     /// 箭头标注工具
     Arrow,
     /// 自由画笔工具
@@ -55,6 +57,7 @@ impl ToolButton {
     /// 避免每次访问时分配内存。
     pub const ORDER: &'static [ToolButton] = &[
         ToolButton::Rectangle,
+        ToolButton::Ellipse,
         ToolButton::Arrow,
         ToolButton::Freehand,
         ToolButton::Text,
@@ -74,6 +77,7 @@ impl ToolButton {
     pub fn label(&self) -> &'static str {
         match self {
             ToolButton::Rectangle => "矩形",
+            ToolButton::Ellipse => "椭圆",
             ToolButton::Arrow => "箭头",
             ToolButton::Freehand => "画图",
             ToolButton::Text => "文字",
