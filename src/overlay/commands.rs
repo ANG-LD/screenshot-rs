@@ -579,7 +579,7 @@ fn draw_ellipse_outline(
     let cy = (y1 + y2) / 2.0;
     let rx = (x2 - x1) / 2.0;
     let ry = (y2 - y1) / 2.0;
-    let n = 64;
+    let n = 128;
     let mut prev: Option<(f32, f32)> = None;
     for i in 0..=n {
         let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;

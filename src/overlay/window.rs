@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Path, Pixels, Point, Rems, Render, RenderImage, Size, Window,
+    MouseMoveEvent, Pixels, Point, Rems, Render, RenderImage, Size, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, point,
     prelude::*, px, quad, rgba,
 };
@@ -22,6 +22,7 @@ use gpui_component::IconName;
 use gpui_component::Selectable;
 use gpui_component::Sizable;
 use gpui_component::popover::Popover;
+use gpui_component::scroll::ScrollableElement;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
@@ -90,6 +91,22 @@ pub struct OverlayView {
 
     /// 已提交文字对应的 DrawingState.commands 中的索引，用于重新编辑时移除
     text_input_cmd_idx: Option<usize>,
+
+    /// 原始捕获帧像素（RGBA），用于 OCR 等需要像素数据的操作
+    frame_pixels: Vec<u8>,
+    /// 捕获帧宽度（物理像素）
+    frame_width: u32,
+    /// 捕获帧高度（物理像素）
+    frame_height: u32,
+
+    /// OCR 工具：选中的识别区域（None 表示尚未框选）
+    ocr_rect: Option<ub::Bounds>,
+    /// OCR 工具：识别结果文字
+    ocr_result: Option<String>,
+    /// OCR 工具：是否正在识别中
+    ocr_loading: bool,
+    /// OCR 工具：框选拖拽起点（None 表示未在拖拽）
+    ocr_drag_start: Option<BoundsPoint>,
 
     /// Tooltip：工具栏 div 当前是否被鼠标悬停（用于 root.on_mouse_down 判断
     /// 点击是否落在工具栏上）。工具栏按钮宽高随图标+中文标签动态变化，
@@ -195,6 +212,13 @@ impl OverlayView {
             text_input_drag: None,
             text_input_finalized: false,
             text_input_cmd_idx: None,
+            frame_pixels: frame.pixels.clone(),
+            frame_width: frame.width,
+            frame_height: frame.height,
+            ocr_rect: None,
+            ocr_result: None,
+            ocr_loading: false,
+            ocr_drag_start: None,
             toolbar_hovered: false,
             selected_cmd_actual_idx: None,
             cmd_drag: None,
@@ -208,13 +232,20 @@ impl OverlayView {
     /// 以匹配 `CapturedFrame` 的物理像素坐标系（app.rs 的 clip_region 和
     /// commands.rs 的栅格化都用物理像素）。
     fn commit(&self, result: OverlayResult, window: &mut Window) {
-        let s = self.scale_factor;
+        // 用实际窗口尺寸计算 canvas 坐标 → 帧物理像素的缩放比。
+        // paint_image 会把帧图像缩放到 window.bounds() 内显示，因此
+        // canvas 坐标要乘上 frame_dim / window_dim 才能正确映射到帧像素。
+        // 不能用 run_blocking 里算的 scale_factor（只反映显示缩放），
+        // 因为窗口实际大小可能与显示尺寸不一致（任务栏挤压等）。
+        let wb = window.bounds();
+        let sx = self.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+        let sy = self.frame_height as f32 / f32::from(wb.size.height).max(1.0);
         let selection = result.selection.map(|b| ub::Bounds {
-            origin: ub::Point::new(b.origin.x * s, b.origin.y * s),
-            size: ub::Point::new(b.size.x * s, b.size.y * s),
+            origin: ub::Point::new(b.origin.x * sx, b.origin.y * sy),
+            size: ub::Point::new(b.size.x * sx, b.size.y * sy),
         });
         let commands: Vec<DrawCommand> =
-            result.commands.into_iter().map(|c| scale_draw_command(c, s)).collect();
+            result.commands.into_iter().map(|c| scale_draw_command(c, sx, sy)).collect();
 
         tracing::info!(
             "commit: selection={:?} commands_count={}",
@@ -283,10 +314,10 @@ impl OverlayView {
                     color: self.toolbar.current_color,
                 }
             }
-            // Text 走 open_text_input（on_mouse_down 已拦截），
+            // Text 走 open_text_input、Ocr 走框选识别（on_mouse_down 已拦截），
             // 其余非绘图工具忽略。
-            ToolButton::Text | ToolButton::ColorPicker | ToolButton::Undo | ToolButton::Redo
-            | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel => return,
+            ToolButton::Text | ToolButton::Ocr | ToolButton::ColorPicker | ToolButton::Undo
+            | ToolButton::Redo | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel => return,
         });
     }
 
@@ -632,6 +663,12 @@ impl OverlayView {
                 self,
                 cx,
             ))
+            .child(render_simple_button(
+                ToolButton::Ocr,
+                active_tool == Some(ToolButton::Ocr),
+                false,
+                weak.clone(),
+            ))
             .child(render_tool_button_with_popover(
                 ToolButton::Mosaic,
                 active_tool == Some(ToolButton::Mosaic),
@@ -715,6 +752,7 @@ fn icon_for(btn: ToolButton) -> IconName {
         ToolButton::Arrow => IconName::ArrowUp,
         ToolButton::Freehand => IconName::Asterisk,
         ToolButton::Text => IconName::SquareTerminal,
+        ToolButton::Ocr => IconName::Eye,
         ToolButton::Mosaic => IconName::LayoutDashboard,
         ToolButton::ColorPicker => IconName::Palette,
         ToolButton::Undo => IconName::Undo2,
@@ -748,8 +786,8 @@ fn compute_toolbar_bounds(
         (screen_h - toolbar_h - TOOLBAR_OFFSET_Y).max(TOOLBAR_OFFSET_Y)
     };
     let toolbar_x = sel.origin.x;
-    // 主行 10 项（6 绘图 + Undo + Redo + Cancel + Finish）按 32 + 间距 4
-    let toolbar_w = TOOLBAR_BTN_SIZE * 10.0 + TOOLBAR_GAP * 9.0 + TOOLBAR_PAD * 2.0;
+    // 主行 11 项（6 绘图 + Ocr + Undo + Redo + Cancel + Finish）按 32 + 间距 4
+    let toolbar_w = TOOLBAR_BTN_SIZE * 11.0 + TOOLBAR_GAP * 10.0 + TOOLBAR_PAD * 2.0;
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
 }
 
@@ -872,6 +910,19 @@ fn render_simple_button(
                             },
                             window,
                         );
+                    }
+                    ToolButton::Ocr => {
+                        this.finalize_text_input_if_active(cx);
+                        if this.toolbar.active_tool == Some(ToolButton::Ocr) {
+                            this.toolbar.active_tool = None;
+                            this.ocr_rect = None;
+                            this.ocr_result = None;
+                        } else {
+                            this.toolbar.active_tool = Some(ToolButton::Ocr);
+                            this.ocr_rect = None;
+                            this.ocr_result = None;
+                        }
+                        cx.notify();
                     }
                     ToolButton::Finish => {
                         // 兜底：若 Text 工具还活着没提交，先把它的内容落成命令
@@ -1351,10 +1402,10 @@ fn to_bounds_point(p: Point<Pixels>) -> BoundsPoint {
     BoundsPoint::new(f32::from(p.x), f32::from(p.y))
 }
 
-/// 把 DrawCommand 中的所有坐标乘以 scale_factor（逻辑像素 → 物理像素）
-fn scale_draw_command(cmd: DrawCommand, s: f32) -> DrawCommand {
+/// 把 DrawCommand 中的所有坐标从 canvas 坐标转为帧物理像素坐标
+fn scale_draw_command(cmd: DrawCommand, sx: f32, sy: f32) -> DrawCommand {
     use crate::overlay::drawing::Point as DP;
-    let sp = |p: DP| DP::new(p.x * s, p.y * s);
+    let sp = |p: DP| DP::new(p.x * sx, p.y * sy);
     match cmd {
         DrawCommand::Rectangle { rect, color, line_width } => DrawCommand::Rectangle {
             rect: (sp(rect.0), sp(rect.1)),
@@ -1383,13 +1434,13 @@ fn scale_draw_command(cmd: DrawCommand, s: f32) -> DrawCommand {
                 content,
                 font_size,
                 color,
-                max_width: max_width.map(|w| w * s),
+                max_width: max_width.map(|w| w * sx),
                 weight,
             }
         }
         DrawCommand::Mosaic { regions, block_size, color } => DrawCommand::Mosaic {
             regions: regions.into_iter().map(|r| (sp(r.0), sp(r.1))).collect(),
-            block_size: (block_size as f32 * s).max(1.0) as u32,
+            block_size: (block_size as f32 * sx).max(1.0) as u32,
             color,
         },
     }
@@ -1403,24 +1454,26 @@ fn rgba_u32(c: RGBA) -> u32 {
         | u32::from(c.a)
 }
 
-/// 画一条指定粗细的实线，使用 Path 抗锯齿渲染
+/// 画一条指定粗细的实线
 ///
-/// 把线段表示为旋转矩形（2 个三角形），交给 GPUI 的 Path（底层 Lyon 剖分）
-/// 渲染，消除旧实现中逐个正方形叠加产生的锯齿。
+/// 沿线以高密度采样圆角正方形（corner_radius=lw/2），
+/// 重叠的圆角方块形成平滑的抗锯齿厚线条。
+/// 采样密度随线宽自适应：越细的线步长越小，确保充分重叠。
 fn paint_thick_line(x1: f32, y1: f32, x2: f32, y2: f32, lw: f32, color: RGBA, window: &mut Window) {
+    let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
+    // 方块略大于线宽，确保重叠覆盖
+    let size = (lw * 1.5).max(2.0);
+    let size_half = size / 2.0;
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len = (dx * dx + dy * dy).sqrt();
-    let half = (lw / 2.0).max(0.5);
     if len < 0.5 {
-        // 极短线段：一个 quad 兜底
-        let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
         window.paint_quad(gpui::quad(
             Bounds {
-                origin: gpui::point(gpui::px(x1 - half), gpui::px(y1 - half)),
-                size: Size::new(gpui::px(lw), gpui::px(lw)),
+                origin: gpui::point(gpui::px(x1 - size_half), gpui::px(y1 - size_half)),
+                size: Size::new(gpui::px(size), gpui::px(size)),
             },
-            gpui::px(0.),
+            gpui::px(size_half),
             hsla,
             gpui::px(0.),
             gpui::transparent_black(),
@@ -1428,31 +1481,33 @@ fn paint_thick_line(x1: f32, y1: f32, x2: f32, y2: f32, lw: f32, color: RGBA, wi
         ));
         return;
     }
-    // 旋转矩形：沿线段方向的条带
     let ux = dx / len;
     let uy = dy / len;
-    // 法向量（逆时针旋转 90°）× 半宽
-    let nx = -uy * half;
-    let ny = ux * half;
-    let p0 = point(px(x1 + nx), px(y1 + ny));
-    let p1 = point(px(x1 - nx), px(y1 - ny));
-    let p2 = point(px(x2 - nx), px(y2 - ny));
-    let p3 = point(px(x2 + nx), px(y2 + ny));
-    let mut path = Path::new(p0);
-    // 三角形 1: p0→p1→p2
-    path.push_triangle(
-        (p0, p1, p2),
-        (point(0., 1.), point(0., 1.), point(0., 1.)),
-    );
-    // 三角形 2: p0→p2→p3
-    path.push_triangle(
-        (p0, p2, p3),
-        (point(0., 1.), point(0., 1.), point(0., 1.)),
-    );
-    window.paint_path(path, gpui::rgba(rgba_u32(color)));
+    // 采样密度：越细的线步长越小，确保充分重叠消除锯齿
+    let spacing = if lw < 3.0 { 0.125 } else if lw < 6.0 { 0.2 } else { 0.25 };
+    let steps = (len / spacing).ceil() as usize;
+    for i in 0..=steps {
+        let t = i as f32 * spacing;
+        let cx = x1 + ux * t;
+        let cy = y1 + uy * t;
+        window.paint_quad(gpui::quad(
+            Bounds {
+                origin: gpui::point(gpui::px(cx - size_half), gpui::px(cy - size_half)),
+                size: Size::new(gpui::px(size), gpui::px(size)),
+            },
+            gpui::px(size_half),
+            hsla,
+            gpui::px(0.),
+            gpui::transparent_black(),
+            Default::default(),
+        ));
+    }
 }
 
-/// 画一条宽度渐变的线段，使用 Path 抗锯齿渲染
+/// 画一条宽度渐变的线段
+///
+/// 同 `paint_thick_line`，用重叠圆角正方形实现平滑抗锯齿，
+/// 采样密度随最大线宽自适应。
 fn paint_tapered_line(
     x1: f32, y1: f32,
     x2: f32, y2: f32,
@@ -1461,18 +1516,19 @@ fn paint_tapered_line(
     color: RGBA,
     window: &mut Window,
 ) {
+    let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len = (dx * dx + dy * dy).sqrt();
+    let max_lw = start_lw.max(end_lw);
     if len < 0.5 {
-        let half = (end_lw / 2.0).max(0.5);
-        let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
+        let half = (end_lw / 2.0).max(0.8);
         window.paint_quad(gpui::quad(
             Bounds {
                 origin: gpui::point(gpui::px(x1 - half), gpui::px(y1 - half)),
                 size: Size::new(gpui::px(end_lw), gpui::px(end_lw)),
             },
-            gpui::px(0.),
+            gpui::px(half),
             hsla,
             gpui::px(0.),
             gpui::transparent_black(),
@@ -1482,22 +1538,31 @@ fn paint_tapered_line(
     }
     let ux = dx / len;
     let uy = dy / len;
-    let sh = (start_lw / 2.0).max(0.5);
-    let eh = (end_lw / 2.0).max(0.5);
-    let p0 = point(px(x1 - uy * sh), px(y1 + ux * sh));
-    let p1 = point(px(x1 + uy * sh), px(y1 - ux * sh));
-    let p2 = point(px(x2 + uy * eh), px(y2 - ux * eh));
-    let p3 = point(px(x2 - uy * eh), px(y2 + ux * eh));
-    let mut path = Path::new(p0);
-    path.push_triangle(
-        (p0, p1, p2),
-        (point(0., 1.), point(0., 1.), point(0., 1.)),
-    );
-    path.push_triangle(
-        (p0, p2, p3),
-        (point(0., 1.), point(0., 1.), point(0., 1.)),
-    );
-    window.paint_path(path, gpui::rgba(rgba_u32(color)));
+    let start_half = (start_lw / 2.0).max(0.8);
+    let end_half = (end_lw / 2.0).max(0.8);
+    let spacing = if max_lw < 3.0 { 0.125 } else if max_lw < 6.0 { 0.2 } else { 0.25 };
+    let steps = (len / spacing).ceil() as usize;
+    for i in 0..=steps {
+        let t = i as f32 * spacing;
+        let frac = (t / len).min(1.0);
+        let cur_half = start_half + (end_half - start_half) * frac;
+        let cur_diam = cur_half * 2.0;
+        let cur_size = (cur_diam * 1.5).max(2.0);
+        let cur_size_half = cur_size / 2.0;
+        let cx = x1 + ux * t;
+        let cy = y1 + uy * t;
+        window.paint_quad(gpui::quad(
+            Bounds {
+                origin: gpui::point(gpui::px(cx - cur_size_half), gpui::px(cy - cur_size_half)),
+                size: Size::new(gpui::px(cur_size), gpui::px(cur_size)),
+            },
+            gpui::px(cur_size_half),
+            hsla,
+            gpui::px(0.),
+            gpui::transparent_black(),
+            Default::default(),
+        ));
+    }
 }
 
 /// 画空心矩形边框（4 条粗线）
@@ -1514,7 +1579,7 @@ fn paint_ellipse_outline(x: f32, y: f32, w: f32, h: f32, lw: f32, color: RGBA, w
     let cy = y + h / 2.0;
     let rx = w / 2.0;
     let ry = h / 2.0;
-    let n = 64;
+    let n = 128;
     let mut prev: Option<(f32, f32)> = None;
     for i in 0..=n {
         let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
@@ -1666,6 +1731,97 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
     }
 }
 
+/// 同步执行 OCR：从 frame_pixels 中裁切 rect 区域，保存为 PNG，调用 tesseract CLI。
+///
+/// `window_w` / `window_h` 是 GPUI 窗口的实际尺寸（逻辑像素），必须从
+/// `window.bounds()` 获取。它与 frame 物理尺寸可能有差异（如任务栏挤压），
+/// `paint_image` 会基于两者之比缩放图像，像素提取需用相同比率。
+fn run_ocr_sync(
+    rect: ub::Bounds,
+    frame_pixels: &[u8],
+    frame_width: u32,
+    frame_height: u32,
+    window_w: f32,
+    window_h: f32,
+) -> String {
+    use std::process::Command;
+
+    // canvas 坐标 → 物理像素：需要考虑 paint_image 的缩放比
+    let x_ratio = frame_width as f32 / window_w.max(1.0);
+    let y_ratio = frame_height as f32 / window_h.max(1.0);
+    let x = (rect.origin.x * x_ratio).round().max(0.0) as u32;
+    let y = (rect.origin.y * y_ratio).round().max(0.0) as u32;
+    let w = (rect.size.x * x_ratio).round() as u32;
+    let h = (rect.size.y * y_ratio).round() as u32;
+
+    tracing::info!(
+        "OCR: logical rect=({:.1},{:.1} {}x{}) win=({:.0}x{:.0}) ratio=({:.3},{:.3}) -> physical ({},{}) {}x{}; frame={}x{}",
+        rect.origin.x, rect.origin.y, rect.size.x, rect.size.y,
+        window_w, window_h,
+        x_ratio, y_ratio,
+        x, y, w, h,
+        frame_width, frame_height,
+    );
+
+    // 边界裁剪
+    let w = w.min(frame_width.saturating_sub(x));
+    let h = h.min(frame_height.saturating_sub(y));
+    if w == 0 || h == 0 {
+        return String::new();
+    }
+
+    // 从 RGBA 帧中提取区域，转为 RGB
+    let mut rgb: Vec<u8> = Vec::with_capacity((w * h * 3) as usize);
+    for row in 0..h {
+        let base = ((y + row) * frame_width + x) as usize * 4;
+        for col in 0..w {
+            let idx = base + col as usize * 4;
+            rgb.push(frame_pixels[idx]);     // R
+            rgb.push(frame_pixels[idx + 1]); // G
+            rgb.push(frame_pixels[idx + 2]); // B
+        }
+    }
+
+    // 写入调试 PNG（固定路径方便检查）
+    let debug_path = std::path::PathBuf::from("/tmp/screenshot_ocr_debug.png");
+    {
+        let img = image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| {
+            image::RgbImage::new(w, h)
+        });
+        if let Err(e) = img.save(&debug_path) {
+            tracing::error!("OCR: 保存调试 PNG 失败: {}", e);
+        } else {
+            tracing::info!("OCR: 调试 PNG 已保存到 {}", debug_path.display());
+        }
+    }
+
+    // 调用 tesseract
+    let output = Command::new("tesseract")
+        .arg(&debug_path)
+        .arg("stdout")
+        .arg("-l")
+        .arg("chi_sim+eng")
+        .arg("--psm")
+        .arg("6")
+        .output();
+
+    match output {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.is_empty() {
+                tracing::info!("OCR: tesseract stderr: {}", stderr.trim());
+            }
+            tracing::info!("OCR: 识别结果 ({} bytes): {:?}", text.len(), text);
+            text.trim_end().to_string()
+        }
+        Err(e) => {
+            tracing::error!("tesseract OCR 失败: {}", e);
+            String::new()
+        }
+    }
+}
+
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_image = self.frame_image.clone();
@@ -1701,14 +1857,20 @@ impl Render for OverlayView {
             None
         };
 
+        let ocr_rect = self.ocr_rect;
+        let ocr_dragging = self.ocr_drag_start.is_some();
+
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx),
-            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging),
+            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging), window, cx| {
                 let win_bounds = window.bounds();
 
-                // 1) 把捕获帧作为全屏背景
+                // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
                 let _ = window.paint_image(
-                    win_bounds,
+                    Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: win_bounds.size,
+                    },
                     Default::default(),
                     frame_image.clone(),
                     0,
@@ -1797,6 +1959,25 @@ impl Render for OverlayView {
                     }
                     if let Some(ref ip) = in_progress {
                         paint_command(ip, window, cx, scale_factor, &font_family);
+                    }
+
+                    // 2.55) OCR 框选矩形（高亮半透明 + 绿色描边）
+                    if let Some(ocr) = ocr_rect {
+                        if ocr_dragging && ocr.size.x > 0.0 && ocr.size.y > 0.0 {
+                            let ocr_fill = Hsla::from(rgba(0x00FF8844));
+                            let ocr_border = Hsla::from(rgba(0x00FF88FF));
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(px(ocr.origin.x), px(ocr.origin.y)),
+                                    size: Size::new(px(ocr.size.x), px(ocr.size.y)),
+                                },
+                                px(0.),
+                                ocr_fill,
+                                px(2.0),
+                                ocr_border,
+                                Default::default(),
+                            ));
+                        }
                     }
 
                     // 2.6) 在选中的已绘制命令上渲染拖拽手柄
@@ -2056,6 +2237,99 @@ impl Render for OverlayView {
             }
         }
 
+        // OCR 结果面板（右侧）
+        if let Some(ref text) = self.ocr_result {
+            let panel_w = 320.0;
+            let panel_x = screen_bounds.origin.x + screen_bounds.size.x - panel_w - 16.0;
+            let panel_y = screen_bounds.origin.y + 16.0;
+            let panel_h = screen_bounds.size.y - 32.0;
+            let weak = cx.weak_entity();
+            let text_for_ui = text.clone();
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(panel_y))
+                    .left(px(panel_x))
+                    .w(px(panel_w))
+                    .h(px(panel_h))
+                    .bg(gpui::rgba(0x1A1A1AF0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(gpui::rgba(0x444444CC))
+                    .flex()
+                    .flex_col()
+                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                    // 标题栏 + 关闭按钮
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .p(px(8.0))
+                            .border_b_1()
+                            .border_color(gpui::rgba(0x44444488))
+                            .child(
+                                div()
+                                    .text_color(gpui::rgba(0xCCCCCCFF))
+                                    .text_sm()
+                                    .child(gpui::SharedString::from("OCR 识别结果")),
+                            )
+                            .child({
+                                let w = weak.clone();
+                                Button::new("ocr-close")
+                                    .icon(IconName::Close)
+                                    .compact()
+                                    .ghost()
+                                    .on_click(move |_, _, cx| {
+                                        let _ = w.update(cx, |this, cx| {
+                                            this.ocr_result = None;
+                                            this.ocr_rect = None;
+                                            cx.notify();
+                                        });
+                                    })
+                            }),
+                    )
+                    // 文字内容（可滚动，等宽字体）
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_y_scrollbar()
+                            .p(px(10.0))
+                            .text_color(gpui::rgba(0xDDDDDDFF))
+                            .text_sm()
+                            .font_family(gpui::SharedString::from("monospace"))
+                            .child(gpui::SharedString::from(text_for_ui)),
+                    ),
+            );
+        } else if self.ocr_loading {
+            // 加载指示器
+            let panel_w = 200.0;
+            let panel_x = screen_bounds.origin.x + screen_bounds.size.x - panel_w - 16.0;
+            let panel_y = screen_bounds.origin.y + 16.0;
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(panel_y))
+                    .left(px(panel_x))
+                    .w(px(panel_w))
+                    .h(px(48.0))
+                    .bg(gpui::rgba(0x1A1A1AF0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(gpui::rgba(0x444444CC))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                    .child(
+                        div()
+                            .text_color(gpui::rgba(0xCCCCCCFF))
+                            .text_sm()
+                            .child(gpui::SharedString::from("OCR 识别中…")),
+                    ),
+            );
+        }
+
         root
             .on_mouse_down(
                 MouseButton::Left,
@@ -2215,6 +2489,22 @@ impl Render for OverlayView {
                                 this.open_text_input(p, window, cx);
                                 return;
                             }
+                            // 2.5) OCR 工具 + 选区内点击 → 开始框选识别区域
+                            if this.toolbar.active_tool == Some(ToolButton::Ocr)
+                                && sel.contains(p)
+                            {
+                                this.finalize_text_input_if_active(cx);
+                                this.ocr_result = None;
+                                this.ocr_rect = Some(ub::Bounds::new(p, BoundsPoint::ZERO));
+                                this.ocr_drag_start = Some(p);
+                                tracing::info!(
+                                    "OCR drag start: p=({:.1},{:.1}) sel=({:.1},{:.1} {}x{}) sf={:.2}",
+                                    p.x, p.y,
+                                    sel.origin.x, sel.origin.y, sel.size.x, sel.size.y,
+                                    this.scale_factor,
+                                );
+                                return;
+                            }
                             // 3) active_tool 选了绘图工具 + 点在选区内 → 开始绘图
                             if this.toolbar.active_tool.is_some() && sel.contains(p) {
                                 this.finalize_text_input_if_active(cx);
@@ -2240,10 +2530,10 @@ impl Render for OverlayView {
                     this.screen_bounds.origin.y,
                     this.screen_bounds.origin.y + this.screen_bounds.size.y,
                 );
-                // 绘制中（in_progress）/ 拖拽命令时进一步裁剪到选区边界，
+                // 绘制中（in_progress）/ 拖拽命令 / OCR 框选时进一步裁剪到选区边界，
                 // 防止矩形/箭头/自由画笔超出截图框进入 dim 区域。
                 let sel = this.selection.current();
-                if this.in_progress.is_some() || this.cmd_drag.is_some() {
+                if this.in_progress.is_some() || this.cmd_drag.is_some() || this.ocr_drag_start.is_some() {
                     if let Some(s) = sel {
                         p.x = p.x.clamp(s.origin.x, s.origin.x + s.size.x);
                         p.y = p.y.clamp(s.origin.y, s.origin.y + s.size.y);
@@ -2258,6 +2548,19 @@ impl Render for OverlayView {
                 // 处理命令拖拽
                 if let Some(drag) = this.cmd_drag {
                     apply_cmd_drag(this, drag, p);
+                    cx.notify();
+                    return;
+                }
+                // OCR 框选中：更新 ocr_rect
+                if let Some(start) = this.ocr_drag_start {
+                    let x1 = start.x.min(p.x);
+                    let y1 = start.y.min(p.y);
+                    let x2 = start.x.max(p.x);
+                    let y2 = start.y.max(p.y);
+                    this.ocr_rect = Some(ub::Bounds {
+                        origin: BoundsPoint::new(x1, y1),
+                        size: BoundsPoint::new(x2 - x1, y2 - y1),
+                    });
                     cx.notify();
                     return;
                 }
@@ -2282,6 +2585,37 @@ impl Render for OverlayView {
                     // 命令拖拽结束
                     if this.cmd_drag.is_some() {
                         this.cmd_drag = None;
+                        return;
+                    }
+                    // OCR 框选结束 → 提取像素、启动识别
+                    if this.ocr_drag_start.is_some() {
+                        tracing::info!(
+                            "OCR mouse_up: drag_start=({:.1},{:.1}) ocr_rect={:?}",
+                            this.ocr_drag_start.unwrap().x,
+                            this.ocr_drag_start.unwrap().y,
+                            this.ocr_rect.map(|r| (r.origin.x, r.origin.y, r.size.x, r.size.y)),
+                        );
+                        this.ocr_drag_start = None;
+                        if let Some(rect) = this.ocr_rect {
+                            if rect.size.x > 5.0 && rect.size.y > 5.0 {
+                                let pixels = this.frame_pixels.clone();
+                                let fw = this.frame_width;
+                                let fh = this.frame_height;
+                                this.ocr_loading = true;
+                                cx.notify();
+                                let wb = window.bounds();
+                                let text = run_ocr_sync(rect, &pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
+                                tracing::info!("OCR result len={}, content={:?}", text.len(), text);
+                                this.ocr_result = if text.is_empty() { None } else { Some(text) };
+                                this.ocr_loading = false;
+                                cx.notify();
+                            } else {
+                                tracing::info!("OCR rect too small, cleared");
+                                this.ocr_rect = None;
+                            }
+                        } else {
+                            tracing::info!("OCR ocr_rect is None");
+                        }
                         return;
                     }
                     // 先结束正在画的那一笔

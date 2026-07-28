@@ -33,6 +33,8 @@ pub enum ToolButton {
     Freehand,
     /// 文本标注工具
     Text,
+    /// OCR 文字识别工具
+    Ocr,
     /// 马赛克/打码工具
     Mosaic,
     /// 取色器工具
@@ -61,6 +63,7 @@ impl ToolButton {
         ToolButton::Arrow,
         ToolButton::Freehand,
         ToolButton::Text,
+        ToolButton::Ocr,
         ToolButton::Mosaic,
         ToolButton::ColorPicker,
         ToolButton::Undo,
@@ -81,6 +84,7 @@ impl ToolButton {
             ToolButton::Arrow => "箭头",
             ToolButton::Freehand => "画图",
             ToolButton::Text => "文字",
+            ToolButton::Ocr => "OCR",
             ToolButton::Mosaic => "马赛克",
             ToolButton::ColorPicker => "颜色",
             ToolButton::Undo => "撤销",
