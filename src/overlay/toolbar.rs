@@ -45,6 +45,8 @@ pub enum ToolButton {
     Redo,
     /// 切换文字粗体（v0.2 新增）
     Bold,
+    /// 固定截图到桌面（Pin）
+    Pin,
     /// 确认并保存截图标注
     Finish,
     /// 取消当前编辑会话
@@ -70,6 +72,7 @@ impl ToolButton {
         ToolButton::Redo,
         ToolButton::Bold,
         ToolButton::Finish,
+        ToolButton::Pin,
         ToolButton::Cancel,
     ];
 
@@ -90,6 +93,7 @@ impl ToolButton {
             ToolButton::Undo => "撤销",
             ToolButton::Redo => "重做",
             ToolButton::Bold => "B",
+            ToolButton::Pin => "固定",
             ToolButton::Finish => "完成",
             ToolButton::Cancel => "取消",
         }

@@ -99,7 +99,10 @@
       "Bash(find /home/lidong/.cargo/git/checkouts/gpui-component-* -name \"*assets*\" -type d)",
       "Bash(grep -nE \"enum InputEvent|^\\\\s+[A-Z][a-zA-Z]+\\\\s*[,{\\(]\" /home/lidong/.cargo/git/checkouts/gpui-component-95ce574d8a0da8b8/951e3de/crates/ui/src/input/input.rs)",
       "Bash(find ~/.cargo/git/checkouts/gpui-component-* -name \"input.rs\" -path \"*/src/*\")",
-      "Bash(rustc *)"
+      "Bash(rustc *)",
+      "Bash(tesseract --version)",
+      "Bash(dpkg -l)",
+      "Bash(tesseract *)"
     ]
   }
 }

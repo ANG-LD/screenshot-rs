@@ -11,7 +11,8 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, Pixels, Point, Rems, Render, RenderImage, Size, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div, point,
+    TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas,
+    div, point,
     prelude::*, px, quad, rgba,
 };
 use gpui_component::ActiveTheme;
@@ -22,7 +23,6 @@ use gpui_component::IconName;
 use gpui_component::Selectable;
 use gpui_component::Sizable;
 use gpui_component::popover::Popover;
-use gpui_component::scroll::ScrollableElement;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
 use smallvec::SmallVec;
@@ -125,6 +125,13 @@ pub struct OverlayView {
     /// screen_bounds 和所有鼠标交互使用逻辑像素（与 GPUI 坐标系一致），
     /// commit 时乘以 scale_factor 转回物理像素供 app.rs 裁剪/栅格化。
     scale_factor: f32,
+
+    /// dim 遮罩透明度（0.0 = 完全透明，1.0 = 最终效果）。
+    ///
+    /// 窗口打开时从 0 动画过渡到 1，减轻突然出现的撕裂感。
+    dim_opacity: f32,
+    /// 淡入动画起始时刻
+    animation_start: std::time::Instant,
 }
 
 /// 文字输入框拖动 / resize 状态
@@ -223,6 +230,8 @@ impl OverlayView {
             selected_cmd_actual_idx: None,
             cmd_drag: None,
             scale_factor,
+            dim_opacity: 0.0,
+            animation_start: std::time::Instant::now(),
         }
     }
 
@@ -317,7 +326,8 @@ impl OverlayView {
             // Text 走 open_text_input、Ocr 走框选识别（on_mouse_down 已拦截），
             // 其余非绘图工具忽略。
             ToolButton::Text | ToolButton::Ocr | ToolButton::ColorPicker | ToolButton::Undo
-            | ToolButton::Redo | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel => return,
+            | ToolButton::Redo | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel
+            | ToolButton::Pin => return,
         });
     }
 
@@ -689,7 +699,13 @@ impl OverlayView {
                 !can_redo,
                 weak.clone(),
             ))
-            // 3) Cancel / Finish
+            // 3) Pin / Cancel / Finish
+            .child(render_simple_button(
+                ToolButton::Pin,
+                false,
+                false,
+                weak.clone(),
+            ))
             .child(render_simple_button(
                 ToolButton::Cancel,
                 false,
@@ -759,6 +775,7 @@ fn icon_for(btn: ToolButton) -> IconName {
         ToolButton::Redo => IconName::Redo2,
         ToolButton::Finish => IconName::Check,
         ToolButton::Cancel => IconName::Close,
+        ToolButton::Pin => IconName::ExternalLink,
         ToolButton::Bold => IconName::CaseSensitive,
     }
 }
@@ -786,8 +803,8 @@ fn compute_toolbar_bounds(
         (screen_h - toolbar_h - TOOLBAR_OFFSET_Y).max(TOOLBAR_OFFSET_Y)
     };
     let toolbar_x = sel.origin.x;
-    // 主行 11 项（6 绘图 + Ocr + Undo + Redo + Cancel + Finish）按 32 + 间距 4
-    let toolbar_w = TOOLBAR_BTN_SIZE * 11.0 + TOOLBAR_GAP * 10.0 + TOOLBAR_PAD * 2.0;
+    // 主行 12 项（6 绘图 + Ocr + Undo + Redo + Pin + Cancel + Finish）按 32 + 间距 4
+    let toolbar_w = TOOLBAR_BTN_SIZE * 12.0 + TOOLBAR_GAP * 11.0 + TOOLBAR_PAD * 2.0;
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
 }
 
@@ -923,6 +940,51 @@ fn render_simple_button(
                             this.ocr_result = None;
                         }
                         cx.notify();
+                    }
+                    ToolButton::Pin => {
+                        this.finalize_text_input_if_active(cx);
+                        let s = this.selection.current().or(Some(this.screen_bounds));
+                        let cmds: Vec<DrawCommand> =
+                            this.drawing.visible_commands().cloned().collect();
+
+                        let wb = window.bounds();
+                        let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+                        let sy = this.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+
+                        let scaled_cmds: Vec<DrawCommand> =
+                            cmds.iter().map(|c| scale_draw_command(c.clone(), sx, sy)).collect();
+
+                        if let Some(sel) = s {
+                            let sel_px = ub::Bounds {
+                                origin: ub::Point::new(sel.origin.x * sx, sel.origin.y * sy),
+                                size: ub::Point::new(sel.size.x * sx, sel.size.y * sy),
+                            };
+                            let full_pixels = this.frame_pixels.clone();
+                            let fw = this.frame_width;
+                            let fh = this.frame_height;
+
+                            let pin_frame = CapturedFrame {
+                                width: fw,
+                                height: fh,
+                                pixels: full_pixels,
+                            };
+                            if let Ok(mut clipped) = pin_frame.clip_region(
+                                sel_px.origin.x as u32,
+                                sel_px.origin.y as u32,
+                                sel_px.size.x as u32,
+                                sel_px.size.y as u32,
+                            ) {
+                                let _ = crate::overlay::commands::apply_commands(
+                                    &mut clipped,
+                                    sel_px.origin.x,
+                                    sel_px.origin.y,
+                                    &scaled_cmds,
+                                );
+                                spawn_pin_window(clipped);
+                            }
+                        }
+
+                        this.commit(OverlayResult { selection: s, commands: cmds }, window);
                     }
                     ToolButton::Finish => {
                         // 兜底：若 Text 工具还活着没提交，先把它的内容落成命令
@@ -1824,6 +1886,18 @@ fn run_ocr_sync(
 
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 淡入动画：窗口打开后 150ms 内 dim 遮罩从透明过渡到最终效果
+        {
+            let elapsed = self.animation_start.elapsed().as_secs_f32();
+            const DURATION: f32 = 0.15;
+            if elapsed < DURATION {
+                self.dim_opacity = elapsed / DURATION;
+                cx.notify();
+            } else if self.dim_opacity < 1.0 {
+                self.dim_opacity = 1.0;
+            }
+        }
+
         let frame_image = self.frame_image.clone();
         let selection_bounds = self.selection.current();
         let screen_bounds = self.screen_bounds;
@@ -1859,10 +1933,11 @@ impl Render for OverlayView {
 
         let ocr_rect = self.ocr_rect;
         let ocr_dragging = self.ocr_drag_start.is_some();
+        let dim_opacity = self.dim_opacity;
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging),
-            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
+            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
@@ -1877,8 +1952,9 @@ impl Render for OverlayView {
                     false,
                 );
 
-                // 2) 半透明 dim 遮罩（选区外）
-                let dim = Hsla::from(rgba(0x000000AA));
+                // 2) 半透明 dim 遮罩（选区外），alpha 随 dim_opacity 动画过渡
+                let dim_alpha = (0xAAu32 as f32 * dim_opacity).round() as u32;
+                let dim = Hsla::from(rgba(dim_alpha));
 
                 if let Some(sel) = selection_bounds {
                     let sel_x = px(sel.origin.x);
@@ -2240,9 +2316,9 @@ impl Render for OverlayView {
         // OCR 结果面板（右侧）
         if let Some(ref text) = self.ocr_result {
             let panel_w = 320.0;
-            let panel_x = screen_bounds.origin.x + screen_bounds.size.x - panel_w - 16.0;
-            let panel_y = screen_bounds.origin.y + 16.0;
-            let panel_h = screen_bounds.size.y - 32.0;
+            let panel_x = screen_bounds.origin.x + screen_bounds.size.x - panel_w;
+            let panel_y = screen_bounds.origin.y;
+            let panel_h = screen_bounds.size.y;
             let weak = cx.weak_entity();
             let text_for_ui = text.clone();
             root = root.child(
@@ -2253,13 +2329,13 @@ impl Render for OverlayView {
                     .w(px(panel_w))
                     .h(px(panel_h))
                     .bg(gpui::rgba(0x1A1A1AF0))
-                    .rounded_lg()
+                    .rounded_l_lg()
                     .border_1()
                     .border_color(gpui::rgba(0x444444CC))
                     .flex()
                     .flex_col()
                     .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                    // 标题栏 + 关闭按钮
+                    // 标题栏 + 关闭按钮 + 复制按钮
                     .child(
                         div()
                             .flex()
@@ -2274,31 +2350,44 @@ impl Render for OverlayView {
                                     .text_sm()
                                     .child(gpui::SharedString::from("OCR 识别结果")),
                             )
-                            .child({
-                                let w = weak.clone();
-                                Button::new("ocr-close")
-                                    .icon(IconName::Close)
-                                    .compact()
-                                    .ghost()
-                                    .on_click(move |_, _, cx| {
-                                        let _ = w.update(cx, |this, cx| {
-                                            this.ocr_result = None;
-                                            this.ocr_rect = None;
-                                            cx.notify();
-                                        });
+                            .child(
+                                div().flex().gap(px(4.0))
+                                    .child({
+                                        let t = text_for_ui.clone();
+                                        Button::new("ocr-copy")
+                                            .icon(IconName::Copy)
+                                            .compact()
+                                            .on_click(move |_, _, _cx| {
+                                                if let Ok(mut c) = arboard::Clipboard::new() {
+                                                    let _ = c.set_text(t.clone());
+                                                }
+                                            })
                                     })
-                            }),
+                                    .child({
+                                        let w = weak.clone();
+                                        Button::new("ocr-close")
+                                            .icon(IconName::Close)
+                                            .compact()
+                                            .on_click(move |_, _, cx| {
+                                                let _ = w.update(cx, |this, cx| {
+                                                    this.ocr_result = None;
+                                                    this.ocr_rect = None;
+                                                    cx.notify();
+                                                });
+                                            })
+                                    }),
+                            ),
                     )
-                    // 文字内容（可滚动，等宽字体）
+                    // 文字内容（可选中的富文本，用 TextView 支持鼠标拖选和 Ctrl+C）
                     .child(
                         div()
                             .flex_1()
-                            .overflow_y_scrollbar()
                             .p(px(10.0))
-                            .text_color(gpui::rgba(0xDDDDDDFF))
-                            .text_sm()
-                            .font_family(gpui::SharedString::from("monospace"))
-                            .child(gpui::SharedString::from(text_for_ui)),
+                            .child({
+                                let md = format!("```text\n{}\n```", text_for_ui);
+                                gpui_component::text::TextView::markdown("ocr-text", md)
+                                    .selectable(true)
+                            }),
                     ),
             );
         } else if self.ocr_loading {
@@ -2359,6 +2448,17 @@ impl Render for OverlayView {
                             }
                         }
                         return;
+                    }
+
+                    // OCR 结果 / 加载中面板：面板上的点击由内部按钮处理，root 不应响应
+                    if this.ocr_result.is_some() || this.ocr_loading {
+                        let pw = if this.ocr_result.is_some() { 320.0 } else { 200.0 };
+                        let px = this.screen_bounds.origin.x + this.screen_bounds.size.x - pw;
+                        let py = this.screen_bounds.origin.y;
+                        let ph = if this.ocr_result.is_some() { this.screen_bounds.size.y } else { 48.0 };
+                        if p.x >= px && p.x <= px + pw && p.y >= py && p.y <= py + ph {
+                            return;
+                        }
                     }
 
                     // 文字输入框存在时，优先检测是否点击了拖动条或 resize 手柄
@@ -2513,7 +2613,12 @@ impl Render for OverlayView {
                             }
                         }
                     }
-                    // 没有选区或点击在选区外 → 开始新选区前先提交活跃 Text 输入
+                    // Editing 模式下已有截图框时，禁止点击框外区域（按钮栏、OCR 面板除外，
+                    // 它们已在上面被拦截 return）。点击 dim 区域不再打散/重选选区。
+                    if this.mode == OverlayMode::Editing && this.selection.current().is_some() {
+                        return;
+                    }
+                    // Selecting 模式或无选区：点击任意位置开始新选区
                     this.finalize_text_input_if_active(cx);
                     this.selection.mouse_down(p);
                 }),
@@ -2691,9 +2796,121 @@ impl Render for OverlayView {
                     }
                     this.check_selected_visible();
                     cx.notify();
+                } else if ev.keystroke.key == "c" && ev.keystroke.modifiers.control {
+                    // Ctrl+C：若 OCR 结果面板可见，复制全部识别文字
+                    if let Some(ref text) = this.ocr_result {
+                        if let Ok(mut c) = arboard::Clipboard::new() {
+                            let _ = c.set_text(text.clone());
+                        }
+                    }
                 }
             }))
     }
+}
+
+/// Pin 窗口视图：显示固定到桌面的标注截图
+struct PinWindowView {
+    image: Arc<RenderImage>,
+    focus_handle: FocusHandle,
+}
+
+impl PinWindowView {
+    fn new(frame: &CapturedFrame, cx: &mut Context<Self>) -> Self {
+        Self {
+            image: build_render_image(frame),
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl Render for PinWindowView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let image = self.image.clone();
+        let focus_handle = self.focus_handle.clone();
+
+        let paint_canvas = canvas(
+            move |_, _, _| image.clone(),
+            move |_, image, window, _cx| {
+                let wb = window.bounds();
+                let _ = window.paint_image(
+                    Bounds {
+                        origin: point(px(0.), px(0.)),
+                        size: wb.size,
+                    },
+                    Default::default(),
+                    image.clone(),
+                    0,
+                    false,
+                );
+            },
+        );
+
+        div()
+            .track_focus(&focus_handle)
+            .size_full()
+            .child(paint_canvas.size_full())
+            .on_key_down(|ev: &KeyDownEvent, window, _cx| {
+                if ev.keystroke.key == "escape" {
+                    window.remove_window();
+                }
+            })
+    }
+}
+
+/// 在新线程中启动独立的 GPUI 窗口，展示标注后的截图
+fn spawn_pin_window(pin_frame: CapturedFrame) {
+    std::thread::spawn(move || {
+        application()
+            .with_assets(gpui_component_assets::Assets)
+            .run(move |cx: &mut App| {
+                gpui_component::init(cx);
+
+                let img_w = pin_frame.width as f32;
+                let img_h = pin_frame.height as f32;
+                let max_w = 1200.0_f32;
+                let max_h = 900.0_f32;
+                let scale = (max_w / img_w).min(max_h / img_h).min(1.0);
+                let win_w = px((img_w * scale).max(200.0));
+                let win_h = px((img_h * scale).max(150.0));
+
+                let title: gpui::SharedString =
+                    format!("截图固定 ({}x{})", pin_frame.width, pin_frame.height).into();
+
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: point(px(80.0), px(80.0)),
+                            size: Size::new(win_w, win_h),
+                        })),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some(title),
+                            appears_transparent: false,
+                            traffic_light_position: None,
+                        }),
+                        window_background: WindowBackgroundAppearance::Transparent,
+                        kind: WindowKind::Normal,
+                        is_movable: true,
+                        is_resizable: true,
+                        focus: true,
+                        ..Default::default()
+                    },
+                    move |window, cx| {
+                        let view = cx.new(|cx| PinWindowView::new(&pin_frame, cx));
+                        cx.new(|cx| {
+                            gpui_component::Root::new(view, window, cx).bordered(false)
+                        })
+                    },
+                )
+                .expect("open pin window failed");
+
+                cx.on_window_closed(|cx, _| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+            });
+    });
 }
 
 /// 在新线程里跑 GPUI 覆盖窗口，阻塞到用户完成/取消。
@@ -2729,7 +2946,9 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
 
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Fullscreen(win_bounds)),
+                    // 用 Windowed 而非 Fullscreen：Fullscreen 在部分 WM 上会被
+                    // 限制到工作区（不含面板），Windowed 可以覆盖更大区域。
+                    window_bounds: Some(WindowBounds::Windowed(win_bounds)),
                     window_background: WindowBackgroundAppearance::Transparent,
                     titlebar: None,
                     kind: WindowKind::Normal,
