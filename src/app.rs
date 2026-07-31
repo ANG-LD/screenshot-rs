@@ -85,32 +85,34 @@ impl AppState {
             result.commands.len()
         );
 
-        // 裁剪并写入剪贴板
-        let mut clipped = frame.clip_region(
-            region.origin.x as u32,
-            region.origin.y as u32,
-            region.size.x as u32,
-            region.size.y as u32,
-        )?;
-
-        // 把可见的 DrawCommand 应用到裁剪后的 frame 上
-        // 命令的坐标是屏幕坐标，需要平移到 clipped 局部坐标
-        if !result.commands.is_empty() {
-            tracing::info!(
-                "apply_commands: clipped={}x{} region_origin=({},{}) commands={}",
-                clipped.width, clipped.height, region.origin.x, region.origin.y,
-                result.commands.len()
-            );
-            crate::overlay::commands::apply_commands(
-                &mut clipped,
-                region.origin.x,
-                region.origin.y,
-                &result.commands,
+        // 裁剪并写入剪贴板（Pin 固定时跳过）
+        if !result.no_clipboard {
+            let mut clipped = frame.clip_region(
+                region.origin.x as u32,
+                region.origin.y as u32,
+                region.size.x as u32,
+                region.size.y as u32,
             )?;
-        }
 
-        self.clipboard.write_frame(&clipped)?;
-        tracing::info!("截图已复制到剪贴板（{}x{}）", clipped.width, clipped.height);
+            // 把可见的 DrawCommand 应用到裁剪后的 frame 上
+            // 命令的坐标是屏幕坐标，需要平移到 clipped 局部坐标
+            if !result.commands.is_empty() {
+                tracing::info!(
+                    "apply_commands: clipped={}x{} region_origin=({},{}) commands={}",
+                    clipped.width, clipped.height, region.origin.x, region.origin.y,
+                    result.commands.len()
+                );
+                crate::overlay::commands::apply_commands(
+                    &mut clipped,
+                    region.origin.x,
+                    region.origin.y,
+                    &result.commands,
+                )?;
+            }
+
+            self.clipboard.write_frame(&clipped)?;
+            tracing::info!("截图已复制到剪贴板（{}x{}）", clipped.width, clipped.height);
+        }
 
         Ok(())
     }

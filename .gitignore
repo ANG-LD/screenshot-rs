@@ -6,3 +6,4 @@ Cargo.lock.bak
 .vscode
 assets/fonts/*.otf
 assets/fonts/*.ttf
+.fuse_hidden*

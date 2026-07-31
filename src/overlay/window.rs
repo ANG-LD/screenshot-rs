@@ -117,6 +117,8 @@ pub struct OverlayView {
     /// 预估矩形（compute_toolbar_bounds）不準；改用 on_mouse_move/on_mouse_down
     /// 在工具栏根 div 上的真实事件来挂标志。
     toolbar_hovered: bool,
+    /// OCR 结果面板是否被鼠标按下（用于 root.on_mouse_down 判断，避免 prevent_default 阻断按钮 click 事件）
+    ocr_panel_hovered: bool,
 
     /// 当前选中的已绘制命令索引（DrawingState.commands 中的实际索引）
     selected_cmd_actual_idx: Option<usize>,
@@ -197,6 +199,8 @@ struct CmdDragState {
 pub struct OverlayResult {
     pub selection: Option<ub::Bounds>,
     pub commands: Vec<DrawCommand>,
+    /// Pin 固定时跳过剪贴板复制
+    pub no_clipboard: bool,
 }
 
 impl OverlayView {
@@ -231,6 +235,7 @@ impl OverlayView {
             ocr_loading: false,
             ocr_drag_start: None,
             toolbar_hovered: false,
+            ocr_panel_hovered: false,
             selected_cmd_actual_idx: None,
             cmd_drag: None,
             scale_factor,
@@ -276,7 +281,8 @@ impl OverlayView {
                 _ => tracing::info!("cmd[{}] {:?}", i, c),
             }
         }
-        let _ = self.tx.send(OverlayResult { selection, commands });
+        let no_clipboard = result.no_clipboard;
+        let _ = self.tx.send(OverlayResult { selection, commands, no_clipboard });
         window.remove_window();
     }
 
@@ -505,7 +511,7 @@ impl OverlayView {
         let w = max_w_override.unwrap_or(100.0);
         self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + w, p.y + 48.0))
             .clamp_inside(limits);
-        tracing::info!("open_text_input: anchor=({:.1}, {:.1}) initial={}", p.x, p.y, initial.is_some());
+        tracing::debug!("open_text_input: anchor=({:.1}, {:.1}) initial={}", p.x, p.y, initial.is_some());
 
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -523,6 +529,10 @@ impl OverlayView {
             state.focus(window, cx);
         });
 
+        // PopUp 窗口（override_redirect）在 X11 上可能不会被 WM 分配键盘焦点，
+        // 手动调用 activate_window() 确保 X 服务器把键盘事件送到本窗口。
+        window.activate_window();
+
         // 订阅 InputState 事件：
         //   PressEnter → 提交（push Text 命令）
         //   Blur       → 用户点击外部也提交（避免半截文字丢失）
@@ -535,6 +545,7 @@ impl OverlayView {
                 cx.notify();
             }
             InputEvent::Blur => {
+                tracing::debug!("text_input Blur: popup={}", _this.toolbar.popup.is_some());
                 // 若 popover 正打开，失焦是因为用户点击了样式选项
                 // （Bold/字号/颜色），此时不应提交文字——保留输入框
                 // 让用户继续编辑。样式按钮 handler 会更新 toolbar 属性，
@@ -598,11 +609,11 @@ impl OverlayView {
                 max_width: Some(max_w),
                 weight: self.toolbar.current_weight,
             });
+            // 记录对应 DrawCommand 索引，便于重新编辑时移除。
+            self.text_input_cmd_idx = Some(self.drawing.history_index - 1);
         }
         // 保留 Input 组件继续渲染文字，只隐藏 chrome（拖拽条、手柄、边框），
         // 避免因 canvas 渲染路径位置计算差异导致文字跳动。
-        // 记录对应 DrawCommand 索引，便于重新编辑时移除。
-        self.text_input_cmd_idx = Some(self.drawing.history_index - 1);
         self.text_input_finalized = true;
         cx.notify();
     }
@@ -933,6 +944,7 @@ fn render_simple_button(
                             OverlayResult {
                                 selection: None,
                                 commands: vec![],
+                                no_clipboard: false,
                             },
                             window,
                         );
@@ -1012,7 +1024,7 @@ fn render_simple_button(
                             }
                         }
 
-                        this.commit(OverlayResult { selection: s, commands: cmds }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true }, window);
                     }
                     ToolButton::Finish => {
                         // 兜底：若 Text 工具还活着没提交，先把它的内容落成命令
@@ -1020,7 +1032,7 @@ fn render_simple_button(
                         let s = this.selection.current().or(Some(this.screen_bounds));
                         let cmds: Vec<DrawCommand> =
                             this.drawing.visible_commands().cloned().collect();
-                        this.commit(OverlayResult { selection: s, commands: cmds }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false }, window);
                     }
                     _ => {}
                 }
@@ -2362,7 +2374,9 @@ impl Render for OverlayView {
                     .border_color(gpui::rgba(0x444444CC))
                     .flex()
                     .flex_col()
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, _cx| {
+                        this.ocr_panel_hovered = true;
+                    }))
                     // 标题栏 + 关闭按钮 + 复制按钮
                     .child(
                         div()
@@ -2385,10 +2399,14 @@ impl Render for OverlayView {
                                         Button::new("ocr-copy")
                                             .icon(IconName::Copy)
                                             .compact()
-                                            .on_click(move |_, _, _cx| {
-                                                if let Ok(mut c) = arboard::Clipboard::new() {
-                                                    let _ = c.set_text(t.clone());
-                                                }
+                                            .on_click(move |_, _window, cx| {
+                                                // 用 GPUI 的 write_to_clipboard（底层 X11
+                                                // Clipboard 长存于 client），而不是每次
+                                                // arboard::Clipboard::new()——后者 drop 即
+                                                // 释放 X11 所有权，粘贴拿到空 → "复制没效果"。
+                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                    t.clone(),
+                                                ));
                                             })
                                     })
                                     .child({
@@ -2397,11 +2415,15 @@ impl Render for OverlayView {
                                             .icon(IconName::Close)
                                             .compact()
                                             .on_click(move |_, _, cx| {
-                                                let _ = w.update(cx, |this, cx| {
+                                                if let Err(e) = w.update(cx, |this, cx| {
                                                     this.ocr_result = None;
                                                     this.ocr_rect = None;
                                                     cx.notify();
-                                                });
+                                                }) {
+                                                    tracing::error!(
+                                                        "[OCR] close: 实体更新失败：{e}"
+                                                    );
+                                                }
                                             })
                                     }),
                             ),
@@ -2478,13 +2500,19 @@ impl Render for OverlayView {
                         return;
                     }
 
-                    // OCR 结果 / 加载中面板：面板上的点击由内部按钮处理，root 不应响应
-                    if this.ocr_result.is_some() || this.ocr_loading {
-                        let pw = if this.ocr_result.is_some() { 320.0 } else { 200.0 };
+                    // OCR 结果面板：由面板 div 的 on_mouse_down 设 ocr_panel_hovered=true，
+                    // root 据此早返回，避免把按钮点击当成"新建选区/移动选区"。
+                    if this.ocr_panel_hovered {
+                        return;
+                    }
+                    // OCR 加载中面板（无按钮，保留几何判断）
+                    if this.ocr_loading {
+                        let pw = 200.0;
                         let px = this.screen_bounds.origin.x + this.screen_bounds.size.x - pw;
                         let py = this.screen_bounds.origin.y;
-                        let ph = if this.ocr_result.is_some() { this.screen_bounds.size.y } else { 48.0 };
+                        let ph = 48.0;
                         if p.x >= px && p.x <= px + pw && p.y >= py && p.y <= py + ph {
+                            window.prevent_default();
                             return;
                         }
                     }
@@ -2497,6 +2525,7 @@ impl Render for OverlayView {
                             if this.text_input_rect.contains(p) {
                                 // 从 drawing 中移除对应的 canvas Text 命令，
                                 // 恢复 Input 编辑态，用户可继续修改文字。
+                                tracing::debug!("text_input re-edit focus at ({:.1},{:.1})", p.x, p.y);
                                 if let Some(idx) = this.text_input_cmd_idx.take() {
                                     this.drawing.remove_visible(idx);
                                 }
@@ -2506,6 +2535,7 @@ impl Render for OverlayView {
                                         state.focus(window, cx);
                                     });
                                 }
+                                window.prevent_default();
                                 cx.notify();
                                 return;
                             }
@@ -2519,8 +2549,17 @@ impl Render for OverlayView {
                                 this.text_input_drag = Some(drag);
                                 return;
                             }
-                            // 点在输入框内部（非拖拽条/手柄）→ 让 Input 组件处理聚焦和光标
+                            // 点在输入框内部（非拖拽条/手柄）→ 显式聚焦 Input 组件
+                            // 必须 prevent_default()：根 div 的 track_focus 会在 bubble 阶段
+                            // 先于 Input 触发自动聚焦，抢走焦点。阻止此行为后 Input 保持聚焦。
                             if this.text_input_rect.contains(p) {
+                                tracing::debug!("text_input focus at ({:.1},{:.1})", p.x, p.y);
+                                if let Some(ref input) = this.text_input {
+                                    input.update(cx, |state, cx| {
+                                        state.focus(window, cx);
+                                    });
+                                }
+                                window.prevent_default();
                                 return;
                             }
                             // 点在输入框外 → 先提交活跃 Text 输入，避免文字丢失
@@ -2710,6 +2749,7 @@ impl Render for OverlayView {
                     // 工具栏按钮 on_click 在 mouse_up 阶段触发，到这里 toolbar_hovered
                     // 已完成它的使命；清回 false 避免下次非工具栏点击误判。
                     this.toolbar_hovered = false;
+                    this.ocr_panel_hovered = false;
                     // 文字框拖动 / resize 结束
                     if this.text_input_drag.is_some() {
                         this.text_input_drag = None;
@@ -2785,7 +2825,7 @@ impl Render for OverlayView {
                             .visible_commands()
                             .cloned()
                             .collect();
-                        this.commit(OverlayResult { selection: sel, commands: cmds }, window);
+                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false }, window);
                     }
                 }),
             )
@@ -2797,7 +2837,7 @@ impl Render for OverlayView {
                         cx.notify();
                         return;
                     }
-                    this.commit(OverlayResult { selection: None, commands: vec![] }, window);
+                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false }, window);
                 } else if ev.keystroke.key == "enter" {
                     // Enter 先尝试提交活跃的 Text 输入（如果 Text 工具正在输入）。
                     // 若 finalize 了 Text 命令，说明这次 Enter 是\"写字时按 Enter 提交\"
@@ -2814,7 +2854,7 @@ impl Render for OverlayView {
                         .visible_commands()
                         .cloned()
                         .collect();
-                    this.commit(OverlayResult { selection: sel, commands: cmds }, window);
+                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false }, window);
                 } else if ev.keystroke.key == "z" && ev.keystroke.modifiers.control {
                     // Ctrl+Z 撤销 / Ctrl+Shift+Z 重做
                     if ev.keystroke.modifiers.shift {
@@ -2826,10 +2866,9 @@ impl Render for OverlayView {
                     cx.notify();
                 } else if ev.keystroke.key == "c" && ev.keystroke.modifiers.control {
                     // Ctrl+C：若 OCR 结果面板可见，复制全部识别文字
+                    // 与复制按钮一样走 GPUI 长存剪贴板，避免 arboard drop 丢 X11 所有权
                     if let Some(ref text) = this.ocr_result {
-                        if let Ok(mut c) = arboard::Clipboard::new() {
-                            let _ = c.set_text(text.clone());
-                        }
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
                     }
                 }
             }))
@@ -2917,6 +2956,8 @@ impl Render for PinWindowView {
             .flex_col()
             .size_full()
             .bg(rgba(0x00000088))
+            .border_1()
+            .border_color(rgba(0xffffff22))
             .child(
                 // 自定义标题栏
                 div()
@@ -3697,6 +3738,9 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
                     // 这样 track_focus 的 div 能收到键盘事件
                     let handle = view.read(cx).focus_handle.clone();
                     handle.focus(window, cx);
+                    // PopUp 窗口（override_redirect）在 X11 上绕过 WM 焦点管理，
+                    // 必须手动 activate 才能收到键盘事件。
+                    window.activate_window();
                     // 必须用 gpui_component::Root 包一层：
                     // gpui-component 的 Input 在 blur 时会调
                     // `Root::update(window, cx, ...)` 去清 `focused_input`，
@@ -3726,5 +3770,6 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
     rx.recv().unwrap_or(OverlayResult {
         selection: None,
         commands: vec![],
+        no_clipboard: false,
     })
 }
