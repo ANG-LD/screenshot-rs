@@ -41,6 +41,10 @@ smallvec = "1"
 cosmic-text = "0.19"
 once_cell = "1.21.4"
 
+# X11 原生窗口操作（Pin 窗口精确放置）
+raw-window-handle = "0.6"
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+
 # GTK 初始化（Linux 托盘依赖）
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"

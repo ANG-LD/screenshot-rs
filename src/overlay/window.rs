@@ -11,7 +11,7 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, Pixels, Point, Rems, Render, RenderImage, Size, Window,
-    TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas,
     div, point,
     prelude::*, px, quad, rgba,
 };
@@ -22,9 +22,12 @@ use gpui_component::Disableable;
 use gpui_component::IconName;
 use gpui_component::Selectable;
 use gpui_component::Sizable;
+use gpui_component::Icon;
 use gpui_component::popover::Popover;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
+#[cfg(target_os = "linux")]
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use smallvec::SmallVec;
 
 use crate::capture::CapturedFrame;
@@ -731,7 +734,7 @@ impl OverlayView {
             .absolute()
             .top(px(toolbar_y))
             .left(px(toolbar_x))
-            .bg(gpui::rgba(0x202020EE))
+            .bg(gpui::rgba(0x202020FF))
             .rounded_md()
             .p(px(TOOLBAR_PAD))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, _cx| {
@@ -794,18 +797,25 @@ fn compute_toolbar_bounds(
     let screen_h = screen_bounds.origin.y + screen_bounds.size.y;
     let toolbar_h = TOOLBAR_BTN_SIZE + TOOLBAR_PAD * 2.0;
     let toolbar_y_below = sel.origin.y + sel.size.y + TOOLBAR_OFFSET_Y;
-    let toolbar_y_above = sel.origin.y - TOOLBAR_OFFSET_Y - toolbar_h;
+    // 选区下方放得下 → 放在选区下方；否则 → 固定屏幕底部
     let toolbar_y = if toolbar_y_below + toolbar_h + TOOLBAR_OFFSET_Y <= screen_h {
         toolbar_y_below
-    } else if toolbar_y_above >= TOOLBAR_OFFSET_Y {
-        toolbar_y_above
     } else {
-        (screen_h - toolbar_h - TOOLBAR_OFFSET_Y).max(TOOLBAR_OFFSET_Y)
+        screen_h - toolbar_h - TOOLBAR_OFFSET_Y
     };
-    let toolbar_x = sel.origin.x;
-    // 主行 12 项（6 绘图 + Ocr + Undo + Redo + Pin + Cancel + Finish）按 32 + 间距 4
     let toolbar_w = TOOLBAR_BTN_SIZE * 12.0 + TOOLBAR_GAP * 11.0 + TOOLBAR_PAD * 2.0;
+    let toolbar_x = sel.origin.x.min(screen_bounds.origin.x + screen_bounds.size.x - toolbar_w - TOOLBAR_OFFSET_Y);
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
+}
+
+/// 工具栏按钮中的图标+文字，紧凑间距
+fn icon_label(btn: ToolButton) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .child(Icon::new(icon_for(btn)).size(px(14.0)))
+        .child(btn.label())
 }
 
 /// 给 5 个绘图工具构造带 Popover 的按钮 Popover
@@ -831,11 +841,10 @@ fn render_tool_button_with_popover(
 
     let weak_for_trigger = weak.clone();
     let trigger = Button::new(("tool", btn as usize))
-        .icon(icon_for(btn))
-        .label(btn.label())
         .tooltip(btn.label())
         .compact()
         .selected(is_active)
+        .child(icon_label(btn))
         .on_click(move |_, _, cx| {
             let _ = weak_for_trigger.update(cx, |this, cx| {
                 if this.toolbar.active_tool == Some(btn) {
@@ -900,11 +909,10 @@ fn render_simple_button(
 ) -> Button {
     let weak_for_click = weak.clone();
     let mut b = Button::new(("action", btn as usize))
-        .icon(icon_for(btn))
-        .label(btn.label())
         .tooltip(btn.label())
         .compact()
         .disabled(disabled)
+        .child(icon_label(btn))
         .on_click(move |_, window, cx| {
             let _ = weak_for_click.update(cx, |this, cx| {
                 this.toolbar.popup = None;
@@ -950,6 +958,11 @@ fn render_simple_button(
                         let wb = window.bounds();
                         let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
                         let sy = this.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+                        tracing::info!(
+                            "[Pin] overlay window: origin=({:.0},{:.0}) size=({:.0},{:.0}) frame={}x{} sx={:.2} sy={:.2}",
+                            wb.origin.x, wb.origin.y, wb.size.width, wb.size.height,
+                            this.frame_width, this.frame_height, sx, sy
+                        );
 
                         let scaled_cmds: Vec<DrawCommand> =
                             cmds.iter().map(|c| scale_draw_command(c.clone(), sx, sy)).collect();
@@ -959,6 +972,14 @@ fn render_simple_button(
                                 origin: ub::Point::new(sel.origin.x * sx, sel.origin.y * sy),
                                 size: ub::Point::new(sel.size.x * sx, sel.size.y * sy),
                             };
+                            tracing::info!(
+                                "[Pin] selection logical: origin=({:.0},{:.0}) size=({:.0},{:.0})",
+                                sel.origin.x, sel.origin.y, sel.size.x, sel.size.y
+                            );
+                            tracing::info!(
+                                "[Pin] selection physical: origin=({:.0},{:.0}) size=({:.0},{:.0})",
+                                sel_px.origin.x, sel_px.origin.y, sel_px.size.x, sel_px.size.y
+                            );
                             let full_pixels = this.frame_pixels.clone();
                             let fw = this.frame_width;
                             let fh = this.frame_height;
@@ -980,7 +1001,13 @@ fn render_simple_button(
                                     sel_px.origin.y,
                                     &scaled_cmds,
                                 );
-                                spawn_pin_window(clipped);
+                                let pin_x = f32::from(wb.origin.x) + sel.origin.x;
+                                let pin_y = f32::from(wb.origin.y) + sel.origin.y;
+                                tracing::info!(
+                                    "[Pin] target position: ({:.0},{:.0}) clipped_frame={}x{}",
+                                    pin_x, pin_y, clipped.width, clipped.height
+                                );
+                                spawn_pin_window(clipped, pin_x, pin_y, sx, sy);
                             }
                         }
 
@@ -2816,6 +2843,10 @@ struct PinWindowView {
 
 impl PinWindowView {
     fn new(frame: &CapturedFrame, cx: &mut Context<Self>) -> Self {
+        tracing::info!(
+            "[Pin] PinWindowView::new: frame={}x{}",
+            frame.width, frame.height
+        );
         Self {
             image: build_render_image(frame),
             focus_handle: cx.focus_handle(),
@@ -2830,13 +2861,14 @@ impl Render for PinWindowView {
 
         let paint_canvas = canvas(
             move |_, _, _| image.clone(),
-            move |_, image, window, _cx| {
-                let wb = window.bounds();
+            move |bounds, image, window, _cx| {
+                tracing::info!(
+                    "[Pin] paint bounds: origin=({:.1},{:.1}) size=({:.1},{:.1})",
+                    bounds.origin.x, bounds.origin.y,
+                    bounds.size.width, bounds.size.height
+                );
                 let _ = window.paint_image(
-                    Bounds {
-                        origin: point(px(0.), px(0.)),
-                        size: wb.size,
-                    },
+                    bounds,
                     Default::default(),
                     image.clone(),
                     0,
@@ -2858,47 +2890,181 @@ impl Render for PinWindowView {
 }
 
 /// 在新线程中启动独立的 GPUI 窗口，展示标注后的截图
-fn spawn_pin_window(pin_frame: CapturedFrame) {
+fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: f32, sy: f32) {
     std::thread::spawn(move || {
         application()
             .with_assets(gpui_component_assets::Assets)
             .run(move |cx: &mut App| {
                 gpui_component::init(cx);
 
-                let img_w = pin_frame.width as f32;
-                let img_h = pin_frame.height as f32;
+                // pin_frame 尺寸是物理像素，转为逻辑像素用于窗口尺寸
+                let img_w = pin_frame.width as f32 / sx;
+                let img_h = pin_frame.height as f32 / sy;
                 let max_w = 1200.0_f32;
                 let max_h = 900.0_f32;
                 let scale = (max_w / img_w).min(max_h / img_h).min(1.0);
-                let win_w = px((img_w * scale).max(200.0));
-                let win_h = px((img_h * scale).max(150.0));
+                // 系统标题栏高度（Linux 典型值，用于 frame_y 偏移）
+                const EST_TITLEBAR_H: f32 = 35.0;
+                let win_w = px(img_w * scale);
+                let win_h = px(img_h * scale);
+                // 使用 Normal 窗口：支持 start_window_move / 键盘事件等 WM 交互
+                tracing::info!(
+                    "[Pin] spawn window: origin=({:.0},{:.0}) img_logical={:.1}x{:.1} img_physical={}x{} win_size={:.1}x{:.1} scale={:.2}",
+                    origin_x, origin_y,
+                    img_w, img_h,
+                    pin_frame.width, pin_frame.height,
+                    win_w, win_h, scale
+                );
 
-                let title: gpui::SharedString =
-                    format!("截图固定 ({}x{})", pin_frame.width, pin_frame.height).into();
+                let target_x = origin_x;
+                let target_y = origin_y;
+                // 窗口框架 y 坐标：上移标题栏高度，使内容区域恰好落在 origin_y
+                let frame_y = origin_y - EST_TITLEBAR_H;
 
                 cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds {
-                            origin: point(px(80.0), px(80.0)),
+                            origin: point(px(target_x), px(target_y)),
                             size: Size::new(win_w, win_h),
                         })),
-                        titlebar: Some(TitlebarOptions {
-                            title: Some(title),
-                            appears_transparent: false,
-                            traffic_light_position: None,
+                        titlebar: Some(gpui::TitlebarOptions {
+                            title: Some("截图固定".into()),
+                            ..Default::default()
                         }),
                         window_background: WindowBackgroundAppearance::Transparent,
                         kind: WindowKind::Normal,
                         is_movable: true,
-                        is_resizable: true,
+                        is_resizable: false,
                         focus: true,
                         ..Default::default()
                     },
                     move |window, cx| {
+                        let actual = window.bounds();
+                        tracing::info!(
+                            "[Pin] actual window after open: origin=({:.0},{:.0}) size=({:.0},{:.0})",
+                            actual.origin.x, actual.origin.y, actual.size.width, actual.size.height
+                        );
+
+                        #[cfg(target_os = "linux")]
+                        {
+                            use x11rb::connection::Connection;
+                            use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
+                            use x11rb::protocol::xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt, PropMode};
+                            use x11rb::x11_utils::Serialize;
+                            use x11rb::xcb_ffi::XCBConnection;
+
+                            if let (Ok(wh), Ok(dh)) =
+                                (window.window_handle(), window.display_handle())
+                            {
+                                if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+                                    (wh.as_raw(), dh.as_raw())
+                                {
+                                    if let Some(conn_ptr) = xcb_dh.connection {
+                                        let conn_result = unsafe {
+                                            XCBConnection::from_raw_xcb_connection(
+                                                conn_ptr.as_ptr().cast(),
+                                                false,
+                                            )
+                                        };
+                                        match conn_result {
+                                            Ok(conn) => {
+                                                // 设置 WM_NORMAL_HINTS 的 PPosition 标志，
+                                                // 告知窗口管理器此窗口位置由程序显式指定
+                                                let nh_atom = conn
+                                                    .intern_atom(false, b"WM_NORMAL_HINTS")
+                                                    .ok()
+                                                    .and_then(|c| c.reply().ok())
+                                                    .map(|r| r.atom);
+                                                let sh_atom = conn
+                                                    .intern_atom(false, b"WM_SIZE_HINTS")
+                                                    .ok()
+                                                    .and_then(|c| c.reply().ok())
+                                                    .map(|r| r.atom);
+                                                if let (Some(nh), Some(sh)) = (nh_atom, sh_atom) {
+                                                    let mut size_hints = WmSizeHints::new();
+                                                    size_hints.position = Some((
+                                                        WmSizeHintsSpecification::ProgramSpecified,
+                                                        target_x as i32,
+                                                        frame_y as i32,
+                                                    ));
+                                                    let data = size_hints.serialize();
+                                                    let _ = conn.change_property(
+                                                        PropMode::REPLACE,
+                                                        xcb_wh.window.into(),
+                                                        nh,
+                                                        sh,
+                                                        32,
+                                                        (data.len() / 4) as u32,
+                                                        &data,
+                                                    );
+                                                    tracing::info!(
+                                                        "[Pin] WM_NORMAL_HINTS set PPosition ({:.0},{:.0})",
+                                                        target_x, frame_y
+                                                    );
+                                                }
+
+                                                // 读取 _NET_FRAME_EXTENTS 获取实际标题栏高度
+                                                let net_fe_result = conn
+                                                    .intern_atom(false, b"_NET_FRAME_EXTENTS");
+                                                if let Ok(net_fe_cookie) = net_fe_result {
+                                                    if let Ok(net_fe_reply) = net_fe_cookie.reply() {
+                                                        if let Ok(reply) = conn.get_property(
+                                                            false,
+                                                            xcb_wh.window.into(),
+                                                            net_fe_reply.atom,
+                                                            AtomEnum::CARDINAL,
+                                                            0,
+                                                            4,
+                                                        ) {
+                                                            if let Ok(reply) = reply.reply() {
+                                                                if reply.value.len() >= 16 {
+                                                                    let left = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap_or_default());
+                                                                    let right = u32::from_ne_bytes(reply.value[4..8].try_into().unwrap_or_default());
+                                                                    let top = u32::from_ne_bytes(reply.value[8..12].try_into().unwrap_or_default());
+                                                                    let bottom = u32::from_ne_bytes(reply.value[12..16].try_into().unwrap_or_default());
+                                                                    tracing::info!(
+                                                                        "[Pin] frame_extents: left={} right={} top={} bottom={} (EST_TITLEBAR_H={})",
+                                                                        left, right, top, bottom, EST_TITLEBAR_H
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                let values = ConfigureWindowAux::new()
+                                                    .x(target_x as i32)
+                                                    .y(frame_y as i32);
+                                                if let Err(e) =
+                                                    conn.configure_window(xcb_wh.window.into(), &values)
+                                                {
+                                                    tracing::warn!(
+                                                        "[Pin] configure_window failed: {:?}",
+                                                        e
+                                                    );
+                                                }
+                                                let _ = conn.flush();
+                                                tracing::info!(
+                                                    "[Pin] X11 moved window to ({:.0},{:.0})",
+                                                    target_x, frame_y
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "[Pin] XCB connection failed: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         let view = cx.new(|cx| PinWindowView::new(&pin_frame, cx));
-                        cx.new(|cx| {
-                            gpui_component::Root::new(view, window, cx).bordered(false)
-                        })
+                        let handle = view.read(cx).focus_handle.clone();
+                        handle.focus(window, cx);
+                        view
                     },
                 )
                 .expect("open pin window failed");
@@ -2935,30 +3101,45 @@ pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayR
                 origin: point(px(0.), px(0.)),
                 size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
             });
-            let scale = {
-                let w = f32::from(win_bounds.size.width);
-                if w > 0.0 { screen_bounds.size.x / w } else { 1.0 }
-            };
-            let logical_bounds = ub::Bounds::new(
-                ub::Point::ZERO,
-                ub::Point::new(screen_bounds.size.x / scale, screen_bounds.size.y / scale),
-            );
 
             cx.open_window(
                 WindowOptions {
-                    // 用 Windowed 而非 Fullscreen：Fullscreen 在部分 WM 上会被
-                    // 限制到工作区（不含面板），Windowed 可以覆盖更大区域。
+                    // PopUp 窗口在 X11 上可能绕过 WM 的 strut 约束，
+                    // 覆盖到系统面板区域，确保 dim 遮罩对齐屏幕顶部。
                     window_bounds: Some(WindowBounds::Windowed(win_bounds)),
                     window_background: WindowBackgroundAppearance::Transparent,
                     titlebar: None,
-                    kind: WindowKind::Normal,
+                    kind: WindowKind::PopUp,
                     is_movable: false,
                     is_resizable: false,
                     focus: true,
                     ..Default::default()
                 },
                 move |window, cx| {
-                    let view = cx.new(|cx| OverlayView::new(&frame, logical_bounds, scale, tx, cx));
+                    // 根据窗口实际屏幕位置裁剪截图帧，确保截图与桌面完美对齐。
+                    // WM 可能把窗口放在工作区内（不含系统面板），不裁剪会导致
+                    // 截图内容与真实桌面错位，产生"重影"。
+                    let actual = window.bounds();
+                    let phys_w = screen_bounds.size.x;
+                    let phys_h = screen_bounds.size.y;
+                    let actual_w = f32::from(actual.size.width).max(1.0);
+                    let actual_h = f32::from(actual.size.height).max(1.0);
+                    let sx = phys_w / actual_w;
+                    let sy = phys_h / actual_h;
+                    let src_x = (f32::from(actual.origin.x) * sx) as u32;
+                    let src_y = (f32::from(actual.origin.y) * sy) as u32;
+                    let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
+                    let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
+                    let clipped = frame.clip_region(src_x, src_y, clip_w, clip_h)
+                        .unwrap_or(frame);
+
+                    let scale = clipped.width as f32 / actual_w;
+                    let logical_bounds = ub::Bounds::new(
+                        ub::Point::ZERO,
+                        ub::Point::new(actual_w, actual_h),
+                    );
+
+                    let view = cx.new(|cx| OverlayView::new(&clipped, logical_bounds, scale, tx, cx));
                     // 主动把焦点给到 view 自己的 focus_handle，
                     // 这样 track_focus 的 div 能收到键盘事件
                     let handle = view.read(cx).focus_handle.clone();
