@@ -11,7 +11,8 @@ use std::sync::Arc;
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, Pixels, Point, Rems, Render, RenderImage, Size, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions,
+    canvas,
     div, point,
     prelude::*, px, quad, rgba,
 };
@@ -2835,10 +2836,40 @@ impl Render for OverlayView {
     }
 }
 
+/// 标题栏按钮 tooltip 视图
+struct TooltipLabel {
+    text: gpui::SharedString,
+}
+
+impl Render for TooltipLabel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(6.0))
+            .py(px(2.0))
+            .bg(rgba(0x2d2d2dee))
+            .rounded(px(3.0))
+            .border_1()
+            .border_color(rgba(0x55555588))
+            .text_color(rgba(0xeeeeeeff))
+            .text_size(px(11.0))
+            .child(self.text.clone())
+    }
+}
+
 /// Pin 窗口视图：显示固定到桌面的标注截图
+#[derive(Clone, Copy, PartialEq)]
+enum HoveredButton {
+    AlwaysOnTop,
+    Minimize,
+    Maximize,
+    Close,
+}
+
 struct PinWindowView {
     image: Arc<RenderImage>,
     focus_handle: FocusHandle,
+    is_always_on_top: bool,
+    hovered_button: Option<HoveredButton>,
 }
 
 impl PinWindowView {
@@ -2850,23 +2881,23 @@ impl PinWindowView {
         Self {
             image: build_render_image(frame),
             focus_handle: cx.focus_handle(),
+            is_always_on_top: false,
+            hovered_button: None,
         }
     }
 }
 
 impl Render for PinWindowView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.image.clone();
         let focus_handle = self.focus_handle.clone();
+        let is_always_on_top = self.is_always_on_top;
+        let hovered_button = self.hovered_button;
+        let entity = cx.entity().downgrade();
 
         let paint_canvas = canvas(
             move |_, _, _| image.clone(),
             move |bounds, image, window, _cx| {
-                tracing::info!(
-                    "[Pin] paint bounds: origin=({:.1},{:.1}) size=({:.1},{:.1})",
-                    bounds.origin.x, bounds.origin.y,
-                    bounds.size.width, bounds.size.height
-                );
                 let _ = window.paint_image(
                     bounds,
                     Default::default(),
@@ -2877,10 +2908,328 @@ impl Render for PinWindowView {
             },
         );
 
+        let entity_for_pin = entity.clone();
+        let is_on_top = is_always_on_top;
+
         div()
             .track_focus(&focus_handle)
+            .flex()
+            .flex_col()
             .size_full()
-            .child(paint_canvas.size_full())
+            .bg(rgba(0x00000088))
+            .child(
+                // 自定义标题栏
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(32.0))
+                    .px(px(6.0))
+                    .gap(px(6.0))
+                    .bg(rgba(0x353535ee))
+                    .text_color(rgba(0xffffffff))
+                    // 左侧：置顶按钮
+                    .child(
+                        div()
+                            .id("pin-always-on-top")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(4.0))
+                            .when(
+                                is_on_top
+                                    || hovered_button
+                                        == Some(
+                                            HoveredButton::AlwaysOnTop,
+                                        ),
+                                |d| {
+                                    let alpha = if is_on_top
+                                        && hovered_button
+                                            == Some(
+                                                HoveredButton::AlwaysOnTop,
+                                            )
+                                    {
+                                        0x66
+                                    } else if is_on_top {
+                                        0x55
+                                    } else {
+                                        0x44
+                                    };
+                                    d.bg(rgba(0xffffff00 | alpha))
+                                },
+                            )
+                            .on_hover({
+                                let entity = entity_for_pin.clone();
+                                move |hovered: &bool,
+                                      _window: &mut Window,
+                                      app: &mut App| {
+                                    let _ = entity.update(
+                                        app,
+                                        |this, cx| {
+                                            if *hovered {
+                                                this.hovered_button =
+                                                    Some(
+                                                        HoveredButton::AlwaysOnTop,
+                                                    );
+                                            } else if this
+                                                .hovered_button
+                                                == Some(
+                                                    HoveredButton::AlwaysOnTop,
+                                                )
+                                            {
+                                                this.hovered_button =
+                                                    None;
+                                            }
+                                            cx.notify();
+                                        },
+                                    );
+                                }
+                            })
+                            .tooltip(|_window, app| {
+                                app.new(|_cx| TooltipLabel {
+                                    text: "固定".into(),
+                                })
+                                .into()
+                            })
+                            .child(
+                                Icon::new(IconName::ArrowUp)
+                                    .size(px(14.0)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                {
+                                    let entity = entity_for_pin.clone();
+                                    move |_ev: &MouseDownEvent,
+                                          window: &mut Window,
+                                          app: &mut App| {
+                                        let new_state = !is_on_top;
+                                        #[cfg(target_os = "linux")]
+                                        send_wm_state_above(
+                                            window, new_state,
+                                        );
+                                        let _ = entity.update(
+                                            app,
+                                            |this, cx| {
+                                                this.is_always_on_top =
+                                                    new_state;
+                                                cx.notify();
+                                            },
+                                        );
+                                    }
+                                },
+                            ),
+                    )
+                    // 中间：可拖拽空白区域
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |_ev: &MouseDownEvent,
+                                      window: &mut Window,
+                                      _app: &mut App| {
+                                    window.start_window_move();
+                                },
+                            ),
+                    )
+                    // 右侧：最小化、最大化、关闭
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id("pin-minimize")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded(px(4.0))
+                                    .when(
+                                        hovered_button
+                                            == Some(
+                                                HoveredButton::Minimize,
+                                            ),
+                                        |d| d.bg(rgba(0xffffff44)),
+                                    )
+                                    .on_hover({
+                                        let entity = entity.clone();
+                                        move |hovered: &bool,
+                                              _window: &mut Window,
+                                              app: &mut App| {
+                                            let _ = entity.update(
+                                                app,
+                                                |this, cx| {
+                                                    if *hovered {
+                                                        this.hovered_button =
+                                                            Some(
+                                                                HoveredButton::Minimize,
+                                                            );
+                                                    } else if this
+                                                        .hovered_button
+                                                        == Some(
+                                                            HoveredButton::Minimize,
+                                                        )
+                                                    {
+                                                        this.hovered_button =
+                                                            None;
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            );
+                                        }
+                                    })
+                                    .tooltip(|_window, app| {
+                                        app.new(|_cx| TooltipLabel {
+                                            text: "最小化".into(),
+                                        })
+                                        .into()
+                                    })
+                                    .child(
+                                        Icon::new(IconName::Minimize)
+                                            .size(px(14.0)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_ev: &MouseDownEvent,
+                                              window: &mut Window,
+                                              _app: &mut App| {
+                                            #[cfg(target_os = "linux")]
+                                            pin_minimize_window(window);
+                                        },
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("pin-maximize")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded(px(4.0))
+                                    .when(
+                                        hovered_button
+                                            == Some(
+                                                HoveredButton::Maximize,
+                                            ),
+                                        |d| d.bg(rgba(0xffffff44)),
+                                    )
+                                    .on_hover({
+                                        let entity = entity.clone();
+                                        move |hovered: &bool,
+                                              _window: &mut Window,
+                                              app: &mut App| {
+                                            let _ = entity.update(
+                                                app,
+                                                |this, cx| {
+                                                    if *hovered {
+                                                        this.hovered_button =
+                                                            Some(
+                                                                HoveredButton::Maximize,
+                                                            );
+                                                    } else if this
+                                                        .hovered_button
+                                                        == Some(
+                                                            HoveredButton::Maximize,
+                                                        )
+                                                    {
+                                                        this.hovered_button =
+                                                            None;
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            );
+                                        }
+                                    })
+                                    .tooltip(|_window, app| {
+                                        app.new(|_cx| TooltipLabel {
+                                            text: "最大化".into(),
+                                        })
+                                        .into()
+                                    })
+                                    .child(
+                                        Icon::new(IconName::Maximize)
+                                            .size(px(14.0)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_ev: &MouseDownEvent,
+                                              window: &mut Window,
+                                              _app: &mut App| {
+                                            #[cfg(target_os = "linux")]
+                                            pin_toggle_maximize(window);
+                                        },
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("pin-close")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded(px(4.0))
+                                    .when(
+                                        hovered_button
+                                            == Some(HoveredButton::Close),
+                                        |d| d.bg(rgba(0xe81123cc)),
+                                    )
+                                    .on_hover({
+                                        let entity = entity.clone();
+                                        move |hovered: &bool,
+                                              _window: &mut Window,
+                                              app: &mut App| {
+                                            let _ = entity.update(
+                                                app,
+                                                |this, cx| {
+                                                    if *hovered {
+                                                        this.hovered_button =
+                                                            Some(
+                                                                HoveredButton::Close,
+                                                            );
+                                                    } else if this
+                                                        .hovered_button
+                                                        == Some(
+                                                            HoveredButton::Close,
+                                                        )
+                                                    {
+                                                        this.hovered_button =
+                                                            None;
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            );
+                                        }
+                                    })
+                                    .tooltip(|_window, app| {
+                                        app.new(|_cx| TooltipLabel {
+                                            text: "关闭".into(),
+                                        })
+                                        .into()
+                                    })
+                                    .child(
+                                        Icon::new(IconName::Close)
+                                            .size(px(14.0)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_ev: &MouseDownEvent,
+                                              window: &mut Window,
+                                              _app: &mut App| {
+                                            window.remove_window();
+                                        },
+                                    ),
+                            ),
+                    ),
+            )
+            .child(paint_canvas.flex_1())
             .on_key_down(|ev: &KeyDownEvent, window, _cx| {
                 if ev.keystroke.key == "escape" {
                     window.remove_window();
@@ -2888,6 +3237,169 @@ impl Render for PinWindowView {
             })
     }
 }
+
+/// 通过 EWMH _NET_WM_STATE_ABOVE 切换窗口置顶状态
+#[cfg(target_os = "linux")]
+fn send_wm_state_above(window: &mut Window, add: bool) {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask, send_event};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
+        if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+            (wh.as_raw(), dh.as_raw())
+        {
+            if let Some(conn_ptr) = xcb_dh.connection {
+                let conn_result = unsafe {
+                    XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
+                };
+                if let Ok(conn) = conn_result {
+                    let root = conn.setup().roots[0].root;
+                    let net_wm_state = conn
+                        .intern_atom(false, b"_NET_WM_STATE")
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.atom);
+                    let net_wm_state_above = conn
+                        .intern_atom(false, b"_NET_WM_STATE_ABOVE")
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.atom);
+                    if let (Some(state_atom), Some(above_atom)) =
+                        (net_wm_state, net_wm_state_above)
+                    {
+                        let action: u32 = if add { 1 } else { 0 };
+                        let event = ClientMessageEvent::new(
+                            32,
+                            xcb_wh.window.into(),
+                            state_atom,
+                            [action, above_atom.into(), 0, 1, 0],
+                        );
+                        let _ = send_event(
+                            &conn,
+                            false,
+                            root,
+                            EventMask::SUBSTRUCTURE_REDIRECT
+                                | EventMask::SUBSTRUCTURE_NOTIFY,
+                            event,
+                        );
+                        let _ = conn.flush();
+                        tracing::info!(
+                            "[Pin] always_on_top {} (action={})",
+                            if add { "on" } else { "off" },
+                            action
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 通过 X11 原生协议最小化窗口
+#[cfg(target_os = "linux")]
+fn pin_minimize_window(window: &mut Window) {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask, send_event};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
+        if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+            (wh.as_raw(), dh.as_raw())
+        {
+            if let Some(conn_ptr) = xcb_dh.connection {
+                let conn_result = unsafe {
+                    XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
+                };
+                if let Ok(conn) = conn_result {
+                    const ICONIC_STATE: u32 = 3;
+                    let wm_change_state = conn
+                        .intern_atom(false, b"WM_CHANGE_STATE")
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.atom);
+                    if let Some(cs_atom) = wm_change_state {
+                        let event = ClientMessageEvent::new(
+                            32,
+                            xcb_wh.window.into(),
+                            cs_atom,
+                            [ICONIC_STATE, 0, 0, 0, 0],
+                        );
+                        let _ = send_event(
+                            &conn,
+                            false,
+                            conn.setup().roots[0].root,
+                            EventMask::SUBSTRUCTURE_REDIRECT
+                                | EventMask::SUBSTRUCTURE_NOTIFY,
+                            event,
+                        );
+                        let _ = conn.flush();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 通过 X11 原生协议最大化/还原窗口
+#[cfg(target_os = "linux")]
+fn pin_toggle_maximize(window: &mut Window) {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask, send_event};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
+        if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+            (wh.as_raw(), dh.as_raw())
+        {
+            if let Some(conn_ptr) = xcb_dh.connection {
+                let conn_result = unsafe {
+                    XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
+                };
+                if let Ok(conn) = conn_result {
+                    let net_wm_state = conn
+                        .intern_atom(false, b"_NET_WM_STATE")
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.atom);
+                    let max_h = conn
+                        .intern_atom(false, b"_NET_WM_STATE_MAXIMIZED_HORZ")
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.atom);
+                    let max_v = conn
+                        .intern_atom(false, b"_NET_WM_STATE_MAXIMIZED_VERT")
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.atom);
+                    if let (Some(state), Some(h), Some(v)) =
+                        (net_wm_state, max_h, max_v)
+                    {
+                        let event = ClientMessageEvent::new(
+                            32,
+                            xcb_wh.window.into(),
+                            state,
+                            [2, h.into(), v.into(), 1, 0], // 2=Toggle
+                        );
+                        let _ = send_event(
+                            &conn,
+                            false,
+                            conn.setup().roots[0].root,
+                            EventMask::SUBSTRUCTURE_REDIRECT
+                                | EventMask::SUBSTRUCTURE_NOTIFY,
+                            event,
+                        );
+                        let _ = conn.flush();
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 /// 在新线程中启动独立的 GPUI 窗口，展示标注后的截图
 fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: f32, sy: f32) {
@@ -2902,11 +3414,15 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                 let img_h = pin_frame.height as f32 / sy;
                 let max_w = 1200.0_f32;
                 let max_h = 900.0_f32;
-                let scale = (max_w / img_w).min(max_h / img_h).min(1.0);
-                // 系统标题栏高度（Linux 典型值，用于 frame_y 偏移）
-                const EST_TITLEBAR_H: f32 = 35.0;
+                const MIN_IMG_W: f32 = 150.0;
+                let scale = (max_w / img_w)
+                    .min(max_h / img_h)
+                    .min(1.0)
+                    .max(MIN_IMG_W / img_w);
+                // 自定义标题栏高度（原生标题栏已移除，由 PinWindowView render 绘制）
+                const CUSTOM_TITLEBAR_H: f32 = 32.0;
                 let win_w = px(img_w * scale);
-                let win_h = px(img_h * scale);
+                let win_h = px(img_h * scale + CUSTOM_TITLEBAR_H);
                 // 使用 Normal 窗口：支持 start_window_move / 键盘事件等 WM 交互
                 tracing::info!(
                     "[Pin] spawn window: origin=({:.0},{:.0}) img_logical={:.1}x{:.1} img_physical={}x{} win_size={:.1}x{:.1} scale={:.2}",
@@ -2917,9 +3433,10 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                 );
 
                 let target_x = origin_x;
-                let target_y = origin_y;
-                // 窗口框架 y 坐标：上移标题栏高度，使内容区域恰好落在 origin_y
-                let frame_y = origin_y - EST_TITLEBAR_H;
+                // 窗口上移自定义标题栏高度，使图片内容与原始选区位置对齐。
+                // 图片渲染在标题栏下方 y=32 处，因此窗口原点需设于 origin_y - 32。
+                let target_y = origin_y - CUSTOM_TITLEBAR_H;
+                let frame_y = origin_y - CUSTOM_TITLEBAR_H;
 
                 cx.open_window(
                     WindowOptions {
@@ -2927,14 +3444,13 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                             origin: point(px(target_x), px(target_y)),
                             size: Size::new(win_w, win_h),
                         })),
-                        titlebar: Some(gpui::TitlebarOptions {
-                            title: Some("截图固定".into()),
-                            ..Default::default()
-                        }),
+                        titlebar: None,
                         window_background: WindowBackgroundAppearance::Transparent,
                         kind: WindowKind::Normal,
-                        is_movable: true,
+                        is_movable: false,
                         is_resizable: false,
+                        is_minimizable: true,
+                        window_decorations: Some(WindowDecorations::Client),
                         focus: true,
                         ..Default::default()
                     },
@@ -3003,7 +3519,43 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                                                     );
                                                 }
 
-                                                // 读取 _NET_FRAME_EXTENTS 获取实际标题栏高度
+                                                // 设置 _MOTIF_WM_HINTS 移除服务端窗口装饰（兜底）
+                                                let mh_result =
+                                                    conn.intern_atom(
+                                                        false,
+                                                        b"_MOTIF_WM_HINTS",
+                                                    );
+                                                if let Ok(mh_cookie) = mh_result {
+                                                    if let Ok(mh_reply) =
+                                                        mh_cookie.reply()
+                                                    {
+                                                        let hints: [u32; 5] =
+                                                            [2, 0, 0, 0, 0];
+                                                        let hint_bytes: [u8; 20] =
+                                                            unsafe {
+                                                                std::mem::transmute(
+                                                                    hints,
+                                                                )
+                                                            };
+                                                        let _ = conn.change_property(
+                                                            PropMode::REPLACE,
+                                                            xcb_wh.window.into(),
+                                                            mh_reply.atom,
+                                                            mh_reply.atom,
+                                                            32,
+                                                            5,
+                                                            &hint_bytes,
+                                                        );
+                                                        tracing::info!(
+                                                            "[Pin] _MOTIF_WM_HINTS no-decorations"
+                                                        );
+                                                    }
+                                                }
+
+                                                // 读取 _NET_FRAME_EXTENTS 获取 WM 附加的边框高度，
+                                                // 用于修正窗口位置（客户端装饰下应为 0，但部分
+                                                // WM 可能仍添加阴影/边框导致内容偏移）
+                                                let mut frame_extent_top: u32 = 0;
                                                 let net_fe_result = conn
                                                     .intern_atom(false, b"_NET_FRAME_EXTENTS");
                                                 if let Ok(net_fe_cookie) = net_fe_result {
@@ -3020,11 +3572,11 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                                                                 if reply.value.len() >= 16 {
                                                                     let left = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap_or_default());
                                                                     let right = u32::from_ne_bytes(reply.value[4..8].try_into().unwrap_or_default());
-                                                                    let top = u32::from_ne_bytes(reply.value[8..12].try_into().unwrap_or_default());
+                                                                    frame_extent_top = u32::from_ne_bytes(reply.value[8..12].try_into().unwrap_or_default());
                                                                     let bottom = u32::from_ne_bytes(reply.value[12..16].try_into().unwrap_or_default());
                                                                     tracing::info!(
-                                                                        "[Pin] frame_extents: left={} right={} top={} bottom={} (EST_TITLEBAR_H={})",
-                                                                        left, right, top, bottom, EST_TITLEBAR_H
+                                                                        "[Pin] frame_extents: left={} right={} top={} bottom={}",
+                                                                        left, right, frame_extent_top, bottom
                                                                     );
                                                                 }
                                                             }
@@ -3032,9 +3584,10 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                                                     }
                                                 }
 
+                                                let adjusted_y = frame_y as i32 - frame_extent_top as i32;
                                                 let values = ConfigureWindowAux::new()
                                                     .x(target_x as i32)
-                                                    .y(frame_y as i32);
+                                                    .y(adjusted_y);
                                                 if let Err(e) =
                                                     conn.configure_window(xcb_wh.window.into(), &values)
                                                 {
@@ -3045,8 +3598,8 @@ fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: 
                                                 }
                                                 let _ = conn.flush();
                                                 tracing::info!(
-                                                    "[Pin] X11 moved window to ({:.0},{:.0})",
-                                                    target_x, frame_y
+                                                    "[Pin] X11 moved window to ({:.0},{:.0}) frame_extent_top={}",
+                                                    target_x, adjusted_y, frame_extent_top
                                                 );
                                             }
                                             Err(e) => {
