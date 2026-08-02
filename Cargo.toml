@@ -23,6 +23,10 @@ tray-icon = "0.11"
 arboard = "3"
 image = "0.25"
 
+# OCR 依赖按需下载（首次使用 OCR 时从 GitHub 拉取 tesseract，不打包进应用）
+ureq = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # 错误处理与日志
 anyhow = "1"
 thiserror = "1"
@@ -48,3 +52,15 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 # GTK 初始化（Linux 托盘依赖）
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+
+# Win32 消息泵（Windows 下 global-hotkey / tray-icon 必须在创建线程上跑消息循环才能派发事件）
+# + ReleaseCapture（Pin 窗口标题栏拖拽）+ ClientToScreen（诊断 pin 客户端原点）
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi"] }
+
+[profile.release]
+opt-level = "z"          # 优化目标为大小 (size optimization)
+lto = "fat"              # 完整的链接时优化 (full LTO)
+codegen-units = 1        # 最小化编译单元以获得最佳优化
+strip = true             # 自动移除符号和调试信息
+panic = "abort"          # 使用 abort 代替 unwind，减少二进制大小

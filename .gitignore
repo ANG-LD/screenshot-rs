@@ -7,3 +7,6 @@ Cargo.lock.bak
 assets/fonts/*.otf
 assets/fonts/*.ttf
 .fuse_hidden*
+# tesseract 打包资源（仅用于生成 tesseract.zip 上传 GitHub Releases，不随应用分发）
+vendor/
+tesseract.zip

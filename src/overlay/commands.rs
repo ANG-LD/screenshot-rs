@@ -206,12 +206,13 @@ pub fn apply_commands(
                 if len >= 1.0 {
                     let ux = dx / len;
                     let uy = dy / len;
-                    let head_len = (line_width * 7.0).max(14.0);
-                    let head_w = (line_width * 2.0).max(4.0);
+                    // 箭头头随线宽缩放：细线（0.5/1）用短小箭头，粗线用大箭头
+                    let head_len = (line_width * 7.0).max(4.0);
+                    let head_w = (line_width * 2.0).max(1.0);
                     let bx = t.0 - ux * head_len;
                     let by = t.1 - uy * head_len;
                     // 主线：从起点窄到箭头底部宽，渐变过渡
-                    let start_lw = (line_width * 0.3).max(1.0);
+                    let start_lw = (line_width * 0.3).max(0.2);
                     draw_tapered_line(frame, f.0, f.1, bx, by, start_lw, *line_width, *color)?;
                     // 箭头：两条短边从 to 张开成 V 字（不画底边 p1→p2）
                     let px = -uy;
@@ -310,7 +311,8 @@ fn draw_thick_line(
     lw: f32,
     color: RGBA,
 ) -> AppResult<()> {
-    let half = (lw / 2.0).max(0.5);
+    // 不设最小下限：允许 0.5 线宽比 1 更细（半宽 0.25 vs 0.5）
+    let half = lw / 2.0;
     let aa = 0.5_f32;
     let r = half + aa;
 
@@ -425,14 +427,14 @@ fn draw_tapered_line(
     let len_sq = dx * dx + dy * dy;
 
     if len_sq < 0.01 {
-        let half = (end_lw / 2.0).max(0.5);
+        let half = end_lw / 2.0;
         return fill_round_dot(frame, x1, y1, half, color);
     }
     let len = len_sq.sqrt();
 
     let aa = 0.5_f32;
-    let start_half = (start_lw / 2.0).max(0.5);
-    let end_half = (end_lw / 2.0).max(0.5);
+    let start_half = start_lw / 2.0;
+    let end_half = end_lw / 2.0;
     // 使用最大半径做扫描行裁剪
     let max_half = start_half.max(end_half);
     let r = max_half + aa;

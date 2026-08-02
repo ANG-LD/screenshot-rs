@@ -3,15 +3,17 @@
 //! 用户拖拽选区，松开鼠标后选区 bounds 通过 mpsc 发回主线程；
 //! 主线程据此裁剪原帧并写入剪贴板。Esc / 关闭窗口 → 取消。
 //!
-//! GPUI 主线程由 `run_blocking` 在 std::thread 中拉起；调用方在 channel 上阻塞等待结果。
+//! GPUI 应用为进程级常驻单例（`OverlayService`）：专用线程跑
+//! `QuitMode::Explicit` 的 `application().run()`，覆盖窗口与 Pin 窗口都在
+//! 同一个应用内创建/销毁，截图完成不退出进程。主线程在 channel 上阻塞等结果。
 
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, OnceLock};
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, Rems, Render, RenderImage, Size, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions,
+    App, AsyncApp, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Rems, Render, RenderImage, Size,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions,
     canvas,
     div, point,
     prelude::*, px, quad, rgba,
@@ -53,6 +55,12 @@ pub struct OverlayView {
     frame_image: Arc<RenderImage>,
     /// 屏幕边界（逻辑像素，与 GPUI 坐标系一致）
     screen_bounds: ub::Bounds,
+    /// 覆盖窗口在屏幕上的客户端区原点（逻辑像素）。
+    ///
+    /// 注意：`window.bounds().origin` 返回的是窗口**外框**位置（含 DWM 隐形边框），
+    /// 与客户端区原点相差顶部边框偏移；选区/画布坐标是客户端区坐标，所以
+    /// 计算屏幕位置必须用这里存的客户端原点，而不是 `window.bounds().origin`。
+    client_origin: ub::Point,
     /// 选区状态机
     selection: SelectionState,
     /// 选区结果回调
@@ -192,6 +200,20 @@ struct CmdDragState {
     cmd_index: usize,
 }
 
+/// Pin 固定所需全部数据：裁剪+应用命令后的帧（物理像素）、屏幕逻辑坐标、物理→逻辑缩放。
+#[derive(Debug, Clone)]
+pub struct PinPayload {
+    /// 已按选区裁剪并应用标注命令的帧（物理像素 RGBA）
+    pub frame: CapturedFrame,
+    /// pin 窗口内容左上角的屏幕逻辑 x
+    pub origin_x: f32,
+    /// pin 窗口内容左上角的屏幕逻辑 y
+    pub origin_y: f32,
+    /// 物理像素 → 逻辑像素 缩放因子
+    pub sx: f32,
+    pub sy: f32,
+}
+
 /// 覆盖窗口完成后回传给主线程的结果
 ///
 /// `selection` 为 None 表示用户取消；否则 `selection` 是选区 bounds，
@@ -201,19 +223,23 @@ pub struct OverlayResult {
     pub commands: Vec<DrawCommand>,
     /// Pin 固定时跳过剪贴板复制
     pub no_clipboard: bool,
+    /// 非 None 表示用户点了「固定」：主线程应把 payload 交给 `OverlayService::open_pin`
+    pub pin: Option<PinPayload>,
 }
 
 impl OverlayView {
     fn new(
         frame: &CapturedFrame,
         screen_bounds: ub::Bounds,
+        client_origin: ub::Point,
         scale_factor: f32,
         tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
+        let this = Self {
             frame_image: build_render_image(frame),
             screen_bounds,
+            client_origin,
             selection: SelectionState::new(screen_bounds),
             tx,
             focus_handle: cx.focus_handle(),
@@ -241,7 +267,9 @@ impl OverlayView {
             scale_factor,
             dim_opacity: 0.0,
             animation_start: std::time::Instant::now(),
-        }
+        };
+
+        this
     }
 
     /// 发送结果并关闭窗口
@@ -282,7 +310,8 @@ impl OverlayView {
             }
         }
         let no_clipboard = result.no_clipboard;
-        let _ = self.tx.send(OverlayResult { selection, commands, no_clipboard });
+        let pin = result.pin;
+        let _ = self.tx.send(OverlayResult { selection, commands, no_clipboard, pin });
         window.remove_window();
     }
 
@@ -693,6 +722,7 @@ impl OverlayView {
                 active_tool == Some(ToolButton::Ocr),
                 false,
                 weak.clone(),
+                cx,
             ))
             .child(render_tool_button_with_popover(
                 ToolButton::Mosaic,
@@ -707,12 +737,14 @@ impl OverlayView {
                 false,
                 !can_undo,
                 weak.clone(),
+                cx,
             ))
             .child(render_simple_button(
                 ToolButton::Redo,
                 false,
                 !can_redo,
                 weak.clone(),
+                cx,
             ))
             // 3) Pin / Cancel / Finish
             .child(render_simple_button(
@@ -720,18 +752,21 @@ impl OverlayView {
                 false,
                 false,
                 weak.clone(),
+                cx,
             ))
             .child(render_simple_button(
                 ToolButton::Cancel,
                 false,
                 false,
                 weak.clone(),
+                cx,
             ))
             .child(render_simple_button(
                 ToolButton::Finish,
                 false,
                 false,
                 weak,
+                cx,
             ));
 
         // 工具栏根 div
@@ -746,8 +781,10 @@ impl OverlayView {
             .absolute()
             .top(px(toolbar_y))
             .left(px(toolbar_x))
-            .bg(gpui::rgba(0x202020FF))
-            .rounded_md()
+            .bg(gpui::rgba(0x1E1E1EF5))
+            .rounded_lg()
+            .border_1()
+            .border_color(gpui::rgba(0xFFFFFF26))
             .p(px(TOOLBAR_PAD))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, _cx| {
                 this.toolbar_hovered = true;
@@ -826,8 +863,41 @@ fn icon_label(btn: ToolButton) -> impl IntoElement {
         .flex()
         .items_center()
         .gap(px(2.0))
-        .child(Icon::new(icon_for(btn)).size(px(14.0)))
-        .child(btn.label())
+        .child(Icon::new(icon_for(btn)).size(px(12.0)))
+        .child(div().text_xs().child(btn.label()))
+}
+
+/// 工具栏按钮配色
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolbarBtnStyle {
+    /// 普通按钮：深色工具栏上的浅色半透明底 + 亮文字
+    Neutral,
+    /// 激活/主操作：蓝色强调
+    Accent,
+    /// 完成：绿色
+    Success,
+}
+
+/// 构造工具栏按钮的定制样式（背景/文字/hover/active 配色）
+fn toolbar_btn_style(cx: &App, kind: ToolbarBtnStyle) -> gpui_component::button::ButtonCustomVariant {
+    let base = gpui_component::button::ButtonCustomVariant::new(cx);
+    match kind {
+        ToolbarBtnStyle::Neutral => base
+            .color(gpui::rgba(0xFFFFFF0F).into())
+            .foreground(gpui::rgba(0xE4E4EA).into())
+            .hover(gpui::rgba(0xFFFFFF20).into())
+            .active(gpui::rgba(0xFFFFFF2E).into()),
+        ToolbarBtnStyle::Accent => base
+            .color(gpui::rgba(0x3B82F6).into())
+            .foreground(gpui::rgba(0xFFFFFFFF).into())
+            .hover(gpui::rgba(0x4C8FFA).into())
+            .active(gpui::rgba(0x3374E8).into()),
+        ToolbarBtnStyle::Success => base
+            .color(gpui::rgba(0x22C55E).into())
+            .foreground(gpui::rgba(0xFFFFFFFF).into())
+            .hover(gpui::rgba(0x2ED36B).into())
+            .active(gpui::rgba(0x1CAE50).into()),
+    }
 }
 
 /// 给 5 个绘图工具构造带 Popover 的按钮 Popover
@@ -852,9 +922,15 @@ fn render_tool_button_with_popover(
     let is_open = is_active && view.toolbar.popup == Some(popup_kind);
 
     let weak_for_trigger = weak.clone();
+    let trigger_style = toolbar_btn_style(
+        cx,
+        if is_active { ToolbarBtnStyle::Accent } else { ToolbarBtnStyle::Neutral },
+    );
     let trigger = Button::new(("tool", btn as usize))
         .tooltip(btn.label())
+        .with_size(gpui_component::Size::Small)
         .compact()
+        .custom(trigger_style)
         .selected(is_active)
         .child(icon_label(btn))
         .on_click(move |_, _, cx| {
@@ -918,11 +994,25 @@ fn render_simple_button(
     active: bool,
     disabled: bool,
     weak: gpui::WeakEntity<OverlayView>,
+    cx: &mut Context<OverlayView>,
 ) -> Button {
+    // Finish 用绿色"完成"；激活工具用蓝色；其余中性配色
+    let style = toolbar_btn_style(
+        cx,
+        if btn == ToolButton::Finish {
+            ToolbarBtnStyle::Success
+        } else if active {
+            ToolbarBtnStyle::Accent
+        } else {
+            ToolbarBtnStyle::Neutral
+        },
+    );
     let weak_for_click = weak.clone();
-    let mut b = Button::new(("action", btn as usize))
+    let b = Button::new(("action", btn as usize))
         .tooltip(btn.label())
+        .with_size(gpui_component::Size::Small)
         .compact()
+        .custom(style)
         .disabled(disabled)
         .child(icon_label(btn))
         .on_click(move |_, window, cx| {
@@ -945,6 +1035,7 @@ fn render_simple_button(
                                 selection: None,
                                 commands: vec![],
                                 no_clipboard: false,
+                                pin: None,
                             },
                             window,
                         );
@@ -980,6 +1071,10 @@ fn render_simple_button(
                         let scaled_cmds: Vec<DrawCommand> =
                             cmds.iter().map(|c| scale_draw_command(c.clone(), sx, sy)).collect();
 
+                        // 固定：把裁剪+标注后的帧放进 OverlayResult，由主线程交给
+                        // OverlayService::open_pin 在同一个 GPUI 应用里开 pin 窗口。
+                        let mut pin: Option<PinPayload> = None;
+
                         if let Some(sel) = s {
                             let sel_px = ub::Bounds {
                                 origin: ub::Point::new(sel.origin.x * sx, sel.origin.y * sy),
@@ -993,6 +1088,7 @@ fn render_simple_button(
                                 "[Pin] selection physical: origin=({:.0},{:.0}) size=({:.0},{:.0})",
                                 sel_px.origin.x, sel_px.origin.y, sel_px.size.x, sel_px.size.y
                             );
+
                             let full_pixels = this.frame_pixels.clone();
                             let fw = this.frame_width;
                             let fh = this.frame_height;
@@ -1014,17 +1110,26 @@ fn render_simple_button(
                                     sel_px.origin.y,
                                     &scaled_cmds,
                                 );
-                                let pin_x = f32::from(wb.origin.x) + sel.origin.x;
-                                let pin_y = f32::from(wb.origin.y) + sel.origin.y;
+                                // 屏幕位置 = 覆盖窗口客户端原点 + 画布(客户端)坐标。
+                                // 不能用 wb.origin（窗口外框位置，含 DWM 隐形边框）：
+                                // 那会把固定窗口整体上移一个顶部边框偏移（几 px）。
+                                let pin_x = this.client_origin.x + sel.origin.x;
+                                let pin_y = this.client_origin.y + sel.origin.y;
                                 tracing::info!(
                                     "[Pin] target position: ({:.0},{:.0}) clipped_frame={}x{}",
                                     pin_x, pin_y, clipped.width, clipped.height
                                 );
-                                spawn_pin_window(clipped, pin_x, pin_y, sx, sy);
+                                pin = Some(PinPayload {
+                                    frame: clipped,
+                                    origin_x: pin_x,
+                                    origin_y: pin_y,
+                                    sx,
+                                    sy,
+                                });
                             }
                         }
 
-                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true, pin }, window);
                     }
                     ToolButton::Finish => {
                         // 兜底：若 Text 工具还活着没提交，先把它的内容落成命令
@@ -1032,15 +1137,12 @@ fn render_simple_button(
                         let s = this.selection.current().or(Some(this.screen_bounds));
                         let cmds: Vec<DrawCommand> =
                             this.drawing.visible_commands().cloned().collect();
-                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false, pin: None }, window);
                     }
                     _ => {}
                 }
             });
         });
-    if active || btn == ToolButton::Finish {
-        b = b.primary();
-    }
     b
 }
 
@@ -1108,12 +1210,13 @@ fn render_stroke_popover_content(
 
     let mut col = div().flex().flex_col().gap(px(6.0)).p(px(6.0)).min_w(px(200.0));
 
-    // 第一行：粗细档位
-    let mut top = div().flex().gap(px(4.0)).items_center();
+    // 第一行：粗细档位（8 档，flex_wrap 自动换行成 4×2）
+    let mut top = div().flex().flex_wrap().gap(px(4.0)).items_center();
     for (i, &lw) in LINE_WIDTHS.iter().enumerate() {
         let weak_lw = weak.clone();
         let is_current = (cur_lw - lw).abs() < f32::EPSILON;
-        let label: gpui::SharedString = format!("{}", lw as i32).into();
+        // 0.5 显示 "0.5"，整数档显示 "1"、"2" 等
+        let label: gpui::SharedString = format!("{}", lw).into();
         let btn = Button::new(("lw", i))
             .label(label)
             .compact()
@@ -1884,8 +1987,8 @@ fn run_ocr_sync(
         }
     }
 
-    // 写入调试 PNG（固定路径方便检查）
-    let debug_path = std::path::PathBuf::from("/tmp/screenshot_ocr_debug.png");
+    // 写入调试 PNG（用系统临时目录，Linux 的 /tmp 在 Windows/macOS 上不存在）
+    let debug_path = std::env::temp_dir().join("screenshot_ocr_debug.png");
     {
         let img = image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| {
             image::RgbImage::new(w, h)
@@ -1897,15 +2000,16 @@ fn run_ocr_sync(
         }
     }
 
-    // 调用 tesseract
-    let output = Command::new("tesseract")
-        .arg(&debug_path)
-        .arg("stdout")
-        .arg("-l")
-        .arg("chi_sim+eng")
-        .arg("--psm")
-        .arg("6")
-        .output();
+    // 调用 tesseract：优先 exe 旁的打包版 → 缓存（已下载）→ 系统 PATH；
+    // 都没有则自动从 GitHub 下载到缓存目录（%LOCALAPPDATA%/screenshot-rs）。
+    let (tesseract_bin, tessdata_dir) = find_or_download_tesseract();
+
+    let mut cmd = Command::new(&tesseract_bin);
+    cmd.arg(&debug_path).arg("stdout").arg("-l").arg("chi_sim+eng").arg("--psm").arg("6");
+    if let Some(td) = tessdata_dir.as_ref().filter(|p| p.exists()) {
+        cmd.arg("--tessdata-dir").arg(td);
+    }
+    let output = cmd.output();
 
     match output {
         Ok(out) => {
@@ -1919,9 +2023,122 @@ fn run_ocr_sync(
         }
         Err(e) => {
             tracing::error!("tesseract OCR 失败: {}", e);
-            String::new()
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "⚠ 未找到 tesseract，自动下载失败。\n\n请手动安装并加入 PATH：\nWindows: winget install UB-Mannheim.TesseractOCR\nmacOS: brew install tesseract\nLinux: apt install tesseract-ocr tesseract-ocr-chi-sim\n\n或检查下载地址：{}",
+                    tesseract_download_url()
+                )
+            } else {
+                format!("⚠ OCR 执行失败: {e}")
+            }
         }
     }
+}
+
+/// tesseract 下载包的 URL：把 `tesseract.zip`（含 tesseract/ 与 tessdata/ 两个目录）
+/// 上传到你的 GitHub Releases，然后把下面的占位地址换成实际的
+/// `https://github.com/<user>/<repo>/releases/latest/download/tesseract.zip`。
+const TESSERACT_DOWNLOAD_URL: &str =
+    "https://github.com/YOUR_USER/YOUR_REPO/releases/latest/download/tesseract.zip";
+
+/// 下载地址：优先读 `TESSERACT_DOWNLOAD_URL` 环境变量，否则用默认常量。
+/// 默认值请在上传 ZIP 后替换为你的 GitHub Releases 地址。
+fn tesseract_download_url() -> String {
+    std::env::var("TESSERACT_DOWNLOAD_URL")
+        .unwrap_or_else(|_| TESSERACT_DOWNLOAD_URL.to_string())
+}
+
+/// 下载缓存目录：`%LOCALAPPDATA%/screenshot-rs`（Linux/macOS 用家目录下）。
+fn tesseract_cache_dir() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("screenshot-rs")
+}
+
+/// 找到可用的 tesseract 可执行文件；找不到则自动从 GitHub 下载并解压到缓存。
+///
+/// 返回 `(tesseract_bin, tessdata_dir)`：
+/// - 优先 exe 旁的打包版（`<exe>/tesseract/tesseract.exe`）
+/// - 其次缓存（`<cache>/tesseract/tesseract.exe`，首次使用下载到这里）
+/// - 最后回退系统 PATH（返回 "tesseract"，让 Command 报错提示安装）
+fn find_or_download_tesseract() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let cache = tesseract_cache_dir();
+    let cache_bin = cache.join("tesseract").join("tesseract.exe");
+    let cache_td = cache.join("tessdata");
+    let bundled_bin = exe_dir.as_ref().map(|d| {
+        #[cfg(target_os = "windows")]
+        {
+            d.join("tesseract").join("tesseract.exe")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            d.join("bin").join("tesseract")
+        }
+    });
+
+    if let Some(b) = bundled_bin.filter(|p| p.exists()) {
+        return (b, exe_dir.map(|d| d.join("tessdata")).filter(|p| p.exists()));
+    }
+    if cache_bin.exists() {
+        return (cache_bin, Some(cache_td).filter(|p| p.exists()));
+    }
+
+    tracing::info!("未检测到 tesseract，尝试从 {} 下载…", tesseract_download_url());
+    match download_tesseract(&cache) {
+        Ok(()) if cache_bin.exists() => {
+            tracing::info!("tesseract 已下载到 {}", cache.display());
+            (cache_bin, Some(cache_td).filter(|p| p.exists()))
+        }
+        Ok(_) => (std::path::PathBuf::from("tesseract"), None),
+        Err(e) => {
+            tracing::error!("tesseract 下载失败: {e}");
+            (std::path::PathBuf::from("tesseract"), None)
+        }
+    }
+}
+
+/// 下载 `tesseract.zip` 并解压到缓存目录。
+fn download_tesseract(cache: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
+    let zip_path = cache.join("tesseract.zip");
+
+    // 下载（阻塞；仅首次使用 OCR 时执行一次）
+    let resp = ureq::get(&tesseract_download_url())
+        .call()
+        .map_err(|e| format!("下载失败: {e}"))?;
+    let mut body = resp.into_reader();
+    {
+        let mut file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut body, &mut file).map_err(|e| e.to_string())?;
+    }
+
+    // 解压
+    let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        if name.contains("..") {
+            continue; // 防路径穿越
+        }
+        let outpath = cache.join(&name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&outpath).ok();
+        } else {
+            if let Some(p) = outpath.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            let mut out = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let _ = std::fs::remove_file(&zip_path);
+    Ok(())
 }
 
 impl Render for OverlayView {
@@ -2781,6 +2998,11 @@ impl Render for OverlayView {
                                 tracing::info!("OCR result len={}, content={:?}", text.len(), text);
                                 this.ocr_result = if text.is_empty() { None } else { Some(text) };
                                 this.ocr_loading = false;
+                                // 识别成功后退出 OCR 工具：否则点击截图区域会开始新框选，
+                                // 把 ocr_result 清空导致右侧面板消失。面板保持到点关闭按钮。
+                                if this.ocr_result.is_some() {
+                                    this.toolbar.active_tool = None;
+                                }
                                 cx.notify();
                             } else {
                                 tracing::info!("OCR rect too small, cleared");
@@ -2825,7 +3047,7 @@ impl Render for OverlayView {
                             .visible_commands()
                             .cloned()
                             .collect();
-                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false }, window);
+                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None }, window);
                     }
                 }),
             )
@@ -2837,7 +3059,7 @@ impl Render for OverlayView {
                         cx.notify();
                         return;
                     }
-                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false }, window);
+                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false, pin: None }, window);
                 } else if ev.keystroke.key == "enter" {
                     // Enter 先尝试提交活跃的 Text 输入（如果 Text 工具正在输入）。
                     // 若 finalize 了 Text 命令，说明这次 Enter 是\"写字时按 Enter 提交\"
@@ -2854,7 +3076,7 @@ impl Render for OverlayView {
                         .visible_commands()
                         .cloned()
                         .collect();
-                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false }, window);
+                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None }, window);
                 } else if ev.keystroke.key == "z" && ev.keystroke.modifiers.control {
                     // Ctrl+Z 撤销 / Ctrl+Shift+Z 重做
                     if ev.keystroke.modifiers.shift {
@@ -3072,6 +3294,35 @@ impl Render for PinWindowView {
                                 move |_ev: &MouseDownEvent,
                                       window: &mut Window,
                                       _app: &mut App| {
+                                    // Windows 上 gpui_windows 未实现 start_window_move
+                                    // （gpui::PlatformWindow 默认 no-op），用 Win32 原生
+                                    // 标题栏拖拽：ReleaseCapture + WM_NCLBUTTONDOWN(HTCAPTION)。
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        use raw_window_handle::{
+                                            HasWindowHandle, RawWindowHandle,
+                                        };
+                                        use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+                                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                                            SendMessageW, HTCAPTION, WM_NCLBUTTONDOWN,
+                                        };
+                                        if let Ok(handle) = window.window_handle() {
+                                            if let RawWindowHandle::Win32(win) = handle.as_raw() {
+                                                unsafe {
+                                                    let hwnd = win.hwnd.get()
+                                                        as *mut core::ffi::c_void;
+                                                    ReleaseCapture();
+                                                    SendMessageW(
+                                                        hwnd,
+                                                        WM_NCLBUTTONDOWN,
+                                                        HTCAPTION as usize,
+                                                        0,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    #[cfg(not(target_os = "windows"))]
                                     window.start_window_move();
                                 },
                             ),
@@ -3443,333 +3694,474 @@ fn pin_toggle_maximize(window: &mut Window) {
 
 
 /// 在新线程中启动独立的 GPUI 窗口，展示标注后的截图
-fn spawn_pin_window(pin_frame: CapturedFrame, origin_x: f32, origin_y: f32, sx: f32, sy: f32) {
-    std::thread::spawn(move || {
-        application()
-            .with_assets(gpui_component_assets::Assets)
-            .run(move |cx: &mut App| {
-                gpui_component::init(cx);
 
-                // pin_frame 尺寸是物理像素，转为逻辑像素用于窗口尺寸
-                let img_w = pin_frame.width as f32 / sx;
-                let img_h = pin_frame.height as f32 / sy;
-                let max_w = 1200.0_f32;
-                let max_h = 900.0_f32;
-                const MIN_IMG_W: f32 = 150.0;
-                let scale = (max_w / img_w)
-                    .min(max_h / img_h)
-                    .min(1.0)
-                    .max(MIN_IMG_W / img_w);
-                // 自定义标题栏高度（原生标题栏已移除，由 PinWindowView render 绘制）
-                const CUSTOM_TITLEBAR_H: f32 = 32.0;
-                let win_w = px(img_w * scale);
-                let win_h = px(img_h * scale + CUSTOM_TITLEBAR_H);
-                // 使用 Normal 窗口：支持 start_window_move / 键盘事件等 WM 交互
-                tracing::info!(
-                    "[Pin] spawn window: origin=({:.0},{:.0}) img_logical={:.1}x{:.1} img_physical={}x{} win_size={:.1}x{:.1} scale={:.2}",
-                    origin_x, origin_y,
-                    img_w, img_h,
-                    pin_frame.width, pin_frame.height,
-                    win_w, win_h, scale
-                );
-
-                let target_x = origin_x;
-                // 窗口上移自定义标题栏高度，使图片内容与原始选区位置对齐。
-                // 图片渲染在标题栏下方 y=32 处，因此窗口原点需设于 origin_y - 32。
-                let target_y = origin_y - CUSTOM_TITLEBAR_H;
-                let frame_y = origin_y - CUSTOM_TITLEBAR_H;
-
-                cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds {
-                            origin: point(px(target_x), px(target_y)),
-                            size: Size::new(win_w, win_h),
-                        })),
-                        titlebar: None,
-                        window_background: WindowBackgroundAppearance::Transparent,
-                        kind: WindowKind::Normal,
-                        is_movable: false,
-                        is_resizable: false,
-                        is_minimizable: true,
-                        window_decorations: Some(WindowDecorations::Client),
-                        focus: true,
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        let actual = window.bounds();
-                        tracing::info!(
-                            "[Pin] actual window after open: origin=({:.0},{:.0}) size=({:.0},{:.0})",
-                            actual.origin.x, actual.origin.y, actual.size.width, actual.size.height
-                        );
-
-                        #[cfg(target_os = "linux")]
-                        {
-                            use x11rb::connection::Connection;
-                            use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
-                            use x11rb::protocol::xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt, PropMode};
-                            use x11rb::x11_utils::Serialize;
-                            use x11rb::xcb_ffi::XCBConnection;
-
-                            if let (Ok(wh), Ok(dh)) =
-                                (window.window_handle(), window.display_handle())
-                            {
-                                if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
-                                    (wh.as_raw(), dh.as_raw())
-                                {
-                                    if let Some(conn_ptr) = xcb_dh.connection {
-                                        let conn_result = unsafe {
-                                            XCBConnection::from_raw_xcb_connection(
-                                                conn_ptr.as_ptr().cast(),
-                                                false,
-                                            )
-                                        };
-                                        match conn_result {
-                                            Ok(conn) => {
-                                                // 设置 WM_NORMAL_HINTS 的 PPosition 标志，
-                                                // 告知窗口管理器此窗口位置由程序显式指定
-                                                let nh_atom = conn
-                                                    .intern_atom(false, b"WM_NORMAL_HINTS")
-                                                    .ok()
-                                                    .and_then(|c| c.reply().ok())
-                                                    .map(|r| r.atom);
-                                                let sh_atom = conn
-                                                    .intern_atom(false, b"WM_SIZE_HINTS")
-                                                    .ok()
-                                                    .and_then(|c| c.reply().ok())
-                                                    .map(|r| r.atom);
-                                                if let (Some(nh), Some(sh)) = (nh_atom, sh_atom) {
-                                                    let mut size_hints = WmSizeHints::new();
-                                                    size_hints.position = Some((
-                                                        WmSizeHintsSpecification::ProgramSpecified,
-                                                        target_x as i32,
-                                                        frame_y as i32,
-                                                    ));
-                                                    let data = size_hints.serialize();
-                                                    let _ = conn.change_property(
-                                                        PropMode::REPLACE,
-                                                        xcb_wh.window.into(),
-                                                        nh,
-                                                        sh,
-                                                        32,
-                                                        (data.len() / 4) as u32,
-                                                        &data,
-                                                    );
-                                                    tracing::info!(
-                                                        "[Pin] WM_NORMAL_HINTS set PPosition ({:.0},{:.0})",
-                                                        target_x, frame_y
-                                                    );
-                                                }
-
-                                                // 设置 _MOTIF_WM_HINTS 移除服务端窗口装饰（兜底）
-                                                let mh_result =
-                                                    conn.intern_atom(
-                                                        false,
-                                                        b"_MOTIF_WM_HINTS",
-                                                    );
-                                                if let Ok(mh_cookie) = mh_result {
-                                                    if let Ok(mh_reply) =
-                                                        mh_cookie.reply()
-                                                    {
-                                                        let hints: [u32; 5] =
-                                                            [2, 0, 0, 0, 0];
-                                                        let hint_bytes: [u8; 20] =
-                                                            unsafe {
-                                                                std::mem::transmute(
-                                                                    hints,
-                                                                )
-                                                            };
-                                                        let _ = conn.change_property(
-                                                            PropMode::REPLACE,
-                                                            xcb_wh.window.into(),
-                                                            mh_reply.atom,
-                                                            mh_reply.atom,
-                                                            32,
-                                                            5,
-                                                            &hint_bytes,
-                                                        );
-                                                        tracing::info!(
-                                                            "[Pin] _MOTIF_WM_HINTS no-decorations"
-                                                        );
-                                                    }
-                                                }
-
-                                                // 读取 _NET_FRAME_EXTENTS 获取 WM 附加的边框高度，
-                                                // 用于修正窗口位置（客户端装饰下应为 0，但部分
-                                                // WM 可能仍添加阴影/边框导致内容偏移）
-                                                let mut frame_extent_top: u32 = 0;
-                                                let net_fe_result = conn
-                                                    .intern_atom(false, b"_NET_FRAME_EXTENTS");
-                                                if let Ok(net_fe_cookie) = net_fe_result {
-                                                    if let Ok(net_fe_reply) = net_fe_cookie.reply() {
-                                                        if let Ok(reply) = conn.get_property(
-                                                            false,
-                                                            xcb_wh.window.into(),
-                                                            net_fe_reply.atom,
-                                                            AtomEnum::CARDINAL,
-                                                            0,
-                                                            4,
-                                                        ) {
-                                                            if let Ok(reply) = reply.reply() {
-                                                                if reply.value.len() >= 16 {
-                                                                    let left = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap_or_default());
-                                                                    let right = u32::from_ne_bytes(reply.value[4..8].try_into().unwrap_or_default());
-                                                                    frame_extent_top = u32::from_ne_bytes(reply.value[8..12].try_into().unwrap_or_default());
-                                                                    let bottom = u32::from_ne_bytes(reply.value[12..16].try_into().unwrap_or_default());
-                                                                    tracing::info!(
-                                                                        "[Pin] frame_extents: left={} right={} top={} bottom={}",
-                                                                        left, right, frame_extent_top, bottom
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                let adjusted_y = frame_y as i32 - frame_extent_top as i32;
-                                                let values = ConfigureWindowAux::new()
-                                                    .x(target_x as i32)
-                                                    .y(adjusted_y);
-                                                if let Err(e) =
-                                                    conn.configure_window(xcb_wh.window.into(), &values)
-                                                {
-                                                    tracing::warn!(
-                                                        "[Pin] configure_window failed: {:?}",
-                                                        e
-                                                    );
-                                                }
-                                                let _ = conn.flush();
-                                                tracing::info!(
-                                                    "[Pin] X11 moved window to ({:.0},{:.0}) frame_extent_top={}",
-                                                    target_x, adjusted_y, frame_extent_top
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "[Pin] XCB connection failed: {:?}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let view = cx.new(|cx| PinWindowView::new(&pin_frame, cx));
-                        let handle = view.read(cx).focus_handle.clone();
-                        handle.focus(window, cx);
-                        view
-                    },
-                )
-                .expect("open pin window failed");
-
-                cx.on_window_closed(|cx, _| {
-                    if cx.windows().is_empty() {
-                        cx.quit();
-                    }
-                })
-                .detach();
-            });
-    });
+/// 主线程 → GPUI 线程的命令
+enum OverlayCommand {
+    /// 打开截图覆盖窗口；`reply` 由 OverlayView::commit 发回结果
+    Capture {
+        frame: CapturedFrame,
+        screen_bounds: ub::Bounds,
+        reply: Sender<OverlayResult>,
+    },
+    /// 在同一个 GPUI 应用里打开 Pin 窗口
+    OpenPin(PinPayload),
 }
 
-/// 在新线程里跑 GPUI 覆盖窗口，阻塞到用户完成/取消。
+/// 进程级唯一的 GPUI 服务：持有命令 Sender，首次使用时才拉起 GPUI 线程。
 ///
-/// 返回值：完整会话结果（选区 + 可见的 DrawCommand 列表）；取消时 selection=None。
-pub fn run_blocking(frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayResult {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // 注册 gpui-component-assets 提供默认 Lucide 图标 svg 资源。
-        // 不调用时 IconName::XXX 渲染会找不到 svg、按钮看不出图标。
-        application()
-            .with_assets(gpui_component_assets::Assets)
-            .run(move |cx: &mut App| {
+/// 常驻单应用（`QuitMode::Explicit`）是修复「Windows 截图后进程被
+/// gpui_windows 的 `ExitProcess(0)` 杀掉」的关键：截图/固定都在同一个
+/// `application().run()` 内创建/销毁窗口，事件循环永不退出。
+pub struct OverlayService {
+    cmd: Sender<OverlayCommand>,
+}
+
+impl OverlayService {
+    pub fn new() -> Self {
+        Self {
+            cmd: ensure_started(),
+        }
+    }
+
+    /// 打开覆盖窗口并阻塞到用户完成/取消。取消时 selection=None。
+    pub fn open_overlay(&self, frame: CapturedFrame, screen_bounds: ub::Bounds) -> OverlayResult {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let _ = self.cmd.send(OverlayCommand::Capture {
+            frame,
+            screen_bounds,
+            reply: reply_tx,
+        });
+        // 主线程阻塞等结果；OverlayView 被销毁（关闭窗口）时 reply Sender drop
+        // → recv 返回 Err → 视为取消。
+        let result = reply_rx.recv().unwrap_or(OverlayResult {
+            selection: None,
+            commands: vec![],
+            no_clipboard: false,
+            pin: None,
+        });
+
+        result
+    }
+
+    /// 在同一个 GPUI 应用里打开 Pin 窗口（fire-and-forget）。
+    pub fn open_pin(&self, payload: PinPayload) {
+        let _ = self.cmd.send(OverlayCommand::OpenPin(payload));
+    }
+}
+
+/// 拉起唯一的 GPUI 线程并返回命令通道（OnceLock 保证全局只启动一次）。
+fn ensure_started() -> Sender<OverlayCommand> {
+    static SERVICE: OnceLock<Sender<OverlayCommand>> = OnceLock::new();
+    SERVICE
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("gpui-overlay".to_string())
+                .spawn(move || run_overlay_app(rx))
+                .expect("failed to spawn gpui overlay thread");
+            tx
+        })
+        .clone()
+}
+
+/// 常驻 GPUI 应用线程：跑一个 `QuitMode::Explicit` 的应用，命令循环在
+/// 应用内打开/关闭窗口，事件循环永不退出（除非进程退出）。
+fn run_overlay_app(rx: Receiver<OverlayCommand>) {
+    // 注册 gpui-component-assets 提供默认 Lucide 图标 svg 资源。
+    // 不调用时 IconName::XXX 渲染会找不到 svg、按钮看不出图标。
+    application()
+        .with_assets(gpui_component_assets::Assets)
+        // QuitMode::Explicit：窗口关闭不自动退出；只有显式 cx.quit() 才结束
+        // 事件循环。这是避免 gpui_windows::WindowsPlatform::run 末尾
+        // ExitProcess(0) 杀进程的关键。
+        .with_quit_mode(QuitMode::Explicit)
+        .run(move |cx: &mut App| {
             // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
             gpui_component::init(cx);
 
-            // screen_bounds 来自 CapturedFrame 的物理像素尺寸，但 GPUI 所有
-            // 坐标（鼠标事件、paint 定位）都使用逻辑像素。这里用主屏 bounds
-            // 与帧尺寸的比率作为 scale_factor，把 screen_bounds 转为逻辑像素，
-            // 来保证 clamp_inside 等边界检查生效。
-            let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
-                origin: point(px(0.), px(0.)),
-                size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
-            });
-
-            cx.open_window(
-                WindowOptions {
-                    // PopUp 窗口在 X11 上可能绕过 WM 的 strut 约束，
-                    // 覆盖到系统面板区域，确保 dim 遮罩对齐屏幕顶部。
-                    window_bounds: Some(WindowBounds::Windowed(win_bounds)),
-                    window_background: WindowBackgroundAppearance::Transparent,
-                    titlebar: None,
-                    kind: WindowKind::PopUp,
-                    is_movable: false,
-                    is_resizable: false,
-                    focus: true,
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    // 根据窗口实际屏幕位置裁剪截图帧，确保截图与桌面完美对齐。
-                    // WM 可能把窗口放在工作区内（不含系统面板），不裁剪会导致
-                    // 截图内容与真实桌面错位，产生"重影"。
-                    let actual = window.bounds();
-                    let phys_w = screen_bounds.size.x;
-                    let phys_h = screen_bounds.size.y;
-                    let actual_w = f32::from(actual.size.width).max(1.0);
-                    let actual_h = f32::from(actual.size.height).max(1.0);
-                    let sx = phys_w / actual_w;
-                    let sy = phys_h / actual_h;
-                    let src_x = (f32::from(actual.origin.x) * sx) as u32;
-                    let src_y = (f32::from(actual.origin.y) * sy) as u32;
-                    let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
-                    let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
-                    let clipped = frame.clip_region(src_x, src_y, clip_w, clip_h)
-                        .unwrap_or(frame);
-
-                    let scale = clipped.width as f32 / actual_w;
-                    let logical_bounds = ub::Bounds::new(
-                        ub::Point::ZERO,
-                        ub::Point::new(actual_w, actual_h),
-                    );
-
-                    let view = cx.new(|cx| OverlayView::new(&clipped, logical_bounds, scale, tx, cx));
-                    // 主动把焦点给到 view 自己的 focus_handle，
-                    // 这样 track_focus 的 div 能收到键盘事件
-                    let handle = view.read(cx).focus_handle.clone();
-                    handle.focus(window, cx);
-                    // PopUp 窗口（override_redirect）在 X11 上绕过 WM 焦点管理，
-                    // 必须手动 activate 才能收到键盘事件。
-                    window.activate_window();
-                    // 必须用 gpui_component::Root 包一层：
-                    // gpui-component 的 Input 在 blur 时会调
-                    // `Root::update(window, cx, ...)` 去清 `focused_input`，
-                    // 找不到 Root 会 panic "BUG: window first layer should be
-                    // a gpui_component::Root." → 整个 GPUI 线程 panic →
-                    // 覆盖窗口闪退（用户报告的"切图框消失"）。
-                    // toolbar / Button 不需要 Root（它们不调 Root::update），
-                    // 但 Input 需要，所以开了 Text 工具 + 点击输入框后任何
-                    // blur 路径（按 Enter、点外面）都会触发 panic。
-                    // bordered(false): 全屏覆盖窗口不需要 Linux CSD 窗口阴影。
-                    // 默认 bordered(true) 会在元素层四周加 12px shadow padding，
-                    // 导致元素层坐标和 canvas paint 的窗口坐标系之间产生偏移。
-                    cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
-                },
-            )
-            .expect("open_window 失败");
-
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
+            cx.spawn(async move |async_cx: &mut AsyncApp| {
+                loop {
+                    match rx.try_recv() {
+                        Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
+                            let _ = async_cx.update(|cx| {
+                                open_overlay_in_app(frame, screen_bounds, reply, cx)
+                            });
+                        }
+                        Ok(OverlayCommand::OpenPin(payload)) => {
+                            let _ = async_cx.update(|cx| open_pin_in_app(payload, cx));
+                        }
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                    async_cx
+                        .background_executor()
+                        .timer(std::time::Duration::from_millis(20))
+                        .await;
                 }
             })
             .detach();
         });
+}
+
+/// 在常驻应用里打开截图覆盖窗口（原 `run_blocking` 的窗口构建逻辑）。
+fn open_overlay_in_app(
+    frame: CapturedFrame,
+    screen_bounds: ub::Bounds,
+    tx: Sender<OverlayResult>,
+    cx: &mut App,
+) {
+    // screen_bounds 来自 CapturedFrame 的物理像素尺寸，但 GPUI 所有
+    // 坐标（鼠标事件、paint 定位）都使用逻辑像素。这里用主屏 bounds
+    // 与帧尺寸的比率作为 scale_factor，把 screen_bounds 转为逻辑像素，
+    // 来保证 clamp_inside 等边界检查生效。
+    let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
+        origin: point(px(0.), px(0.)),
+        size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
     });
-    // 主线程阻塞等结果；GPUI 线程退出时 Sender 被 drop，本端 recv 返回 Err → 视为取消
-    rx.recv().unwrap_or(OverlayResult {
-        selection: None,
-        commands: vec![],
-        no_clipboard: false,
-    })
+    // 覆盖窗口的客户端区原点 = 请求的 win_bounds 原点（GPUI 把客户端区放到
+    // 请求 bounds 处）。选区/画布坐标是客户端区坐标，屏幕位置 = client_origin + sel。
+    // 不能用 window.bounds().origin（那是窗口外框位置，含 DWM 隐形边框，会差几 px）。
+    let client_origin =
+        ub::Point::new(f32::from(win_bounds.origin.x), f32::from(win_bounds.origin.y));
+
+    cx.open_window(
+        WindowOptions {
+            // PopUp 窗口在 X11 上可能绕过 WM 的 strut 约束，
+            // 覆盖到系统面板区域，确保 dim 遮罩对齐屏幕顶部。
+            window_bounds: Some(WindowBounds::Windowed(win_bounds)),
+            window_background: WindowBackgroundAppearance::Transparent,
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            focus: true,
+            ..Default::default()
+        },
+        move |window, cx| {
+            // 动态校正：把客户端顶移到显示区原点（GPUI 边框不对称可能放高几 px），
+            // 遮罩（帧）与桌面对齐。跨平台无需硬编码系统栏高度。
+            #[cfg(target_os = "windows")]
+            adjust_window_client_top(window, client_origin.y as i32);
+
+            // 根据窗口实际屏幕位置裁剪截图帧，确保截图与桌面完美对齐。
+            // WM 可能把窗口放在工作区内（不含系统面板），不裁剪会导致
+            // 截图内容与真实桌面错位，产生"重影"。
+            let actual = window.bounds();
+            let phys_w = screen_bounds.size.x;
+            let phys_h = screen_bounds.size.y;
+            let actual_w = f32::from(actual.size.width).max(1.0);
+            let actual_h = f32::from(actual.size.height).max(1.0);
+            let sx = phys_w / actual_w;
+            let sy = phys_h / actual_h;
+            let src_x = (f32::from(actual.origin.x) * sx) as u32;
+            let src_y = (f32::from(actual.origin.y) * sy) as u32;
+            let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
+            let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
+            let clipped = frame.clip_region(src_x, src_y, clip_w, clip_h).unwrap_or(frame);
+
+            let scale = clipped.width as f32 / actual_w;
+            let logical_bounds =
+                ub::Bounds::new(ub::Point::ZERO, ub::Point::new(actual_w, actual_h));
+
+            let view = cx.new(|cx| {
+                OverlayView::new(&clipped, logical_bounds, client_origin, scale, tx, cx)
+            });
+            // 主动把焦点给到 view 自己的 focus_handle，
+            // 这样 track_focus 的 div 能收到键盘事件
+            let handle = view.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+            // PopUp 窗口（override_redirect）在 X11 上绕过 WM 焦点管理，
+            // 必须手动 activate 才能收到键盘事件。
+            window.activate_window();
+            // 必须用 gpui_component::Root 包一层：
+            // gpui-component 的 Input 在 blur 时会调
+            // `Root::update(window, cx, ...)` 去清 `focused_input`，
+            // 找不到 Root 会 panic "BUG: window first layer should be
+            // a gpui_component::Root." → 整个 GPUI 线程 panic →
+            // 覆盖窗口闪退（用户报告的"切图框消失"）。
+            // toolbar / Button 不需要 Root（它们不调 Root::update），
+            // 但 Input 需要，所以开了 Text 工具 + 点击输入框后任何
+            // blur 路径（按 Enter、点外面）都会触发 panic。
+            // bordered(false): 全屏覆盖窗口不需要 Linux CSD 窗口阴影。
+            // 默认 bordered(true) 会在元素层四周加 12px shadow padding，
+            // 导致元素层坐标和 canvas paint 的窗口坐标系之间产生偏移。
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+        },
+    )
+    .expect("open_window 失败");
+}
+
+/// 在常驻应用里打开 Pin 窗口（原 `spawn_pin_window` 的窗口构建逻辑）。
+///
+/// 不再新建 `application().run()`——Pin 窗口与覆盖窗口共用一个常驻应用，
+/// 避免 Windows 上第二个并发 GPUI app 与 `ExitProcess(0)` 冲突。
+fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
+    let PinPayload { frame: pin_frame, origin_x, origin_y, sx, sy } = payload;
+
+    // pin_frame 尺寸是物理像素，转为逻辑像素用于窗口尺寸
+    let img_w = pin_frame.width as f32 / sx;
+    let img_h = pin_frame.height as f32 / sy;
+    let max_w = 1200.0_f32;
+    let max_h = 900.0_f32;
+    const MIN_IMG_W: f32 = 150.0;
+    let scale = (max_w / img_w)
+        .min(max_h / img_h)
+        .min(1.0)
+        .max(MIN_IMG_W / img_w);
+    // 自定义标题栏高度（原生标题栏已移除，由 PinWindowView render 绘制）
+    const CUSTOM_TITLEBAR_H: f32 = 32.0;
+    let win_w = px(img_w * scale);
+    let win_h = px(img_h * scale + CUSTOM_TITLEBAR_H);
+    // 使用 Normal 窗口：支持 start_window_move / 键盘事件等 WM 交互
+    tracing::info!(
+        "[Pin] open window: origin=({:.0},{:.0}) img_logical={:.1}x{:.1} img_physical={}x{} win_size={:.1}x{:.1} scale={:.2}",
+        origin_x, origin_y,
+        img_w, img_h,
+        pin_frame.width, pin_frame.height,
+        win_w, win_h, scale
+    );
+
+    let target_x = origin_x;
+    // 窗口上移标题栏高度，使图片内容与原始选区位置对齐。
+    // 图片实际渲染在 client y = 边框1px + 标题栏32px = 33 处。
+    // Windows 上 GPUI 的 calculate_window_rect 假设边框对称（height_offset/2=4），
+    // 但这类窗口实际顶部边框为 0，导致客户端被放高 4px（ClientToScreen 实测）。
+    // 因此 Windows 需要补偿：target_y = origin_y - 33 + 4 = origin_y - 29。
+    // 图像实际渲染在 client y=33（边框1px + 标题栏32px）。窗口先按
+    // target_y = origin_y - 32 请求，创建后由 `adjust_window_client_top`
+    // 动态校正客户端位置（见下），跨平台无需硬编码偏移量。
+    let target_y = origin_y - CUSTOM_TITLEBAR_H;
+
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(target_x), px(target_y)),
+                size: Size::new(win_w, win_h),
+            })),
+            titlebar: None,
+            window_background: WindowBackgroundAppearance::Transparent,
+            kind: WindowKind::Normal,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: true,
+            window_decorations: Some(WindowDecorations::Client),
+            focus: true,
+            ..Default::default()
+        },
+        move |window, cx| {
+            // 动态校正：图像在 client y=33，把客户端顶移到 origin_y - 33，
+            // 使图像与选区对齐。跨平台无需硬编码系统栏高度/边框偏移。
+            #[cfg(target_os = "windows")]
+            adjust_window_client_top(window, (origin_y - 33.0) as i32);
+
+            let actual = window.bounds();
+            tracing::info!(
+                "[Pin] actual window after open: origin=({:.0},{:.0}) size=({:.0},{:.0})",
+                actual.origin.x, actual.origin.y, actual.size.width, actual.size.height
+            );
+
+            #[cfg(target_os = "linux")]
+            {
+                use x11rb::connection::Connection;
+                use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
+                use x11rb::protocol::xproto::{AtomEnum, ConfigureWindowAux, ConnectionExt, PropMode};
+                use x11rb::x11_utils::Serialize;
+                use x11rb::xcb_ffi::XCBConnection;
+
+                if let (Ok(wh), Ok(dh)) =
+                    (window.window_handle(), window.display_handle())
+                {
+                    if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+                        (wh.as_raw(), dh.as_raw())
+                    {
+                        if let Some(conn_ptr) = xcb_dh.connection {
+                            let conn_result = unsafe {
+                                XCBConnection::from_raw_xcb_connection(
+                                    conn_ptr.as_ptr().cast(),
+                                    false,
+                                )
+                            };
+                            match conn_result {
+                                Ok(conn) => {
+                                    // 设置 WM_NORMAL_HINTS 的 PPosition 标志，
+                                    // 告知窗口管理器此窗口位置由程序显式指定
+                                    let nh_atom = conn
+                                        .intern_atom(false, b"WM_NORMAL_HINTS")
+                                        .ok()
+                                        .and_then(|c| c.reply().ok())
+                                        .map(|r| r.atom);
+                                    let sh_atom = conn
+                                        .intern_atom(false, b"WM_SIZE_HINTS")
+                                        .ok()
+                                        .and_then(|c| c.reply().ok())
+                                        .map(|r| r.atom);
+                                    if let (Some(nh), Some(sh)) = (nh_atom, sh_atom) {
+                                        let mut size_hints = WmSizeHints::new();
+                                        size_hints.position = Some((
+                                            WmSizeHintsSpecification::ProgramSpecified,
+                                            target_x as i32,
+                                            target_y as i32,
+                                        ));
+                                        let data = size_hints.serialize();
+                                        let _ = conn.change_property(
+                                            PropMode::REPLACE,
+                                            xcb_wh.window.into(),
+                                            nh,
+                                            sh,
+                                            32,
+                                            (data.len() / 4) as u32,
+                                            &data,
+                                        );
+                                        tracing::info!(
+                                            "[Pin] WM_NORMAL_HINTS set PPosition ({:.0},{:.0})",
+                                            target_x, target_y
+                                        );
+                                    }
+
+                                    // 设置 _MOTIF_WM_HINTS 移除服务端窗口装饰（兜底）
+                                    let mh_result =
+                                        conn.intern_atom(
+                                            false,
+                                            b"_MOTIF_WM_HINTS",
+                                        );
+                                    if let Ok(mh_cookie) = mh_result {
+                                        if let Ok(mh_reply) =
+                                            mh_cookie.reply()
+                                        {
+                                            let hints: [u32; 5] =
+                                                [2, 0, 0, 0, 0];
+                                            let hint_bytes: [u8; 20] =
+                                                unsafe {
+                                                    std::mem::transmute(
+                                                        hints,
+                                                    )
+                                                };
+                                            let _ = conn.change_property(
+                                                PropMode::REPLACE,
+                                                xcb_wh.window.into(),
+                                                mh_reply.atom,
+                                                mh_reply.atom,
+                                                32,
+                                                5,
+                                                &hint_bytes,
+                                            );
+                                            tracing::info!(
+                                                "[Pin] _MOTIF_WM_HINTS no-decorations"
+                                            );
+                                        }
+                                    }
+
+                                    // 读取 _NET_FRAME_EXTENTS 获取 WM 附加的边框高度，
+                                    // 用于修正窗口位置（客户端装饰下应为 0，但部分
+                                    // WM 可能仍添加阴影/边框导致内容偏移）
+                                    let mut frame_extent_top: u32 = 0;
+                                    let net_fe_result = conn
+                                        .intern_atom(false, b"_NET_FRAME_EXTENTS");
+                                    if let Ok(net_fe_cookie) = net_fe_result {
+                                        if let Ok(net_fe_reply) = net_fe_cookie.reply() {
+                                            if let Ok(reply) = conn.get_property(
+                                                false,
+                                                xcb_wh.window.into(),
+                                                net_fe_reply.atom,
+                                                AtomEnum::CARDINAL,
+                                                0,
+                                                4,
+                                            ) {
+                                                if let Ok(reply) = reply.reply() {
+                                                    if reply.value.len() >= 16 {
+                                                        let left = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap_or_default());
+                                                        let right = u32::from_ne_bytes(reply.value[4..8].try_into().unwrap_or_default());
+                                                        frame_extent_top = u32::from_ne_bytes(reply.value[8..12].try_into().unwrap_or_default());
+                                                        let bottom = u32::from_ne_bytes(reply.value[12..16].try_into().unwrap_or_default());
+                                                        tracing::info!(
+                                                            "[Pin] frame_extents: left={} right={} top={} bottom={}",
+                                                            left, right, frame_extent_top, bottom
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let adjusted_y = target_y as i32 - frame_extent_top as i32;
+                                    let values = ConfigureWindowAux::new()
+                                        .x(target_x as i32)
+                                        .y(adjusted_y);
+                                    if let Err(e) =
+                                        conn.configure_window(xcb_wh.window.into(), &values)
+                                    {
+                                        tracing::warn!(
+                                            "[Pin] configure_window failed: {:?}",
+                                            e
+                                        );
+                                    }
+                                    let _ = conn.flush();
+                                    tracing::info!(
+                                        "[Pin] X11 moved window to ({:.0},{:.0}) frame_extent_top={}",
+                                        target_x, adjusted_y, frame_extent_top
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[Pin] XCB connection failed: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let view = cx.new(|cx| PinWindowView::new(&pin_frame, cx));
+            let handle = view.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+            view
+        },
+    )
+    .expect("open pin window failed");
+}
+
+/// 把窗口客户端区的屏幕 Y 校正到 `desired_client_top`（Windows）。
+///
+/// GPUI 的 `calculate_window_rect` 假设边框对称（height_offset/2 平分上下），
+/// 但实际窗口顶部边框可能为 0（全部在底部），导致客户端被放高几像素。
+/// 这里在窗口创建后用 `ClientToScreen` 实测客户端原点，再用 `SetWindowPos`
+/// 校正——任何平台/DPI 都自动正确，无需硬编码系统栏高度。
+#[cfg(target_os = "windows")]
+fn adjust_window_client_top(window: &mut Window, desired_client_top: i32) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Win32(win) = handle.as_raw() {
+            let hwnd = win.hwnd.get() as *mut core::ffi::c_void;
+            unsafe {
+                let mut pt: POINT = std::mem::zeroed();
+                ClientToScreen(hwnd, &mut pt);
+                let dy = desired_client_top - pt.y;
+                if dy != 0 {
+                    let mut wr: RECT = std::mem::zeroed();
+                    GetWindowRect(hwnd, &mut wr);
+                    tracing::debug!(
+                        "[adjust] client_top actual={} desired={} dy={}",
+                        pt.y, desired_client_top, dy
+                    );
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        wr.left,
+                        wr.top + dy,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+    }
 }
