@@ -12,6 +12,12 @@ use cosmic_text::{FontSystem, SwashCache};
 
 use crate::overlay::drawing::FontWeight;
 
+/// 文字标注使用的字体族名（两个 OTF 的实际 family，fc-scan 显示 "Noto Sans CJK SC"）。
+///
+/// 预览（GPUI text system）与提交栅格化（cosmic-text）必须用同一个族名，
+/// 才能让 `weight == Bold` 精确命中 Bold face，而不是靠全字体按字重降序兜底。
+pub const TEXT_FONT_FAMILY: &str = "Noto Sans CJK SC";
+
 /// 跨线程共享的 OTF 字节缓存（lazy + 全局唯一）
 static REGULAR_BYTES: once_cell::sync::Lazy<Vec<u8>> =
     once_cell::sync::Lazy::new(|| FontWeight::Normal.font_bytes().to_vec());

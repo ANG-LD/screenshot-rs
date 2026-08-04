@@ -12,13 +12,12 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Rems, Render, RenderImage, Size,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Render, RenderImage, Size,
     Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions,
     canvas,
     div, point,
     prelude::*, px, quad, rgba,
 };
-use gpui_component::ActiveTheme;
 use gpui_component::button::Button;
 use gpui_component::button::ButtonVariants;
 use gpui_component::Disableable;
@@ -535,10 +534,13 @@ impl OverlayView {
         self.text_input_anchor = p;
         // 初始输入框大小（logical pixels），auto_grow(3,8) 会根据内容自动扩展。
         // 新输入从紧凑大小起步，重新编辑时沿用旧宽度。
+        // 高度随字号缩放（行盒=1.5×字号 + 顶部拖拽条），保证大字号能完整显示。
         // 裁剪到选区范围内，防止靠近边缘时文字框/手柄超出截图区域。
         let limits = self.selection.current().unwrap_or(self.screen_bounds);
         let w = max_w_override.unwrap_or(100.0);
-        self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + w, p.y + 48.0))
+        let logical_fs = self.toolbar.current_size / self.scale_factor;
+        let init_h = (logical_fs * 1.5 + 6.0).max(48.0);
+        self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + w, p.y + init_h))
             .clamp_inside(limits);
         tracing::debug!("open_text_input: anchor=({:.1}, {:.1}) initial={}", p.x, p.y, initial.is_some());
 
@@ -858,13 +860,23 @@ fn compute_toolbar_bounds(
 }
 
 /// 工具栏按钮中的图标+文字，紧凑间距
-fn icon_label(btn: ToolButton) -> impl IntoElement {
+///
+/// gpui-component 的 Custom 按钮变体忽略 `foreground` 字段（渲染时 text_color
+/// 取的是 `colors.color`，即背景色），文字会继承到近透明的白色而看不清。
+/// 这里显式把图标/文字设为白色，禁用按钮用半透明白区分状态。
+fn icon_label(btn: ToolButton, disabled: bool) -> impl IntoElement {
+    let color = if disabled {
+        gpui::rgba(0xFFFFFF66)
+    } else {
+        gpui::rgba(0xFFFFFFFF)
+    };
     div()
         .flex()
         .items_center()
         .gap(px(2.0))
-        .child(Icon::new(icon_for(btn)).size(px(12.0)))
-        .child(div().text_xs().child(btn.label()))
+        .text_color(color)
+        .child(Icon::new(icon_for(btn)).size(px(12.0)).text_color(color))
+        .child(div().text_xs().text_color(color).child(btn.label()))
 }
 
 /// 工具栏按钮配色
@@ -932,7 +944,7 @@ fn render_tool_button_with_popover(
         .compact()
         .custom(trigger_style)
         .selected(is_active)
-        .child(icon_label(btn))
+        .child(icon_label(btn, false))
         .on_click(move |_, _, cx| {
             let _ = weak_for_trigger.update(cx, |this, cx| {
                 if this.toolbar.active_tool == Some(btn) {
@@ -1014,7 +1026,7 @@ fn render_simple_button(
         .compact()
         .custom(style)
         .disabled(disabled)
-        .child(icon_label(btn))
+        .child(icon_label(btn, disabled))
         .on_click(move |_, window, cx| {
             let _ = weak_for_click.update(cx, |this, cx| {
                 this.toolbar.popup = None;
@@ -1797,8 +1809,127 @@ fn paint_ellipse_outline(x: f32, y: f32, w: f32, h: f32, lw: f32, color: RGBA, w
     }
 }
 
+/// 把矩形/椭圆/箭头/画图这 4 类形状用解析式抗锯齿光栅化到离屏缓冲，再整幅贴到 canvas。
+///
+/// 原 preview 用 `paint_thick_line` 叠很多小圆角 quad，每个 quad 的 bounds 会被
+/// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感。这里复用
+/// commit 路径的 `commands::apply_commands` 逐像素解析式 AA（smoothstep 覆盖率），
+/// 得到与最终成图一致的平滑线条。Text（元素层渲染）与 Mosaic（棋盘模拟）不经过这里。
+fn paint_drawing_layer(
+    visible_cmds: &[DrawCommand],
+    in_progress: Option<&DrawCommand>,
+    scale_factor: f32,
+    window: &mut Window,
+) {
+    let is_shape = |c: &DrawCommand| {
+        matches!(
+            c,
+            DrawCommand::Rectangle { .. }
+                | DrawCommand::Ellipse { .. }
+                | DrawCommand::Arrow { .. }
+                | DrawCommand::Freehand { .. }
+        )
+    };
+    let mut shapes: Vec<&DrawCommand> = visible_cmds.iter().filter(|c| is_shape(c)).collect();
+    if let Some(ip) = in_progress {
+        if is_shape(ip) {
+            shapes.push(ip);
+        }
+    }
+    if shapes.is_empty() {
+        return;
+    }
+
+    // 联合包围盒（逻辑像素）+ 最大线宽，外扩 padding 覆盖描边/箭头外扩
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut max_lw = 0.0_f32;
+    for cmd in &shapes {
+        match cmd {
+            DrawCommand::Rectangle { rect, line_width, .. }
+            | DrawCommand::Ellipse { rect, line_width, .. } => {
+                let (a, b) = rect;
+                min_x = min_x.min(a.x.min(b.x));
+                min_y = min_y.min(a.y.min(b.y));
+                max_x = max_x.max(a.x.max(b.x));
+                max_y = max_y.max(a.y.max(b.y));
+                max_lw = max_lw.max(*line_width);
+            }
+            DrawCommand::Arrow { from, to, line_width, .. } => {
+                min_x = min_x.min(from.x.min(to.x));
+                min_y = min_y.min(from.y.min(to.y));
+                max_x = max_x.max(from.x.max(to.x));
+                max_y = max_y.max(from.y.max(to.y));
+                max_lw = max_lw.max(*line_width);
+            }
+            DrawCommand::Freehand { points, line_width, .. } => {
+                for p in points {
+                    min_x = min_x.min(p.x);
+                    min_y = min_y.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
+                }
+                max_lw = max_lw.max(*line_width);
+            }
+            _ => {}
+        }
+    }
+
+    // line_width 是物理像素，转逻辑 px 外扩，再给 AA 留 1px
+    let pad = max_lw / scale_factor / 2.0 + 1.0;
+    min_x -= pad;
+    min_y -= pad;
+    max_x += pad;
+    max_y += pad;
+
+    let win = window.bounds();
+    let win_w = f32::from(win.size.width);
+    let win_h = f32::from(win.size.height);
+    let origin_x = min_x.floor().clamp(0.0, win_w);
+    let origin_y = min_y.floor().clamp(0.0, win_h);
+    let size_w = (max_x - origin_x).ceil().max(1.0).min((win_w - origin_x).max(1.0));
+    let size_h = (max_y - origin_y).ceil().max(1.0).min((win_h - origin_y).max(1.0));
+
+    let phys_w = (size_w * scale_factor).round() as u32;
+    let phys_h = (size_h * scale_factor).round() as u32;
+    if phys_w == 0 || phys_h == 0 {
+        return;
+    }
+    let phys_origin_x = origin_x * scale_factor;
+    let phys_origin_y = origin_y * scale_factor;
+
+    // 透明离屏缓冲：形状坐标转物理像素后走与 commit 相同的解析式 AA
+    let mut frame = CapturedFrame {
+        width: phys_w,
+        height: phys_h,
+        pixels: vec![0; (phys_w * phys_h * 4) as usize],
+    };
+    let scaled: Vec<DrawCommand> = shapes
+        .into_iter()
+        .map(|c| scale_draw_command(c.clone(), scale_factor, scale_factor))
+        .collect();
+    let _ = crate::overlay::commands::apply_commands(
+        &mut frame,
+        phys_origin_x,
+        phys_origin_y,
+        &scaled,
+    );
+
+    let img = build_render_image(&frame);
+    let _ = window.paint_image(
+        Bounds {
+            origin: gpui::point(gpui::px(origin_x), gpui::px(origin_y)),
+            size: Size::new(gpui::px(size_w), gpui::px(size_h)),
+        },
+        Default::default(),
+        img,
+        0,
+        false,
+    );
+}
+
 /// 把一个 DrawCommand 渲染到 window 上（Phase 3 preview，Phase 4 也会复用）
-fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_factor: f32, font_family: &gpui::SharedString) {
+fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_factor: f32) {
     match cmd {
         DrawCommand::Rectangle { rect, color, line_width } => {
             let a = rect.0;
@@ -1850,12 +1981,15 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
         }
         DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let fs = *font_size / scale_factor;
-                let line_height = Rems(1.25).to_pixels(window.rem_size());
+                // 行盒必须随字号缩放：GPUI paint_line 会把文字裁剪到 line_height 高的
+                // 图层里，若行盒 < 字体的 ascent+descent（CJK 约 1.45em），大字号第一行
+                // 顶部会被截断。1.5 倍能容纳 Noto Sans CJK SC 的完整字形。
+                let line_height = px(fs * 1.5);
                 let origin_x = window.pixel_snap(px(anchor.x + TO_X));
                 let mut origin_y = window.pixel_snap(px(anchor.y + TO_Y));
 
                 let mut base_run = window.text_style().to_run(0);
-                base_run.font.family = font_family.clone();
+                base_run.font.family = gpui::SharedString::from(crate::overlay::font::TEXT_FONT_FAMILY);
                 base_run.color = Hsla::from(rgba(rgba_u32(*color)));
                 if *weight == FontWeight::Bold {
                     base_run.font.weight = gpui::FontWeight::BOLD;
@@ -2180,7 +2314,6 @@ impl Render for OverlayView {
             }
         });
         let scale_factor = self.scale_factor;
-        let font_family = cx.theme().font_family.clone();
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
         let skip_canvas_idx: Option<usize> = if self.text_input_finalized {
             self.text_input_cmd_idx
@@ -2193,8 +2326,8 @@ impl Render for OverlayView {
         let dim_opacity = self.dim_opacity;
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
-            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, font_family, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
+            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
@@ -2284,15 +2417,32 @@ impl Render for OverlayView {
 
                     // 2.5) 可见的 DrawCommand + 当前 in_progress（在 dim 之上、border 之下）
                     // 跳过已提交但由元素层展示的 Text 命令，避免文字重复
+                    // 矩形/椭圆/箭头/画图 → paint_drawing_layer 离屏解析式 AA；
+                    // Text（GPUI 文字）/ Mosaic（棋盘模拟）仍走 paint_command。
+                    let is_buffer_shape = |c: &DrawCommand| {
+                        matches!(
+                            c,
+                            DrawCommand::Rectangle { .. }
+                                | DrawCommand::Ellipse { .. }
+                                | DrawCommand::Arrow { .. }
+                                | DrawCommand::Freehand { .. }
+                        )
+                    };
                     for (i, cmd) in visible_cmds.iter().enumerate() {
                         if skip_canvas_idx == Some(i) {
                             continue;
                         }
-                        paint_command(cmd, window, cx, scale_factor, &font_family);
+                        if is_buffer_shape(cmd) {
+                            continue;
+                        }
+                        paint_command(cmd, window, cx, scale_factor);
                     }
                     if let Some(ref ip) = in_progress {
-                        paint_command(ip, window, cx, scale_factor, &font_family);
+                        if !is_buffer_shape(ip) {
+                            paint_command(ip, window, cx, scale_factor);
+                        }
                     }
+                    paint_drawing_layer(&visible_cmds, in_progress.as_ref(), scale_factor, window);
 
                     // 2.55) OCR 框选矩形（高亮半透明 + 绿色描边）
                     if let Some(ocr) = ocr_rect {
@@ -2509,7 +2659,12 @@ impl Render for OverlayView {
                                         .font_weight(match self.toolbar.current_weight {
                                             FontWeight::Bold => gpui::FontWeight::BOLD,
                                             FontWeight::Normal => gpui::FontWeight::NORMAL,
-                                        }),
+                                        })
+                                        .font_family(gpui::SharedString::from(
+                                            crate::overlay::font::TEXT_FONT_FAMILY,
+                                        ))
+                                        // 行盒随字号缩放，避免大字号时编辑器把第一行顶部裁掉
+                                        .line_height(gpui::relative(1.5)),
                                 ),
                         ),
                 );
@@ -2554,7 +2709,12 @@ impl Render for OverlayView {
                                         .font_weight(match self.toolbar.current_weight {
                                             FontWeight::Bold => gpui::FontWeight::BOLD,
                                             FontWeight::Normal => gpui::FontWeight::NORMAL,
-                                        }),
+                                        })
+                                        .font_family(gpui::SharedString::from(
+                                            crate::overlay::font::TEXT_FONT_FAMILY,
+                                        ))
+                                        // 行盒随字号缩放，避免大字号时编辑器把第一行顶部裁掉
+                                        .line_height(gpui::relative(1.5)),
                                 ),
                         )
                         // 8 个 resize 手柄（相对于 outer div，覆盖全框四边）
@@ -3778,6 +3938,16 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
         .run(move |cx: &mut App| {
             // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
             gpui_component::init(cx);
+
+            // 把内置 Noto Sans CJK SC Regular/Bold 注册进 GPUI text system，
+            // 这样预览文字用 family="Noto Sans CJK SC" + weight=BOLD 时能命中
+            // Bold face（与提交栅格化一致），而不是退化成系统字体/普通字重。
+            if let Err(err) = cx.text_system().add_fonts(vec![
+                std::borrow::Cow::Owned(crate::overlay::drawing::FontWeight::Normal.font_bytes().to_vec()),
+                std::borrow::Cow::Owned(crate::overlay::drawing::FontWeight::Bold.font_bytes().to_vec()),
+            ]) {
+                eprintln!("[overlay] register Noto fonts failed: {err}");
+            }
 
             cx.spawn(async move |async_cx: &mut AsyncApp| {
                 loop {

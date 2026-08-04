@@ -14,8 +14,8 @@ pub const FONT_SIZES: &[f32] = &[16.0, 20.0, 24.0, 32.0, 48.0];
 /// 画笔/边框粗细档位（px）
 ///
 /// 用于矩形、箭头、画笔、马赛克的边线粗细选择。
-/// 0.5 为超细档；1~8 为整数档。
-pub const LINE_WIDTHS: &[f32] = &[0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+/// 最小 1px（0.5 超细档因锯齿感已去掉），向上为整数档。
+pub const LINE_WIDTHS: &[f32] = &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
 
 /// 工具栏按钮类型
@@ -145,7 +145,7 @@ impl Default for ToolbarState {
         Self {
             active_tool: None,
             current_color: RGBA::RED,
-            line_width: 4.0,
+            line_width: 1.0,
             current_size: 24.0,
             current_weight: FontWeight::Normal,
             popup: None,
@@ -162,7 +162,13 @@ mod tests {
         let s = ToolbarState::default();
         assert_eq!(s.current_size, 24.0);
         assert_eq!(s.current_weight, FontWeight::Normal);
-        assert_eq!(s.line_width, 4.0);
+        assert_eq!(s.line_width, 1.0);
+    }
+
+    #[test]
+    fn line_widths_no_longer_include_half_pixel() {
+        assert!(!LINE_WIDTHS.contains(&0.5));
+        assert_eq!(LINE_WIDTHS[0], 1.0);
     }
 
     #[test]

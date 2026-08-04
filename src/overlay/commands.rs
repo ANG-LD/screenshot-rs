@@ -18,7 +18,7 @@ use crate::capture::CapturedFrame;
 use crate::error::{AppError, AppResult};
 use crate::overlay::drawing::{DrawCommand, FontWeight, Point as DrawPoint, RGBA};
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Weight};
-use crate::overlay::font::{with_font_system, with_swash_cache};
+use crate::overlay::font::{with_font_system, with_swash_cache, TEXT_FONT_FAMILY};
 use image::imageops::FilterType;
 
 /// 把 Text 命令栅格化到 frame（v0.2 真实现）
@@ -59,7 +59,7 @@ pub fn rasterize_text(
         let metrics = Metrics::new(font_size, font_size * 1.4);
         let mut buffer = Buffer::new(font_system, metrics);
         let attrs = Attrs::new()
-            .family(Family::Name("Noto Sans SC"))
+            .family(Family::Name(TEXT_FONT_FAMILY))
             .weight(weight_attr);
         buffer.set_text(content, &attrs, Shaping::Advanced, None);
         buffer.set_size(max_w, None);
