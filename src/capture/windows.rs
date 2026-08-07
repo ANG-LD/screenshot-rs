@@ -38,6 +38,13 @@ impl ScreenCapture for PlatformScreenCapture {
         })
     }
 
+    /// 滚动截屏暂不支持 Windows（区域截屏可行，但自动滚动注入未实现）
+    fn capture_area(&self, _x: i32, _y: i32, _w: u32, _h: u32) -> AppResult<CapturedFrame> {
+        Err(crate::error::AppError::Window(
+            "滚动截屏暂不支持 Windows".into(),
+        ))
+    }
+
     fn list_displays(&self) -> Vec<DisplayInfo> {
         Screen::all()
             .map(|screens| {

@@ -7,16 +7,15 @@
 //! `QuitMode::Explicit` 的 `application().run()`，覆盖窗口与 Pin 窗口都在
 //! 同一个应用内创建/销毁，截图完成不退出进程。主线程在 channel 上阻塞等结果。
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Render, RenderImage, Size,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowKind, WindowOptions,
-    canvas,
-    div, point,
-    prelude::*, px, quad, rgba,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
+    WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
 use gpui_component::button::Button;
 use gpui_component::button::ButtonVariants;
@@ -224,6 +223,11 @@ pub struct OverlayResult {
     pub no_clipboard: bool,
     /// 非 None 表示用户点了「固定」：主线程应把 payload 交给 `OverlayService::open_pin`
     pub pin: Option<PinPayload>,
+    /// 非 None 表示用户点了「滚动截屏」：`selection` 应为 None，主线程据此
+    /// 运行滚动截屏（region 是物理像素，主屏相对坐标）
+    pub scroll_region_px: Option<ub::Bounds>,
+    /// true 表示用户点了「手动滚动」：滚动由用户手动进行，应用只检测拼接
+    pub scroll_manual: bool,
 }
 
 impl OverlayView {
@@ -310,7 +314,10 @@ impl OverlayView {
         }
         let no_clipboard = result.no_clipboard;
         let pin = result.pin;
-        let _ = self.tx.send(OverlayResult { selection, commands, no_clipboard, pin });
+        // scroll_region_px 在 Scroll 按钮处已换算成物理像素，这里原样透传，不参与缩放
+        let scroll_region_px = result.scroll_region_px;
+        let scroll_manual = result.scroll_manual;
+        let _ = self.tx.send(OverlayResult { selection, commands, no_clipboard, pin, scroll_region_px, scroll_manual });
         window.remove_window();
     }
 
@@ -364,8 +371,8 @@ impl OverlayView {
             // Text 走 open_text_input、Ocr 走框选识别（on_mouse_down 已拦截），
             // 其余非绘图工具忽略。
             ToolButton::Text | ToolButton::Ocr | ToolButton::ColorPicker | ToolButton::Undo
-            | ToolButton::Redo | ToolButton::Bold | ToolButton::Finish | ToolButton::Cancel
-            | ToolButton::Pin => return,
+            | ToolButton::Redo | ToolButton::Bold | ToolButton::Scroll | ToolButton::ScrollManual
+            | ToolButton::Finish | ToolButton::Cancel | ToolButton::Pin => return,
         });
     }
 
@@ -726,6 +733,13 @@ impl OverlayView {
                 weak.clone(),
                 cx,
             ))
+            .child(render_simple_button(
+                ToolButton::Scroll,
+                false,
+                sel.size.x < 20.0 || sel.size.y < 20.0,
+                weak.clone(),
+                cx,
+            ))
             .child(render_tool_button_with_popover(
                 ToolButton::Mosaic,
                 active_tool == Some(ToolButton::Mosaic),
@@ -831,6 +845,8 @@ fn icon_for(btn: ToolButton) -> IconName {
         ToolButton::Cancel => IconName::Close,
         ToolButton::Pin => IconName::ExternalLink,
         ToolButton::Bold => IconName::CaseSensitive,
+        ToolButton::Scroll => IconName::ChevronDown,
+        ToolButton::ScrollManual => IconName::ChevronsUpDown,
     }
 }
 
@@ -854,7 +870,7 @@ fn compute_toolbar_bounds(
     } else {
         screen_h - toolbar_h - TOOLBAR_OFFSET_Y
     };
-    let toolbar_w = TOOLBAR_BTN_SIZE * 12.0 + TOOLBAR_GAP * 11.0 + TOOLBAR_PAD * 2.0;
+    let toolbar_w = TOOLBAR_BTN_SIZE * 14.0 + TOOLBAR_GAP * 13.0 + TOOLBAR_PAD * 2.0;
     let toolbar_x = sel.origin.x.min(screen_bounds.origin.x + screen_bounds.size.x - toolbar_w - TOOLBAR_OFFSET_Y);
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
 }
@@ -1048,6 +1064,8 @@ fn render_simple_button(
                                 commands: vec![],
                                 no_clipboard: false,
                                 pin: None,
+                                scroll_region_px: None,
+                                scroll_manual: false,
                             },
                             window,
                         );
@@ -1141,7 +1159,38 @@ fn render_simple_button(
                             }
                         }
 
-                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true, pin }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true, pin, scroll_region_px: None, scroll_manual: false }, window);
+                    }
+                    ToolButton::Scroll | ToolButton::ScrollManual => {
+                        // 滚动截屏：把选区（物理像素）交给主线程去滚动拼接。
+                        // ScrollManual 由用户手动滚动，应用只负责检测拼接。
+                        this.finalize_text_input_if_active(cx);
+                        let manual = btn == ToolButton::ScrollManual;
+                        let Some(s) = this.selection.current() else {
+                            return;
+                        };
+                        let wb = window.bounds();
+                        let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+                        let sy = this.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+                        let region = ub::Bounds {
+                            origin: ub::Point::new(s.origin.x * sx, s.origin.y * sy),
+                            size: ub::Point::new(s.size.x * sx, s.size.y * sy),
+                        };
+                        tracing::info!(
+                            "[Scroll] selection physical: origin=({:.0},{:.0}) size=({:.0},{:.0}) manual={manual}",
+                            region.origin.x, region.origin.y, region.size.x, region.size.y
+                        );
+                        this.commit(
+                            OverlayResult {
+                                selection: None,
+                                commands: vec![],
+                                no_clipboard: false,
+                                pin: None,
+                                scroll_region_px: Some(region),
+                                scroll_manual: manual,
+                            },
+                            window,
+                        );
                     }
                     ToolButton::Finish => {
                         // 兜底：若 Text 工具还活着没提交，先把它的内容落成命令
@@ -1149,7 +1198,7 @@ fn render_simple_button(
                         let s = this.selection.current().or(Some(this.screen_bounds));
                         let cmds: Vec<DrawCommand> =
                             this.drawing.visible_commands().cloned().collect();
-                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false, pin: None }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
                     }
                     _ => {}
                 }
@@ -3207,7 +3256,7 @@ impl Render for OverlayView {
                             .visible_commands()
                             .cloned()
                             .collect();
-                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None }, window);
+                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
                     }
                 }),
             )
@@ -3219,7 +3268,7 @@ impl Render for OverlayView {
                         cx.notify();
                         return;
                     }
-                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false, pin: None }, window);
+                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
                 } else if ev.keystroke.key == "enter" {
                     // Enter 先尝试提交活跃的 Text 输入（如果 Text 工具正在输入）。
                     // 若 finalize 了 Text 命令，说明这次 Enter 是\"写字时按 Enter 提交\"
@@ -3236,7 +3285,7 @@ impl Render for OverlayView {
                         .visible_commands()
                         .cloned()
                         .collect();
-                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None }, window);
+                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
                 } else if ev.keystroke.key == "z" && ev.keystroke.modifiers.control {
                     // Ctrl+Z 撤销 / Ctrl+Shift+Z 重做
                     if ev.keystroke.modifiers.shift {
@@ -3865,6 +3914,21 @@ enum OverlayCommand {
     },
     /// 在同一个 GPUI 应用里打开 Pin 窗口
     OpenPin(PinPayload),
+    /// 打开滚动截屏进度小窗（cancel/progress 由主线程与 GPUI 线程共享原子）
+    ShowProgress {
+        cancel: Arc<AtomicBool>,
+        /// 手动滚动模式下用户点「完成」置 true（自动模式传哑值，不使用）
+        done: Arc<AtomicBool>,
+        progress: Arc<AtomicU32>,
+        /// true = 手动滚动模式（进度窗显示「完成」按钮 + 手动提示文案）
+        manual: bool,
+        /// 选区物理像素（用于把小窗摆到不遮挡选区的位置）
+        region_px: ub::Bounds,
+        /// 主屏物理像素尺寸（换算逻辑坐标用）
+        screen_px: ub::Bounds,
+    },
+    /// 关闭滚动截屏进度小窗
+    HideProgress,
 }
 
 /// 进程级唯一的 GPUI 服务：持有命令 Sender，首次使用时才拉起 GPUI 线程。
@@ -3898,6 +3962,8 @@ impl OverlayService {
             commands: vec![],
             no_clipboard: false,
             pin: None,
+            scroll_region_px: None,
+            scroll_manual: false,
         });
 
         result
@@ -3906,6 +3972,50 @@ impl OverlayService {
     /// 在同一个 GPUI 应用里打开 Pin 窗口（fire-and-forget）。
     pub fn open_pin(&self, payload: PinPayload) {
         let _ = self.cmd.send(OverlayCommand::OpenPin(payload));
+    }
+
+    /// 打开自动滚动截屏进度小窗（主线程调用，不阻塞）
+    pub fn open_scroll_progress(
+        &self,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<AtomicU32>,
+        region_px: ub::Bounds,
+        screen_px: ub::Bounds,
+    ) {
+        let _ = self.cmd.send(OverlayCommand::ShowProgress {
+            cancel,
+            done: Arc::new(AtomicBool::new(false)),
+            progress,
+            manual: false,
+            region_px,
+            screen_px,
+        });
+    }
+
+    /// 打开手动滚动截屏进度小窗（主线程调用，不阻塞）
+    ///
+    /// `done` 由用户点「完成」置 true，主线程据此结束拼接。
+    pub fn open_manual_scroll_progress(
+        &self,
+        done: Arc<AtomicBool>,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<AtomicU32>,
+        region_px: ub::Bounds,
+        screen_px: ub::Bounds,
+    ) {
+        let _ = self.cmd.send(OverlayCommand::ShowProgress {
+            cancel,
+            done,
+            progress,
+            manual: true,
+            region_px,
+            screen_px,
+        });
+    }
+
+    /// 关闭滚动截屏进度小窗
+    pub fn close_scroll_progress(&self) {
+        let _ = self.cmd.send(OverlayCommand::HideProgress);
     }
 }
 
@@ -3950,6 +4060,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
             }
 
             cx.spawn(async move |async_cx: &mut AsyncApp| {
+                let mut progress: Option<WindowHandle<ProgressView>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -3960,8 +4071,29 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         Ok(OverlayCommand::OpenPin(payload)) => {
                             let _ = async_cx.update(|cx| open_pin_in_app(payload, cx));
                         }
+                        Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, manual, region_px, screen_px }) => {
+                            // 先关掉可能残留的旧进度窗
+                            if let Some(old) = progress.take() {
+                                let _ = old.update(async_cx, |_, window, _| window.remove_window());
+                            }
+                            match async_cx.update(|cx| {
+                                open_progress_window(cancel, done, progress_arc, manual, region_px, screen_px, cx)
+                            }) {
+                                Ok(handle) => progress = Some(handle),
+                                Err(e) => eprintln!("[overlay] open progress window failed: {e}"),
+                            }
+                        }
+                        Ok(OverlayCommand::HideProgress) => {
+                            if let Some(handle) = progress.take() {
+                                let _ = handle.update(async_cx, |_, window, _| window.remove_window());
+                            }
+                        }
                         Err(TryRecvError::Empty) => {}
                         Err(TryRecvError::Disconnected) => break,
+                    }
+                    // 滚动进度窗：每 tick 从原子读最新高度重绘
+                    if let Some(handle) = &progress {
+                        let _ = handle.update(async_cx, |_, _, cx| cx.notify());
                     }
                     async_cx
                         .background_executor()
@@ -3971,6 +4103,157 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
             })
             .detach();
         });
+}
+
+/// 滚动截屏进度小窗视图（auto/manual 共用；manual 显示「完成」按钮）
+struct ProgressView {
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    progress: Arc<AtomicU32>,
+    manual: bool,
+}
+
+impl Render for ProgressView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let cancel = self.cancel.clone();
+        let done = self.done.clone();
+        let height = self.progress.load(Ordering::Relaxed);
+        let text = if self.manual {
+            format!("手动滚动截屏中… {height}px")
+        } else {
+            format!("滚动截屏中… {height}px")
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .h(px(44.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .child(div().text_sm().child(text)),
+            )
+            .when(self.manual, |b| {
+                b.child(
+                    Button::new("scroll-done")
+                        .label("完成")
+                        .compact()
+                        .with_size(gpui_component::Size::Small)
+                        .on_click(move |_, _, _| done.store(true, Ordering::Relaxed)),
+                )
+            })
+            .child(
+                Button::new("scroll-cancel")
+                    .label("取消")
+                    .compact()
+                    .with_size(gpui_component::Size::Small)
+                    .on_click(move |_, _, _| cancel.store(true, Ordering::Relaxed)),
+            )
+    }
+}
+
+/// 两个逻辑像素矩形是否相交（用于把进度窗摆到不遮挡选区的角落）
+fn bounds_intersect(a: ub::Bounds, b: ub::Bounds) -> bool {
+    a.origin.x < b.origin.x + b.size.x
+        && a.origin.x + a.size.x > b.origin.x
+        && a.origin.y < b.origin.y + b.size.y
+        && a.origin.y + a.size.y > b.origin.y
+}
+
+/// 打开滚动截屏进度小窗，摆到不与选区重叠的屏幕角落
+fn open_progress_window(
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    progress: Arc<AtomicU32>,
+    manual: bool,
+    region_px: ub::Bounds,
+    screen_px: ub::Bounds,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<ProgressView>> {
+    let display = cx
+        .primary_display()
+        .ok_or_else(|| anyhow::anyhow!("no primary display"))?;
+    let dbounds = display.bounds();
+
+    // 物理像素 → 逻辑像素（选区与主屏都是物理像素，GPUI 用逻辑坐标）
+    let sx = f32::from(dbounds.size.width) / screen_px.size.x.max(1.0);
+    let sy = f32::from(dbounds.size.height) / screen_px.size.y.max(1.0);
+
+    // 手动模式多一个「完成」按钮，窗口加宽
+    let win_w = if manual { 360.0 } else { 280.0 };
+    const WIN_H: f32 = 44.0;
+    let dw = f32::from(dbounds.size.width);
+    let dh = f32::from(dbounds.size.height);
+    // 兜底角落：右下、左下、右上、左上
+    let corners = [
+        point(px(dw - win_w), px(dh - WIN_H)),
+        point(px(0.0), px(dh - WIN_H)),
+        point(px(dw - win_w), px(0.0)),
+        point(px(0.0), px(0.0)),
+    ];
+    let region_logical = ub::Bounds {
+        origin: ub::Point::new(region_px.origin.x * sx, region_px.origin.y * sy),
+        size: ub::Point::new(region_px.size.x * sx, region_px.size.y * sy),
+    };
+    // 优先把进度窗放到选区旁边（下方→上方→右侧→左侧），指针可及、且不污染截图；
+    // 候选位越界/与选区相交就跳过，最后回退到角落。
+    let clamp_x = |x: f32| x.clamp(0.0, (dw - win_w).max(0.0));
+    let clamp_y = |y: f32| y.clamp(0.0, (dh - WIN_H).max(0.0));
+    let candidates = [
+        // 下方（滚动方向正下方，指针最近）
+        (
+            clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
+            clamp_y(region_logical.origin.y + region_logical.size.y),
+        ),
+        // 上方
+        (
+            clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
+            clamp_y(region_logical.origin.y - WIN_H),
+        ),
+        // 右侧
+        (
+            clamp_x(region_logical.origin.x + region_logical.size.x),
+            clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
+        ),
+        // 左侧
+        (
+            clamp_x(region_logical.origin.x - win_w),
+            clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
+        ),
+    ];
+    let origin = candidates
+        .into_iter()
+        .find(|(x, y)| {
+            !bounds_intersect(
+                ub::Bounds {
+                    origin: ub::Point::new(*x, *y),
+                    size: ub::Point::new(win_w, WIN_H),
+                },
+                region_logical,
+            )
+        })
+        .map(|(x, y)| point(px(x), px(y)))
+        .unwrap_or_else(|| corners[0]);
+
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin,
+                size: Size::new(px(win_w), px(WIN_H)),
+            })),
+            window_background: WindowBackgroundAppearance::Opaque,
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            focus: false,
+            ..Default::default()
+        },
+        |_, cx| cx.new(|_| ProgressView { cancel, done, progress, manual }),
+    )
 }
 
 /// 在常驻应用里打开截图覆盖窗口（原 `run_blocking` 的窗口构建逻辑）。

@@ -8,5 +8,6 @@ pub mod clipboard;
 pub mod error;
 pub mod hotkey;
 pub mod overlay;
+pub mod scroll;
 pub mod tray;
 pub mod utils;

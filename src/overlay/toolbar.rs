@@ -46,6 +46,10 @@ pub enum ToolButton {
     Redo,
     /// 切换文字粗体（v0.2 新增）
     Bold,
+    /// 滚动截屏：自动滚动所选视口并拼接成长图
+    Scroll,
+    /// 手动滚动截屏：由用户自己滚动，应用检测并拼接（对自动注入失效的应用兜底）
+    ScrollManual,
     /// 固定截图到桌面（Pin）
     Pin,
     /// 确认并保存截图标注
@@ -72,6 +76,8 @@ impl ToolButton {
         ToolButton::Undo,
         ToolButton::Redo,
         ToolButton::Bold,
+        ToolButton::Scroll,
+        ToolButton::ScrollManual,
         ToolButton::Finish,
         ToolButton::Pin,
         ToolButton::Cancel,
@@ -94,6 +100,8 @@ impl ToolButton {
             ToolButton::Undo => "撤销",
             ToolButton::Redo => "重做",
             ToolButton::Bold => "B",
+            ToolButton::Scroll => "滚动截屏",
+            ToolButton::ScrollManual => "手动滚动",
             ToolButton::Pin => "固定",
             ToolButton::Finish => "完成",
             ToolButton::Cancel => "取消",

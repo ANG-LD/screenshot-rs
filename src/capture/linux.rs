@@ -83,6 +83,29 @@ impl ScreenCapture for PlatformScreenCapture {
         })
     }
 
+    /// 捕获主屏上指定区域（滚动截屏用）
+    ///
+    /// 与 `capture_primary` 一样每次调用重新取主屏 `Screen`，避免把连接状态
+    /// 存进实现里跨线程共享（trait 是 Send + Sync）。
+    ///
+    /// 坐标语义：frame 物理像素 = 主屏相对坐标；`capture_area` 内部会再加
+    /// `display_info.x/y`。越界区域会被 clamp，返回尺寸可能小于请求值。
+    fn capture_area(&self, x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame> {
+        let screens = Screen::all().map_err(|e| crate::error::AppError::Capture(e.to_string()))?;
+        let screen = screens
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::error::AppError::Window("未检测到任何显示器".into()))?;
+        let image = screen
+            .capture_area(x, y, w, h)
+            .map_err(|e| crate::error::AppError::Capture(e.to_string()))?;
+        Ok(CapturedFrame {
+            width: image.width(),
+            height: image.height(),
+            pixels: image.into(),
+        })
+    }
+
     /// 列出系统上所有可用显示器
     ///
     /// `Screen::all()` 失败时（例如没有可用的 X Server）返回空 Vec 而不是错误，

@@ -3,11 +3,15 @@
 //! MVP 阶段 `AppState` 仅做服务容器与事件循环分发；
 //! GPUI 窗口的创建/销毁由 `overlay/mod.rs` 中的 `run_overlay` 入口负责。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+
 use crate::capture::platform_capture;
 use crate::clipboard::ClipboardService;
 use crate::error::AppResult;
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::overlay::window::OverlayService;
+use crate::scroll::ScrollProgress;
 use crate::tray::{TrayMenuEvent, TrayService};
 use crate::utils::bounds::{Bounds, Point};
 
@@ -84,6 +88,15 @@ impl AppState {
 
         // GPUI 覆盖层（阻塞直到用户选完/取消；常驻应用内开窗）
         let result = self.overlay.open_overlay(frame.clone(), screen_bounds);
+        // 滚动截屏：selection=None（会被当取消）必须先于选区分支处理
+        if let Some(region) = result.scroll_region_px {
+            if result.scroll_manual {
+                tracing::info!("开始手动滚动截屏 region=({}, {}) {}x{}", region.origin.x, region.origin.y, region.size.x, region.size.y);
+                return self.run_manual_scroll_capture(&region, screen_bounds);
+            }
+            tracing::info!("开始滚动截屏 region=({}, {}) {}x{}", region.origin.x, region.origin.y, region.size.x, region.size.y);
+            return self.run_scroll_capture(&region, screen_bounds);
+        }
         let Some(region) = result.selection else {
             tracing::info!("用户取消截图");
             return Ok(());
@@ -133,6 +146,73 @@ impl AppState {
         }
 
         Ok(())
+    }
+
+    /// 运行滚动截屏引擎并把拼接好的长图写入剪贴板
+    fn run_scroll_capture(&self, region: &Bounds, screen_bounds: Bounds) -> AppResult<()> {
+        let progress = ScrollProgressAdapter(&self.overlay);
+        let stitched = crate::scroll::run_scroll_capture(
+            region,
+            &screen_bounds,
+            self.capture.as_ref(),
+            &progress,
+        )?;
+        self.clipboard.write_frame(&stitched)?;
+        tracing::info!(
+            "滚动截屏完成并复制到剪贴板（{}x{}）",
+            stitched.width,
+            stitched.height
+        );
+        Ok(())
+    }
+
+    /// 运行手动滚动截屏引擎并把拼接好的长图写入剪贴板
+    fn run_manual_scroll_capture(&self, region: &Bounds, screen_bounds: Bounds) -> AppResult<()> {
+        let progress = ScrollProgressAdapter(&self.overlay);
+        let stitched = crate::scroll::run_manual_scroll_capture(
+            region,
+            &screen_bounds,
+            self.capture.as_ref(),
+            &progress,
+        )?;
+        self.clipboard.write_frame(&stitched)?;
+        tracing::info!(
+            "手动滚动截屏完成并复制到剪贴板（{}x{}）",
+            stitched.width,
+            stitched.height
+        );
+        Ok(())
+    }
+}
+
+/// 把 OverlayService 包装成滚动引擎的进度回调
+struct ScrollProgressAdapter<'a>(&'a OverlayService);
+
+impl ScrollProgress for ScrollProgressAdapter<'_> {
+    fn show(
+        &self,
+        region: &Bounds,
+        screen_bounds: &Bounds,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<AtomicU32>,
+    ) {
+        self.0.open_scroll_progress(cancel, progress, *region, *screen_bounds);
+    }
+
+    fn show_manual(
+        &self,
+        region: &Bounds,
+        screen_bounds: &Bounds,
+        cancel: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+        progress: Arc<AtomicU32>,
+    ) {
+        self.0
+            .open_manual_scroll_progress(done, cancel, progress, *region, *screen_bounds);
+    }
+
+    fn hide(&self) {
+        self.0.close_scroll_progress();
     }
 }
 

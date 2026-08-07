@@ -54,6 +54,12 @@ pub trait ScreenCapture: Send + Sync {
     /// 捕获主显示器全屏
     fn capture_primary(&self) -> AppResult<CapturedFrame>;
 
+    /// 捕获主显示器上 (x, y) 起 (w, h) 的区域（物理像素，主屏相对坐标）
+    ///
+    /// 用于滚动截屏：反复抓取同一视口并拼接。越界部分会被底层 clamp，
+    /// 返回的实际尺寸可能小于请求值，调用方需校验。
+    fn capture_area(&self, x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame>;
+
     /// 列出所有可用显示器
     fn list_displays(&self) -> Vec<DisplayInfo>;
 }
