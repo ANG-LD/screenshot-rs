@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Screenshot RS
+Comment=截图标注工具 - 支持箭头、画笔、文字、马赛克、OCR、长截图
+Exec=screenshot-rs
+Icon=screenshot-rs
+Terminal=false
+Type=Application
+Categories=Graphics;Utility;
+Keywords=screenshot;annotation;snip;OCR;

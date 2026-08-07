@@ -28,9 +28,22 @@
 use std::sync::mpsc::{Receiver, Sender};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::error::{AppError, AppResult};
+
+/// 托盘图标尺寸（物理像素）
+const TRAY_ICON_SIZE: u32 = 48;
+
+/// 内嵌 48x48 PNG 图标数据
+static TRAY_ICON_PNG: &[u8] = include_bytes!("../../assets/icons/tray-48.png");
+
+/// 解码内嵌 PNG 为 RGBA Vec
+fn load_tray_icon_rgba() -> AppResult<Vec<u8>> {
+    let img = image::load_from_memory(TRAY_ICON_PNG)
+        .map_err(|e| AppError::Tray(format!("托盘图标解码失败: {e}")))?;
+    Ok(img.to_rgba8().into_raw())
+}
 
 /// 托盘菜单事件枚举
 ///
@@ -90,9 +103,12 @@ impl TrayService {
         menu.append(&quit_item)
             .map_err(|e| AppError::Tray(e.to_string()))?;
 
-        // 构建托盘图标：设置菜单、tooltip。图标本身留空（Linux 下只要设置了菜单
-        // 也会显示一个默认图标；其他平台下系统会用占位图标兜底）。
+        // 构建托盘图标：设置图标、菜单、tooltip。
+        let rgba = load_tray_icon_rgba()?;
+        let tray_icon = Icon::from_rgba(rgba, TRAY_ICON_SIZE, TRAY_ICON_SIZE)
+            .map_err(|e| AppError::Tray(e.to_string()))?;
         let icon = TrayIconBuilder::new()
+            .with_icon(tray_icon)
             .with_menu(Box::new(menu))
             .with_tooltip("screenshot-rs")
             .build()

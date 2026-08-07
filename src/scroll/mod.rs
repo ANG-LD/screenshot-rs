@@ -187,21 +187,28 @@ pub fn run_scroll_capture(
             // 用户在暂停期间手动滚动目标窗口时，帧在变化，会持续刷新基线并继续等待。
             let dist = injector.pointer_distance_from(warp.0 as i16, warp.1 as i16);
             if dist > PAUSE_RADIUS {
-                let moving = capture
+                let b = capture
                     .capture_area(x, y, w, h)
-                    .ok()
-                    .map(|b| {
-                        if b.width != a.width || b.height != a.height {
-                            return false;
-                        }
-                        let differ = frames_differ(&a, &b);
-                        if differ {
-                            a = b; // 用户正在手动滚动目标窗口：跟住新基线
-                        }
-                        differ
-                    })
-                    .unwrap_or(false);
-                if moving {
+                    .ok();
+                let b_energy = b.as_ref().map(|f| avg_adjacent_diff(f)).unwrap_or(0.0);
+                let same_size = b.as_ref().map_or(false, |f| f.width == a.width && f.height == a.height);
+                let differ = if same_size {
+                    frames_differ(&a, b.as_ref().unwrap())
+                } else {
+                    false
+                };
+                if differ {
+                    // 用户正在手动滚动目标窗口：跟住新基线
+                    if let Some(b) = b {
+                        a = b;
+                    }
+                }
+                // 暂停中到达底部：内容空白且静止 → 立即停止，不等 MAX_PAUSED_STATIC
+                if !differ && b_energy < TEXTURED_ENERGY {
+                    stop_reason = "blank_while_paused";
+                    break;
+                }
+                if differ {
                     paused_static = 0;
                 } else {
                     paused_static += 1;
@@ -215,6 +222,19 @@ pub fn run_scroll_capture(
                     break;
                 }
                 continue;
+            }
+            // 刚退出暂停：捕获当前帧作为新基线再开始注入。
+            // 暂停期间若 a 被手动滚动刷新过，丢掉的那一段无法找回（引擎未注入滚轮），
+            // 但从当前帧续跑保证后续拼接正确，不会把已滚过的内容重复拼进去。
+            let resume_from_pause = paused_static > 0;
+            if resume_from_pause {
+                if let Ok(fresh) = capture.capture_area(x, y, w, h) {
+                    if fresh.width == a.width && fresh.height == a.height {
+                        a = fresh;
+                        streak = 0;
+                        tracing::info!("[scroll] iter={iter} resume_from_pause refresh_baseline");
+                    }
+                }
             }
             paused_static = 0;
 

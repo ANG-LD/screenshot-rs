@@ -38,6 +38,12 @@ impl AppState {
 
     /// 主事件循环（MVP 简化版）
     pub fn run(&self) -> AppResult<()> {
+        // Linux：GTK 初始化（tray-icon 内部也会尝试初始化，这里确保成功）。
+        // 托盘菜单事件需通过 GTK 事件循环泵取（libayatana-appindicator 通过
+        // D-Bus 接收菜单点击，回调由 GLib 主上下文调度）。
+        #[cfg(target_os = "linux")]
+        gtk_init_linux();
+
         loop {
             // Windows 下必须先泵取 Win32 消息：
             // global-hotkey / tray-icon 各自创建了隐藏窗口并注册到当前线程的消息队列，
@@ -46,6 +52,12 @@ impl AppState {
             // 「创建管理器/图标的线程必须运行 Win32 消息循环」。
             #[cfg(target_os = "windows")]
             pump_windows_messages();
+
+            // Linux 下托盘菜单事件通过 GTK/GLib 信号投递。
+            // libayatana-appindicator 虽通过 D-Bus 渲染菜单，但菜单点击的 activate
+            // 信号需要 GLib 主上下文迭代才能触发。
+            #[cfg(target_os = "linux")]
+            pump_gtk_events_linux();
 
             if let Some(event) = self.hotkey.try_recv() {
                 match event {
@@ -62,6 +74,8 @@ impl AppState {
                 match event {
                     TrayMenuEvent::TriggerScreenshot => {
                         tracing::info!("托盘触发：开始截图");
+                        // 等待桌面环境关闭托盘菜单，避免菜单残留在截图中
+                        std::thread::sleep(std::time::Duration::from_millis(200));
                         if let Err(e) = self.trigger_screenshot() {
                             tracing::error!("截图失败：{e}");
                         }
@@ -213,6 +227,36 @@ impl ScrollProgress for ScrollProgressAdapter<'_> {
 
     fn hide(&self) {
         self.0.close_scroll_progress();
+    }
+}
+
+/// Linux：初始化 GTK（幂等，多次调用无副作用）。
+///
+/// tray-icon 内部 libappindicator 可能已调过 `gtk_init_check`；
+/// 这里再调一次确保成功。
+#[cfg(target_os = "linux")]
+fn gtk_init_linux() {
+    gtk::init().ok();
+}
+
+/// Linux：泵取当前线程全部已排队的 GLib 主上下文事件。
+///
+/// 同时迭代全局默认上下文和线程默认上下文（若不同）。
+/// libayatana-appindicator 的 D-Bus 事件源可能挂在任一上下文中。
+/// 非阻塞模式：无事件时立即返回。
+#[cfg(target_os = "linux")]
+fn pump_gtk_events_linux() {
+    let default_ctx = gtk::glib::MainContext::default();
+    while default_ctx.pending() {
+        default_ctx.iteration(false);
+    }
+    // 如果线程默认上下文不同于全局默认，也一起泵取
+    if let Some(thread_ctx) = gtk::glib::MainContext::thread_default() {
+        if thread_ctx != default_ctx {
+            while thread_ctx.pending() {
+                thread_ctx.iteration(false);
+            }
+        }
     }
 }
 
