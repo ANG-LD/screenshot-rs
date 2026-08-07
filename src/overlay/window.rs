@@ -138,12 +138,8 @@ pub struct OverlayView {
     /// commit 时乘以 scale_factor 转回物理像素供 app.rs 裁剪/栅格化。
     scale_factor: f32,
 
-    /// dim 遮罩透明度（0.0 = 完全透明，1.0 = 最终效果）。
-    ///
-    /// 窗口打开时从 0 动画过渡到 1，减轻突然出现的撕裂感。
+    /// dim 遮罩不透明度（0=透明, 1=最大 dim）——直接到 1.0，无淡入动画
     dim_opacity: f32,
-    /// 淡入动画起始时刻
-    animation_start: std::time::Instant,
 }
 
 /// 文字输入框拖动 / resize 状态
@@ -268,8 +264,7 @@ impl OverlayView {
             selected_cmd_actual_idx: None,
             cmd_drag: None,
             scale_factor,
-            dim_opacity: 0.0,
-            animation_start: std::time::Instant::now(),
+            dim_opacity: 1.0,
         };
 
         this
@@ -2326,17 +2321,7 @@ fn download_tesseract(cache: &std::path::Path) -> Result<(), String> {
 
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 淡入动画：窗口打开后 150ms 内 dim 遮罩从透明过渡到最终效果
-        {
-            let elapsed = self.animation_start.elapsed().as_secs_f32();
-            const DURATION: f32 = 0.15;
-            if elapsed < DURATION {
-                self.dim_opacity = elapsed / DURATION;
-                cx.notify();
-            } else if self.dim_opacity < 1.0 {
-                self.dim_opacity = 1.0;
-            }
-        }
+        // dim 遮罩直接到位（无淡入动画）——动画造成"两次变暗"的视觉，感知上拖慢响应
 
         let frame_image = self.frame_image.clone();
         let selection_bounds = self.selection.current();
@@ -4065,7 +4050,9 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
                             let _ = async_cx.update(|cx| {
-                                open_overlay_in_app(frame, screen_bounds, reply, cx)
+                                let t0 = std::time::Instant::now();
+                                open_overlay_in_app(frame, screen_bounds, reply, cx);
+                                tracing::info!("[overlay] window open took {:.0}ms", t0.elapsed().as_millis());
                             });
                         }
                         Ok(OverlayCommand::OpenPin(payload)) => {
@@ -4097,7 +4084,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                     }
                     async_cx
                         .background_executor()
-                        .timer(std::time::Duration::from_millis(20))
+                        .timer(std::time::Duration::from_millis(5))
                         .await;
                 }
             })
@@ -4263,24 +4250,15 @@ fn open_overlay_in_app(
     tx: Sender<OverlayResult>,
     cx: &mut App,
 ) {
-    // screen_bounds 来自 CapturedFrame 的物理像素尺寸，但 GPUI 所有
-    // 坐标（鼠标事件、paint 定位）都使用逻辑像素。这里用主屏 bounds
-    // 与帧尺寸的比率作为 scale_factor，把 screen_bounds 转为逻辑像素，
-    // 来保证 clamp_inside 等边界检查生效。
     let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
         origin: point(px(0.), px(0.)),
         size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
     });
-    // 覆盖窗口的客户端区原点 = 请求的 win_bounds 原点（GPUI 把客户端区放到
-    // 请求 bounds 处）。选区/画布坐标是客户端区坐标，屏幕位置 = client_origin + sel。
-    // 不能用 window.bounds().origin（那是窗口外框位置，含 DWM 隐形边框，会差几 px）。
     let client_origin =
         ub::Point::new(f32::from(win_bounds.origin.x), f32::from(win_bounds.origin.y));
 
     cx.open_window(
         WindowOptions {
-            // PopUp 窗口在 X11 上可能绕过 WM 的 strut 约束，
-            // 覆盖到系统面板区域，确保 dim 遮罩对齐屏幕顶部。
             window_bounds: Some(WindowBounds::Windowed(win_bounds)),
             window_background: WindowBackgroundAppearance::Transparent,
             titlebar: None,
@@ -4291,14 +4269,9 @@ fn open_overlay_in_app(
             ..Default::default()
         },
         move |window, cx| {
-            // 动态校正：把客户端顶移到显示区原点（GPUI 边框不对称可能放高几 px），
-            // 遮罩（帧）与桌面对齐。跨平台无需硬编码系统栏高度。
             #[cfg(target_os = "windows")]
             adjust_window_client_top(window, client_origin.y as i32);
 
-            // 根据窗口实际屏幕位置裁剪截图帧，确保截图与桌面完美对齐。
-            // WM 可能把窗口放在工作区内（不含系统面板），不裁剪会导致
-            // 截图内容与真实桌面错位，产生"重影"。
             let actual = window.bounds();
             let phys_w = screen_bounds.size.x;
             let phys_h = screen_bounds.size.y;
@@ -4319,25 +4292,9 @@ fn open_overlay_in_app(
             let view = cx.new(|cx| {
                 OverlayView::new(&clipped, logical_bounds, client_origin, scale, tx, cx)
             });
-            // 主动把焦点给到 view 自己的 focus_handle，
-            // 这样 track_focus 的 div 能收到键盘事件
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
-            // PopUp 窗口（override_redirect）在 X11 上绕过 WM 焦点管理，
-            // 必须手动 activate 才能收到键盘事件。
             window.activate_window();
-            // 必须用 gpui_component::Root 包一层：
-            // gpui-component 的 Input 在 blur 时会调
-            // `Root::update(window, cx, ...)` 去清 `focused_input`，
-            // 找不到 Root 会 panic "BUG: window first layer should be
-            // a gpui_component::Root." → 整个 GPUI 线程 panic →
-            // 覆盖窗口闪退（用户报告的"切图框消失"）。
-            // toolbar / Button 不需要 Root（它们不调 Root::update），
-            // 但 Input 需要，所以开了 Text 工具 + 点击输入框后任何
-            // blur 路径（按 Enter、点外面）都会触发 panic。
-            // bordered(false): 全屏覆盖窗口不需要 Linux CSD 窗口阴影。
-            // 默认 bordered(true) 会在元素层四周加 12px shadow padding，
-            // 导致元素层坐标和 canvas paint 的窗口坐标系之间产生偏移。
             cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
         },
     )

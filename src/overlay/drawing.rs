@@ -99,8 +99,8 @@ impl FontWeight {
     /// 选对应字体的 OTF 字节
     pub fn font_bytes(self) -> &'static [u8] {
         match self {
-            Self::Normal => include_bytes!("../../assets/fonts/NotoSansSC-Regular.otf"),
-            Self::Bold   => include_bytes!("../../assets/fonts/NotoSansSC-Bold.otf"),
+            Self::Normal => include_bytes!("../../assets/fonts/NotoSansSC-Regular-subset.otf"),
+            Self::Bold   => include_bytes!("../../assets/fonts/NotoSansSC-Bold-subset.otf"),
         }
     }
 }

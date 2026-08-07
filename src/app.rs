@@ -93,15 +93,19 @@ impl AppState {
 
     /// 触发一次截图：捕获屏幕 → 打开覆盖窗口 → 取选区 → 复制到剪贴板
     fn trigger_screenshot(&self) -> AppResult<()> {
+        let t0 = std::time::Instant::now();
         let frame = self.capture.capture_primary()?;
+        let t1 = t0.elapsed();
         let screen_bounds = Bounds::new(
             Point::ZERO,
             Point::new(frame.width as f32, frame.height as f32),
         );
-        tracing::info!("捕获到 {}x{} 帧", frame.width, frame.height);
+        tracing::info!("捕获到 {}x{} 帧 (capture={:.0}ms)", frame.width, frame.height, t1.as_millis());
 
         // GPUI 覆盖层（阻塞直到用户选完/取消；常驻应用内开窗）
         let result = self.overlay.open_overlay(frame.clone(), screen_bounds);
+        let t2 = t0.elapsed();
+        tracing::info!("overlay 打开 (overlay_open={:.0}ms total={:.0}ms)", (t2 - t1).as_millis(), t2.as_millis());
         // 滚动截屏：selection=None（会被当取消）必须先于选区分支处理
         if let Some(region) = result.scroll_region_px {
             if result.scroll_manual {
