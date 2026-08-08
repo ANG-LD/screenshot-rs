@@ -98,6 +98,7 @@ pub struct OverlayView {
 
     /// Text 工具：文字已提交，Input 仅作展示（无拖拽条、手柄、边框）
     text_input_finalized: bool,
+    text_input_rotation: f32,
 
     /// 已提交文字对应的 DrawingState.commands 中的索引，用于重新编辑时移除
     text_input_cmd_idx: Option<usize>,
@@ -166,6 +167,8 @@ enum TextDragMode {
     ResizeS,
     ResizeW,
     ResizeE,
+    /// 旋转手柄拖拽
+    Rotate,
 }
 
 /// 对已绘制命令的拖拽模式
@@ -251,6 +254,7 @@ impl OverlayView {
             text_input_rect: ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO),
             text_input_drag: None,
             text_input_finalized: false,
+            text_input_rotation: 0.0,
             text_input_cmd_idx: None,
             frame_pixels: frame.pixels.clone(),
             frame_width: frame.width,
@@ -298,7 +302,7 @@ impl OverlayView {
         );
         for (i, c) in commands.iter().enumerate() {
             match c {
-                DrawCommand::Text { anchor, content, font_size, color, weight, max_width } => {
+                DrawCommand::Text { anchor, content, font_size, color, weight, max_width, .. } => {
                     tracing::info!(
                         "cmd[{}] Text anchor=({},{}) size={} weight={:?} max_w={:?} color={:?} content={:?}",
                         i, anchor.x, anchor.y, font_size, weight, max_width, color, content
@@ -550,6 +554,7 @@ impl OverlayView {
             InputState::new(window, cx)
                 .placeholder("输入文字…（换行按 Enter，完成后点击框外）")
                 .auto_grow(3, 8)
+                .soft_wrap(false)
         });
         // 预填旧内容（重新编辑场景）
         if let Some(text) = initial {
@@ -570,7 +575,7 @@ impl OverlayView {
         //   PressEnter → 提交（push Text 命令）
         //   Blur       → 用户点击外部也提交（避免半截文字丢失）
         //   Change     → 通知重绘（输入框内容变化→重渲染）
-        cx.subscribe_in(&input, window, |_this, _state, event, _window, cx| match event {
+        cx.subscribe_in(&input, window, |this, state, event, _window, cx| match event {
             // submit_on_enter=false → Enter/Shift+Enter 都用于换行（InputState
             // 内部已插入 \n）。PressEnter 不触发 finalize，让用户继续编辑；
             // 完成输入靠 Blur：点输入框外 / 点 Finish / 点其他工具都会 Blur。
@@ -578,19 +583,25 @@ impl OverlayView {
                 cx.notify();
             }
             InputEvent::Blur => {
-                tracing::debug!("text_input Blur: popup={}", _this.toolbar.popup.is_some());
+                tracing::debug!("text_input Blur: popup={}", this.toolbar.popup.is_some());
                 // 若 popover 正打开，失焦是因为用户点击了样式选项
                 // （Bold/字号/颜色），此时不应提交文字——保留输入框
                 // 让用户继续编辑。样式按钮 handler 会更新 toolbar 属性，
                 // Input 组件下次 render 时自然应用新样式。
-                if _this.toolbar.popup.is_some() {
+                if this.toolbar.popup.is_some() {
                     return;
                 }
                 // 兜底：其他失焦场景（点输入框外、点工具栏、切工具）
                 // 把当前文字落成命令，避免丢失。
-                _this.finalize_text_input_if_active(cx);
+                this.finalize_text_input_if_active(cx);
             }
             InputEvent::Change => {
+                let value = state.read(cx).value().to_string();
+                let r = this.text_input_rect;
+                tracing::info!(
+                    "text_input Change: value={:?} box_origin=({:.1},{:.1}) box_size=({:.1},{:.1})",
+                    value, r.origin.x, r.origin.y, r.size.x, r.size.y
+                );
                 cx.notify();
             }
             InputEvent::Focus => {
@@ -628,8 +639,9 @@ impl OverlayView {
             let anchor = self.text_input_rect.origin;
             let max_w = self.text_input_rect.size.x;
             tracing::info!(
-                "finalize text: anchor=({:.1},{:.1}) rect_size=({:.1},{:.1}) fs={:.1} sf={:.1}",
-                anchor.x, anchor.y, self.text_input_rect.size.x, self.text_input_rect.size.y,
+                "finalize text: value={:?} anchor=({:.1},{:.1}) rect_size=({:.1},{:.1}) fs={:.1} sf={:.1}",
+                value.to_string(), anchor.x, anchor.y,
+                self.text_input_rect.size.x, self.text_input_rect.size.y,
                 self.toolbar.current_size, self.scale_factor
             );
             // SharedString 没有 Display impl；用 String::from 走 From<SharedString>
@@ -641,6 +653,7 @@ impl OverlayView {
                 color: self.toolbar.current_color,
                 max_width: Some(max_w),
                 weight: self.toolbar.current_weight,
+                rotation: self.text_input_rotation,
             });
             // 记录对应 DrawCommand 索引，便于重新编辑时移除。
             self.text_input_cmd_idx = Some(self.drawing.history_index - 1);
@@ -1364,6 +1377,15 @@ fn hit_test_text_drag(rect: ub::Bounds, p: BoundsPoint) -> Option<TextDragState>
         }
     }
 
+    // 旋转手柄命中检测（canvas 渲染的手柄位置：框中心上方 stalk_len 处）
+    {
+        let hx = x + w / 2.0;
+        let hy = y - 16.0; // 框上边缘外 16px = stalk_len
+        if (p.x - hx).abs() <= 10.0 && (p.y - hy).abs() <= 10.0 {
+            return Some(TextDragState { mode: TextDragMode::Rotate, start_mouse: p, start_rect: rect });
+        }
+    }
+
     // 顶部 6px 整条为 Move 拖动区（排除已被手柄命中的区域，手柄优先检测）
     if p.y >= y && p.y <= y + H && p.x >= x && p.x <= x + w {
         return Some(TextDragState {
@@ -1459,6 +1481,13 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
                 origin: start.origin,
                 size: BoundsPoint::new(new_w, new_h),
             }
+        }
+        TextDragMode::Rotate => {
+            let cx = start.origin.x + start.size.x / 2.0;
+            let cy = start.origin.y + start.size.y / 2.0;
+            let angle = (p.y - cy).atan2(p.x - cx);
+            this.text_input_rotation = angle.to_degrees().rem_euclid(360.0);
+            start
         }
     };
     this.text_input_rect = new_rect.clamp_inside(this.selection.current().unwrap_or(this.screen_bounds));
@@ -1689,7 +1718,7 @@ fn scale_draw_command(cmd: DrawCommand, sx: f32, sy: f32) -> DrawCommand {
             color,
             line_width,
         },
-        DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+        DrawCommand::Text { anchor, content, font_size, color, max_width, weight, rotation } => {
             DrawCommand::Text {
                 anchor: sp(anchor),
                 content,
@@ -1697,6 +1726,7 @@ fn scale_draw_command(cmd: DrawCommand, sx: f32, sy: f32) -> DrawCommand {
                 color,
                 max_width: max_width.map(|w| w * sx),
                 weight,
+                rotation,
             }
         }
         DrawCommand::Mosaic { regions, block_size, color } => DrawCommand::Mosaic {
@@ -2023,14 +2053,30 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 paint_thick_line(w[0].x, w[0].y, w[1].x, w[1].y, *line_width, *color, window);
             }
         }
-        DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+        DrawCommand::Text { anchor, content, font_size, color, max_width, weight, rotation } => {
+                // 有旋转角 → 走 paint_drawing_layer 离屏渲染
+                if *rotation != 0.0 { return; }
                 let fs = *font_size / scale_factor;
-                // 行盒必须随字号缩放：GPUI paint_line 会把文字裁剪到 line_height 高的
-                // 图层里，若行盒 < 字体的 ascent+descent（CJK 约 1.45em），大字号第一行
-                // 顶部会被截断。1.5 倍能容纳 Noto Sans CJK SC 的完整字形。
+                // 行盒必须随字号缩放，避免 paint_layer 高度 < asc+descent 时字形被裁剪。
                 let line_height = px(fs * 1.5);
-                let origin_x = window.pixel_snap(px(anchor.x + TO_X));
-                let mut origin_y = window.pixel_snap(px(anchor.y + TO_Y));
+                // 编辑态 Input 的文字行盒高是 window.line_height()（≈1.5×窗口默认字号 16px，
+                // 与输入字号无关），字形相对行盒顶偏移 (lh_in-asc-desc)/2。paint 的行盒是
+                // fs*1.5，字形偏移 (lh_paint-asc-desc)/2。要让两者字形顶重合，需把 paint
+                // 起点上移 (lh_paint-lh_in)/2，否则提交后文字会整体下移。
+                let input_lh = window.line_height();
+                let origin_fx = anchor.x + TO_X;
+                // 基准点用 box+7 而非 TO_Y(8)：编辑态文字行盒顶实测在 anchor.y+7
+                // （6px 拖动条 + 1px 内边距），用 8 会让提交后文字整体下移 1px。
+                let origin_fy = anchor.y + TO_Y - 1.0;
+                let origin_x = window.pixel_snap(px(origin_fx));
+                // 先对 box 基准点做像素对齐（与 Input 所在 box 的整块栅格化一致），
+                // 再叠加行高偏移，避免偏移非整数时 pixel_snap 单独取整导致错位。
+                let mut origin_y = window.pixel_snap(px(origin_fy))
+                    + px((input_lh - line_height).as_f32() / 2.0);
+                tracing::info!(
+                    "render Text paint: anchor=({:.1},{:.1}) origin=({:.1},{:.1}) content={:?} fs={:.1} max_w={:?}",
+                    anchor.x, anchor.y, origin_fx, origin_fy, content, *font_size, *max_width
+                );
 
                 let mut base_run = window.text_style().to_run(0);
                 base_run.font.family = gpui::SharedString::from(crate::overlay::font::TEXT_FONT_FAMILY);
@@ -2039,6 +2085,9 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                     base_run.font.weight = gpui::FontWeight::BOLD;
                 }
 
+                // 只把 max_width 传给 paint 作对齐宽度（TextAlign::Left 下无效）。
+                // 不能传 force_width 给 shape_line：GPUI 会把超出宽度的字形按
+                // glyph_index*force_width 重排，文本宽于框时中间出现整段空隙（"文字分开"）。
                 let force_width = max_width.map(|mw| px(mw));
 
                 for line_text in content.split('\n') {
@@ -2053,7 +2102,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                         gpui::SharedString::from(line_text),
                         px(fs),
                         &[run],
-                        force_width,
+                        None,
                     );
 
                     let _ = shaped.paint(
@@ -2358,10 +2407,17 @@ impl Render for OverlayView {
         let ocr_rect = self.ocr_rect;
         let ocr_dragging = self.ocr_drag_start.is_some();
         let dim_opacity = self.dim_opacity;
+        let text_editing = self.text_input.is_some() && self.mode == OverlayMode::Editing;
+        let text_edit_rect = self.text_input_rect;
+        let text_edit_rot = self.text_input_rotation;
+        let text_content: String = self.text_input.as_ref().map(|i| i.read(cx).value().to_string()).unwrap_or_default();
+        let text_color = self.toolbar.current_color;
+        let text_size = self.toolbar.current_size;
+        let text_weight = self.toolbar.current_weight;
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
-            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, text_editing, text_edit_rect, text_edit_rot, text_content, text_color, text_size, text_weight),
+            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, editing, edit_rect, edit_rot, txt, txt_color, txt_size, txt_weight), window, cx| {
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
@@ -2477,6 +2533,133 @@ impl Render for OverlayView {
                         }
                     }
                     paint_drawing_layer(&visible_cmds, in_progress.as_ref(), scale_factor, window);
+
+                    // 旋转预览（编辑文字且角度非零时，canvas 离屏渲染旋转文字+框+手柄）
+                    if editing && edit_rot != 0.0 && !txt.is_empty() {
+                        let r = edit_rect;
+
+                        // 1. 测量未旋转文字字形物理尺寸与中心偏移（不限制宽度=不自动换行）
+                        let (tw_px, th_px, cx_off, cy_off) =
+                            crate::overlay::commands::measure_text_px(
+                                &txt, txt_size, None, txt_weight,
+                            );
+
+                        // 2. 计算旋转后包围盒（与 rasterize_text 内部 cx/cy 对齐）
+                        let (rw_px, rh_px) =
+                            crate::overlay::commands::rotated_box_size(tw_px, th_px, edit_rot);
+                        let phys_w = rw_px as u32;
+                        let phys_h = rh_px as u32;
+
+                        if phys_w > 0 && phys_h > 0 && tw_px > 0.0 && th_px > 0.0 {
+                            // 锚点让字形中心 = 帧中心 → 360° 精确重合
+                            let anchor_x = phys_w as f32 / 2.0 - cx_off;
+                            let anchor_y = phys_h as f32 / 2.0 - cy_off;
+
+                            let mut frame = CapturedFrame {
+                                width: phys_w,
+                                height: phys_h,
+                                pixels: vec![0; (phys_w * phys_h * 4) as usize],
+                            };
+                            let _ = crate::overlay::commands::rasterize_text(
+                                &mut frame,
+                                (anchor_x, anchor_y),
+                                &txt,
+                                txt_size,
+                                txt_color,
+                                None,
+                                txt_weight,
+                                edit_rot,
+                            );
+                            let mut raw_px = frame.pixels;
+                            rgba_to_bgra(&mut raw_px);
+                            if let Some(buf) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+                                phys_w, phys_h, raw_px,
+                            ) {
+                                let img = Arc::new(RenderImage::new(SmallVec::from_elem(
+                                    image::Frame::new(buf),
+                                    1,
+                                )));
+                                // 图像居中于原 text box 中心
+                                let img_w = phys_w as f32 / scale_factor;
+                                let img_h = phys_h as f32 / scale_factor;
+                                let img_x = r.origin.x + r.size.x / 2.0 - img_w / 2.0;
+                                let img_y = r.origin.y + r.size.y / 2.0 - img_h / 2.0;
+                                let _ = window.paint_image(
+                                    Bounds {
+                                        origin: point(px(img_x), px(img_y)),
+                                        size: Size::new(px(img_w), px(img_h)),
+                                    },
+                                    Default::default(),
+                                    img,
+                                    0,
+                                    false,
+                                );
+                            }
+                        }
+
+                        // 旋转框线与手柄基于原始 text box（保持与拖拽交互一致）
+                        let cx = r.origin.x + r.size.x / 2.0;
+                        let cy = r.origin.y + r.size.y / 2.0;
+                        let hw = r.size.x / 2.0;
+                        let hh = r.size.y / 2.0;
+                        let angle = edit_rot * std::f32::consts::PI / 180.0;
+                        let (sin_a, cos_a) = angle.sin_cos();
+                        let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
+                        let rc: Vec<(f32, f32)> = corners
+                            .iter()
+                            .map(|&(rx, ry)| {
+                                (
+                                    cx + rx * cos_a - ry * sin_a,
+                                    cy + rx * sin_a + ry * cos_a,
+                                )
+                            })
+                            .collect();
+                        let oc = RGBA::new(0x00, 0x66, 0xCC, 0x88);
+                        for k in 0..4 {
+                            paint_thick_line(
+                                rc[k].0,
+                                rc[k].1,
+                                rc[(k + 1) % 4].0,
+                                rc[(k + 1) % 4].1,
+                                2.0,
+                                oc,
+                                window,
+                            );
+                        }
+                        // 柄线+手柄
+                        let stalk = 18.0;
+                        let hx = cx + sin_a * (hh + stalk);
+                        let hy = cy - cos_a * (hh + stalk);
+                        let top_x = cx + sin_a * hh;
+                        let top_y = cy - cos_a * hh;
+                        paint_thick_line(
+                            top_x, top_y, hx, hy, 2.0,
+                            RGBA::new(0x00, 0x66, 0xCC, 0xCC),
+                            window,
+                        );
+                        const HR: f32 = 6.0;
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: point(px(hx - HR), px(hy - HR)),
+                                size: Size::new(px(HR * 2.0), px(HR * 2.0)),
+                            },
+                            px(HR),
+                            Hsla::from(rgba(0xFFFFFFFF)),
+                            px(2.0),
+                            Hsla::from(rgba(0x0066CCFF)),
+                            Default::default(),
+                        ));
+                    } else if editing {
+                        // 无旋转时也画简易手柄指示器
+                        let r = edit_rect;
+                        let cx = r.origin.x + r.size.x / 2.0;
+                        let hy = r.origin.y - 14.0;
+                        const HR: f32 = 5.0;
+                        window.paint_quad(quad(
+                            Bounds { origin: point(px(cx-HR), px(hy-HR)), size: Size::new(px(HR*2.0), px(HR*2.0)) },
+                            px(HR), Hsla::from(rgba(0xFFFFFF88)), px(1.5), Hsla::from(rgba(0x0066CC88)), Default::default(),
+                        ));
+                    }
 
                     // 2.55) OCR 框选矩形（高亮半透明 + 绿色描边）
                     if let Some(ocr) = ocr_rect {
@@ -2653,10 +2836,61 @@ impl Render for OverlayView {
 
         // 渲染活动文字输入（gpui-component Input，自带 IME 支持）
         // text_input_rect 存储逻辑像素（与 GPUI 坐标系一致），直接用 px() 做 CSS 定位。
-        // 多行模式（auto_grow）：输入内容超过 max_rows 后内部滚动。
-        // 不用 .small() —— single-line 模式下高度被钉死在 h_6=24px，
-        // multi_line 自动调 h_auto()，垂直 padding 由 input_py 控制；视觉比 small 更宽松。
+        // 不传 max_width → 不自动换行，仅手动 Enter 换行；宽度在 render 前测量。
         if let Some(ref input) = self.text_input {
+            // 先测量文字尺寸，更新 text_input_rect 后再渲染，避免宽度不足导致换行
+            if !self.text_input_finalized {
+                let value: String = input.read(cx).value().to_string();
+                if !value.is_empty() {
+                    let sf = self.scale_factor;
+                    let fs = self.toolbar.current_size;
+                    let weight = self.toolbar.current_weight;
+                    let (_tw_px, th_px, _, _) =
+                        crate::overlay::commands::measure_text_px(&value, fs, None, weight);
+                    // 宽度必须用真实行宽 advance（光标能到的右边界），不能用字形包围盒：
+                    // 包围盒对 CJK 会低估（ink≈0.78×advance），导致长文本下光标贴近右缘时
+                    // 编辑器产生负 scroll_offset 把整行文字左移，首字被 overflow_hidden 裁掉。
+                    let adv_px =
+                        crate::overlay::commands::measure_line_advance_px(&value, fs, weight);
+                    // Input 实际内边距：1px border + 8px padding，每侧 9px 共 18px；
+                    // 再留 10px 右缘（RIGHT_MARGIN），使 content = adv + 10 ≥ adv，不触发左滚。
+                    const INSET_X: f32 = 18.0;
+                    const RIGHT_MARGIN: f32 = 10.0;
+                    const MIN_W: f32 = 100.0;
+                    const MIN_H: f32 = 40.0;
+                    let new_w = if adv_px > 0.0 {
+                        (adv_px / sf + INSET_X + RIGHT_MARGIN).max(MIN_W)
+                    } else {
+                        MIN_W
+                    };
+                    let new_h = if th_px > 0.0 {
+                        (th_px / sf + TO_Y * 2.0).max(MIN_H)
+                    } else {
+                        MIN_H
+                    };
+                    let old_w = self.text_input_rect.size.x;
+                    let old_h = self.text_input_rect.size.y;
+                    self.text_input_rect.size = BoundsPoint::new(new_w, new_h);
+                    // 诊断「自动扩增时文字左移」：content 宽度 vs 行宽 advance。
+                    // 若 content - RIGHT_MARGIN < adv_px，光标贴近右缘时编辑器会
+                    // 产生负 scroll_offset 把整行左移（首字被 overflow_hidden 裁掉）。
+                    let content_w = new_w - INSET_X;
+                    let scroll = if content_w - RIGHT_MARGIN < adv_px {
+                        content_w - RIGHT_MARGIN - adv_px
+                    } else {
+                        0.0
+                    };
+                    if (old_w - new_w).abs() > 0.01 || (old_h - new_h).abs() > 0.01 {
+                        tracing::info!(
+                            "textbox auto-grow: value={:?} fs={:.1} sf={:.1} th_px={:.1} adv_px={:.1} box=({:.1},{:.1})->({:.1},{:.1}) content={:.1} scroll={:+.1}px",
+                            value, fs, sf, th_px, adv_px,
+                            old_w, old_h, new_w, new_h,
+                            content_w, scroll
+                        );
+                    }
+                }
+            }
+
             let rect = self.text_input_rect;
             let (lx, ly, lw, lh) = (rect.origin.x, rect.origin.y, rect.size.x, rect.size.y);
 
@@ -2709,6 +2943,9 @@ impl Render for OverlayView {
                 let h_cy = lh / 2.0 - hh;
                 let h_r = lw - h_size;
                 let h_b = lh - h_size;
+                let rotated = self.text_input_rotation != 0.0;
+                // 旋转时 canvas 负责所有视觉，元素树 Input 透明（仅用于键盘输入）
+                let tc = if rotated { gpui::rgba(0x00000000) } else { gpui::rgba(rgba_u32(self.toolbar.current_color)) };
                 root = root.child(
                     div()
                         .absolute()
@@ -2716,10 +2953,11 @@ impl Render for OverlayView {
                         .left(px(lx))
                         .w(px(lw))
                         .h(px(lh))
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
-                        .child(
-                            // 顶部拖动 bar
+                        .when(!rotated, |d| d.child(
+                            // 顶部拖动 bar（仅非旋转时显示）
                             div()
                                 .id("text-drag-bar")
                                 .w_full()
@@ -2727,7 +2965,7 @@ impl Render for OverlayView {
                                 .bg(gpui::rgba(0x4A4A4AEE))
                                 .rounded_t_md()
                                 .cursor_move(),
-                        )
+                        ))
                         .child(
                             div()
                                 .relative()
@@ -2735,8 +2973,8 @@ impl Render for OverlayView {
                                 .child(
                                     gpui_component::input::Input::new(input)
                                         .appearance(false)
-                                        .bordered(true)
-                                        .text_color(gpui::rgba(rgba_u32(self.toolbar.current_color)))
+                                        .bordered(!rotated)
+                                        .text_color(tc)
                                         .with_size(gpui_component::Size::Size(gpui::px(
                                             self.toolbar.current_size / 0.875 / self.scale_factor,
                                         )))
@@ -2747,19 +2985,19 @@ impl Render for OverlayView {
                                         .font_family(gpui::SharedString::from(
                                             crate::overlay::font::TEXT_FONT_FAMILY,
                                         ))
-                                        // 行盒随字号缩放，避免大字号时编辑器把第一行顶部裁掉
                                         .line_height(gpui::relative(1.5)),
                                 ),
                         )
-                        // 8 个 resize 手柄（相对于 outer div，覆盖全框四边）
-                        .child(make_resize_handle("text-resize-nw", 0.0, 0.0, TextDragMode::ResizeNW))
-                        .child(make_resize_handle("text-resize-n", h_cx, 0.0, TextDragMode::ResizeN))
-                        .child(make_resize_handle("text-resize-ne", h_r, 0.0, TextDragMode::ResizeNE))
-                        .child(make_resize_handle("text-resize-w", 0.0, h_cy, TextDragMode::ResizeW))
-                        .child(make_resize_handle("text-resize-e", h_r, h_cy, TextDragMode::ResizeE))
-                        .child(make_resize_handle("text-resize-sw", 0.0, h_b, TextDragMode::ResizeSW))
-                        .child(make_resize_handle("text-resize-s", h_cx, h_b, TextDragMode::ResizeS))
-                        .child(make_resize_handle("text-resize-se", h_r, h_b, TextDragMode::ResizeSE)),
+                        .when(!rotated, |d| d
+                            .child(make_resize_handle("text-resize-nw", 0.0, 0.0, TextDragMode::ResizeNW))
+                            .child(make_resize_handle("text-resize-n", h_cx, 0.0, TextDragMode::ResizeN))
+                            .child(make_resize_handle("text-resize-ne", h_r, 0.0, TextDragMode::ResizeNE))
+                            .child(make_resize_handle("text-resize-w", 0.0, h_cy, TextDragMode::ResizeW))
+                            .child(make_resize_handle("text-resize-e", h_r, h_cy, TextDragMode::ResizeE))
+                            .child(make_resize_handle("text-resize-sw", 0.0, h_b, TextDragMode::ResizeSW))
+                            .child(make_resize_handle("text-resize-s", h_cx, h_b, TextDragMode::ResizeS))
+                            .child(make_resize_handle("text-resize-se", h_r, h_b, TextDragMode::ResizeSE)),
+                        ),
                 );
             }
         }
@@ -2990,7 +3228,7 @@ impl Render for OverlayView {
                                 let mut edit = None;
                                 for (idx, cmd) in visible.iter().rev() {
                                     if hit_test_text_cmd(cmd, p) {
-                                        if let DrawCommand::Text { anchor, content, font_size, max_width, weight, color } = cmd {
+                                        if let DrawCommand::Text { anchor, content, font_size, max_width, weight, color, .. } = cmd {
                                             edit = Some((*idx, BoundsPoint::new(anchor.x, anchor.y), content.clone(), *font_size, *max_width, *weight, *color));
                                         }
                                         break;

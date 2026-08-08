@@ -40,6 +40,7 @@ pub fn rasterize_text(
     color: RGBA,
     max_width: Option<f32>,
     weight: FontWeight,
+    rotation: f32,
 ) -> AppResult<()> {
     if content.is_empty() || font_size <= 0.0 {
         return Ok(());
@@ -76,6 +77,25 @@ pub fn rasterize_text(
         out
     });
 
+    // 阶段 1.5：计算文字包围盒中心（用于旋转）
+    let (cx, cy, cos, sin) = if rotation != 0.0 {
+        let angle = rotation * std::f32::consts::PI / 180.0;
+        let (s, c) = angle.sin_cos();
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for &(gx, gy, _) in &physical_glyphs {
+            min_x = min_x.min(anchor_x + gx);
+            min_y = min_y.min(anchor_y + gy);
+            max_x = max_x.max(anchor_x + gx);
+            max_y = max_y.max(anchor_y + gy);
+        }
+        ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, c, s)
+    } else {
+        (0.0, 0.0, 1.0, 0.0)
+    };
+
     // 阶段 2：rasterize。每个 glyph 单独进入 swash_cache；为避开
     // 同时借用 font_system + swash_cache 两个 RefCell 的问题，
     // swash_cache 闭包内再开一个 with_font_system（不同 thread_local，无重叠）。
@@ -84,10 +104,16 @@ pub fn rasterize_text(
             with_font_system(|fs| swash.get_image(fs, cache_key).as_ref().cloned())
         });
         let Some(mask) = mask_opt else {
-            // 字体无法栅格化该 glyph（极少见：缺字形、emoji、彩色位图等），静默跳过
             continue;
         };
-        blend_mask_to_frame(frame, &mask, anchor_x + gx, anchor_y + gy, color);
+        let (px, py) = if rotation != 0.0 {
+            let rx = anchor_x + gx - cx;
+            let ry = anchor_y + gy - cy;
+            (cx + rx * cos - ry * sin, cy + rx * sin + ry * cos)
+        } else {
+            (anchor_x + gx, anchor_y + gy)
+        };
+        blend_mask_to_frame(frame, &mask, px, py, color);
     }
     Ok(())
 }
@@ -156,6 +182,110 @@ fn blend_pixel_with_text_mask(dst: &mut [u8], text_color: RGBA, mask_a: u32) {
         dst[i] = ((s * eff_a + d * inv) / 255) as u8;
     }
     dst[3] = eff_a.max(dst[3] as u32) as u8;
+}
+
+/// 测量文字在物理像素下的（未旋转）字形度量。
+///
+/// 返回 `(width, height, cx_off, cy_off)`，其中 `cx_off/cy_off`
+/// 是字形原点包围盒中心到 anchor (0,0) 的偏移量。
+pub fn measure_text_px(
+    content: &str,
+    font_size: f32,
+    max_width: Option<f32>,
+    weight: FontWeight,
+) -> (f32, f32, f32, f32) {
+    if content.is_empty() || font_size <= 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let weight_attr = if weight == FontWeight::Normal {
+        Weight::NORMAL
+    } else {
+        Weight::BOLD
+    };
+    let max_w = max_width.filter(|&w| w > 0.0);
+    with_font_system(|font_system| {
+        let metrics = Metrics::new(font_size, font_size * 1.4);
+        let mut buffer = Buffer::new(font_system, metrics);
+        let attrs = Attrs::new()
+            .family(Family::Name(TEXT_FONT_FAMILY))
+            .weight(weight_attr);
+        buffer.set_text(content, &attrs, Shaping::Advanced, None);
+        buffer.set_size(max_w, None);
+        buffer.shape_until_scroll(font_system, false);
+
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = 0.0_f32;
+        let mut max_y = 0.0_f32;
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let phys = glyph.physical((0.0, run.line_y), 1.0);
+                min_x = min_x.min(phys.x as f32);
+                min_y = min_y.min(phys.y as f32);
+                max_x = max_x.max(phys.x as f32);
+                max_y = max_y.max(phys.y as f32);
+            }
+        }
+        if min_x > max_x {
+            return (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+        }
+        // 字形原点包围盒
+        let tw = (max_x - min_x).ceil();
+        let th = (max_y - min_y).ceil();
+        let cx = (min_x + max_x) / 2.0;
+        let cy = (min_y + max_y) / 2.0;
+        // 加单字形余量：字形光栅可能超出原点，旋转后尤其需要
+        (tw + font_size, th + font_size * 0.5, cx, cy)
+    })
+}
+
+/// 测量文字在物理像素下的**行宽 advance**（所有 layout run 的最大 line_w）。
+///
+/// 与 `measure_text_px` 的字形包围盒宽度不同，这里返回的是 cosmic-text 排版
+/// 的实际行进宽度（每个字形 advance 之和），等于光标能到达的右边界。编辑框
+/// 自动扩增宽度必须 >= 此值，否则光标贴近右缘时编辑器会产生负 scroll_offset
+/// 把整行文字左移（见 gpui-component input/element.rs layout_cursor）。
+pub fn measure_line_advance_px(
+    content: &str,
+    font_size: f32,
+    weight: FontWeight,
+) -> f32 {
+    if content.is_empty() || font_size <= 0.0 {
+        return 0.0;
+    }
+    let weight_attr = if weight == FontWeight::Normal {
+        Weight::NORMAL
+    } else {
+        Weight::BOLD
+    };
+    with_font_system(|font_system| {
+        let metrics = Metrics::new(font_size, font_size * 1.4);
+        let mut buffer = Buffer::new(font_system, metrics);
+        let attrs = Attrs::new()
+            .family(Family::Name(TEXT_FONT_FAMILY))
+            .weight(weight_attr);
+        buffer.set_text(content, &attrs, Shaping::Advanced, None);
+        buffer.set_size(None, None);
+        buffer.shape_until_scroll(font_system, false);
+
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0_f32, f32::max)
+    })
+}
+
+/// 计算物理像素包围盒旋转后的尺寸（与 demo 中逻辑一致，对 360° 做浮点修正）
+pub fn rotated_box_size(w: f32, h: f32, angle_deg: f32) -> (f32, f32) {
+    let rad = angle_deg * std::f32::consts::PI / 180.0;
+    let (mut sin, mut cos) = rad.sin_cos();
+    if sin.abs() < 1e-6 { sin = 0.0; }
+    if cos.abs() < 1e-6 { cos = 0.0; }
+    if (sin.abs() - 1.0).abs() < 1e-6 { sin = sin.signum(); }
+    if (cos.abs() - 1.0).abs() < 1e-6 { cos = cos.signum(); }
+    let rw = (w * cos).abs() + (h * sin).abs();
+    let rh = (w * sin).abs() + (h * cos).abs();
+    (rw.ceil().max(4.0), rh.ceil().max(4.0))
 }
 
 /// 把 commands 列表应用到 frame 的指定子区域
@@ -233,13 +363,13 @@ pub fn apply_commands(
                     draw_thick_line(frame, p1.0, p1.1, p2.0, p2.1, *line_width, *color)?;
                 }
             }
-            DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+            DrawCommand::Text { anchor, content, font_size, color, max_width, weight, rotation } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
                 tracing::info!(
-                    "apply_commands Text: local_anchor=({}, {}) content={:?} size={} weight={:?} max_width={:?}",
-                    a.0, a.1, content, font_size, weight, max_width
+                    "apply_commands Text: local_anchor=({}, {}) content={:?} size={} weight={:?} max_width={:?} rotation={}",
+                    a.0, a.1, content, font_size, weight, max_width, rotation
                 );
-                rasterize_text(frame, a, content, *font_size, *color, *max_width, *weight)?;
+                rasterize_text(frame, a, content, *font_size, *color, *max_width, *weight, *rotation)?;
                 tracing::info!("apply_commands Text: rasterize_text done");
             }
         }
@@ -857,7 +987,7 @@ mod tests {
         let mut f = empty_frame(50, 30);
         let baseline = f.pixels.clone();
         rasterize_text(
-            &mut f, (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal,
+            &mut f, (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
         )
         .unwrap();
         assert_eq!(f.pixels, baseline, "空 content 不能改 frame");
@@ -867,7 +997,7 @@ mod tests {
     fn rasterize_text_out_of_frame_anchor_does_not_panic() {
         let mut f = empty_frame(20, 20);
         rasterize_text(
-            &mut f, (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal,
+            &mut f, (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
         )
         .unwrap();
         assert_eq!(f.width, 20);
@@ -884,7 +1014,7 @@ mod tests {
             32.0,
             RGBA::new(0xFF, 0x00, 0x00, 0xFF),
             None,
-            FontWeight::Normal,
+            FontWeight::Normal, 0.0,
         )
         .unwrap();
         let non_zero = f.pixels.iter().filter(|&&p| p != 0).count();
@@ -906,7 +1036,7 @@ mod tests {
             24.0,
             RGBA::RED,
             Some(50.0),
-            FontWeight::Normal,
+            FontWeight::Normal, 0.0,
         )
         .unwrap();
         // 60 字 / 50px 约每行 5-6 字 → 应至少跑出 3 行
@@ -921,11 +1051,11 @@ mod tests {
         let mut normal = empty_frame(120, 60);
         let mut bold = empty_frame(120, 60);
         rasterize_text(
-            &mut normal, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal,
+            &mut normal, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal, 0.0,
         )
         .unwrap();
         rasterize_text(
-            &mut bold, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold,
+            &mut bold, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold, 0.0,
         )
         .unwrap();
         let diff = normal
