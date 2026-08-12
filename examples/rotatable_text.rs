@@ -169,6 +169,7 @@ impl RotatableTextDemo {
         let _ = rasterize_text(
             &mut probe_frame,
             (probe_anchor_x, probe_anchor_y),
+            (probe_anchor_x, probe_anchor_y),
             &content,
             fs,
             color,
@@ -205,6 +206,7 @@ impl RotatableTextDemo {
         let _ = rasterize_text(
             &mut frame,
             (anchor_x, anchor_y),
+            (frame_w as f32 / 2.0, frame_h as f32 / 2.0),
             &content,
             fs,
             color,

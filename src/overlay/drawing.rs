@@ -76,8 +76,6 @@ pub enum DrawCommand {
         color: RGBA,
         max_width: Option<f32>,
         weight: FontWeight,
-        /// 旋转角度（度），0 = 水平，逆时针
-        rotation: f32,
     },
     /// 马赛克画笔：沿鼠标轨迹的多个方块，每个方块内像素被 block_size 像素化
     Mosaic {

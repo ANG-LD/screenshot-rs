@@ -35,6 +35,7 @@ use image::imageops::FilterType;
 pub fn rasterize_text(
     frame: &mut CapturedFrame,
     anchor: (f32, f32),
+    pivot: (f32, f32),
     content: &str,
     font_size: f32,
     color: RGBA,
@@ -77,21 +78,11 @@ pub fn rasterize_text(
         out
     });
 
-    // 阶段 1.5：计算文字包围盒中心（用于旋转）
+    // 阶段 1.5：旋转中心 = 传入的 pivot（文本框中心），与旋转框保持一致
     let (cx, cy, cos, sin) = if rotation != 0.0 {
         let angle = rotation * std::f32::consts::PI / 180.0;
         let (s, c) = angle.sin_cos();
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-        for &(gx, gy, _) in &physical_glyphs {
-            min_x = min_x.min(anchor_x + gx);
-            min_y = min_y.min(anchor_y + gy);
-            max_x = max_x.max(anchor_x + gx);
-            max_y = max_y.max(anchor_y + gy);
-        }
-        ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, c, s)
+        (pivot.0, pivot.1, c, s)
     } else {
         (0.0, 0.0, 1.0, 0.0)
     };
@@ -363,13 +354,14 @@ pub fn apply_commands(
                     draw_thick_line(frame, p1.0, p1.1, p2.0, p2.1, *line_width, *color)?;
                 }
             }
-            DrawCommand::Text { anchor, content, font_size, color, max_width, weight, rotation } => {
+            DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
                 tracing::info!(
-                    "apply_commands Text: local_anchor=({}, {}) content={:?} size={} weight={:?} max_width={:?} rotation={}",
-                    a.0, a.1, content, font_size, weight, max_width, rotation
+                    "apply_commands Text: local_anchor=({}, {}) content={:?} size={} weight={:?} max_width={:?}",
+                    a.0, a.1, content, font_size, weight, max_width
                 );
-                rasterize_text(frame, a, content, *font_size, *color, *max_width, *weight, *rotation)?;
+                // 应用层暂不支持文字旋转，固定 0 度（pivot 传 anchor，旋转分支不生效）
+                rasterize_text(frame, a, a, content, *font_size, *color, *max_width, *weight, 0.0)?;
                 tracing::info!("apply_commands Text: rasterize_text done");
             }
         }
@@ -987,7 +979,7 @@ mod tests {
         let mut f = empty_frame(50, 30);
         let baseline = f.pixels.clone();
         rasterize_text(
-            &mut f, (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            &mut f, (0.0, 0.0), (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
         )
         .unwrap();
         assert_eq!(f.pixels, baseline, "空 content 不能改 frame");
@@ -997,7 +989,7 @@ mod tests {
     fn rasterize_text_out_of_frame_anchor_does_not_panic() {
         let mut f = empty_frame(20, 20);
         rasterize_text(
-            &mut f, (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            &mut f, (-100.0, -100.0), (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
         )
         .unwrap();
         assert_eq!(f.width, 20);
@@ -1009,6 +1001,7 @@ mod tests {
         let mut f = empty_frame(200, 60);
         rasterize_text(
             &mut f,
+            (10.0, 10.0),
             (10.0, 10.0),
             "Hi 你好",
             32.0,
@@ -1032,6 +1025,7 @@ mod tests {
         rasterize_text(
             &mut f,
             (0.0, 0.0),
+            (0.0, 0.0),
             &content,
             24.0,
             RGBA::RED,
@@ -1051,11 +1045,11 @@ mod tests {
         let mut normal = empty_frame(120, 60);
         let mut bold = empty_frame(120, 60);
         rasterize_text(
-            &mut normal, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            &mut normal, (10.0, 10.0), (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal, 0.0,
         )
         .unwrap();
         rasterize_text(
-            &mut bold, (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold, 0.0,
+            &mut bold, (10.0, 10.0), (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold, 0.0,
         )
         .unwrap();
         let diff = normal
