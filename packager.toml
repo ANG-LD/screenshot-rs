@@ -1,0 +1,50 @@
+name = "screenshot-rs"
+product-name = "Screenshot RS"
+version = "0.1.0"
+identifier = "com.screenshot-rs.screenshot-rs"
+description = "Cross-platform screenshot tool built with GPUI"
+homepage = "https://github.com/ANG-LD/screenshot-rs"
+authors = ["Lidong yang <735615901@qq.com>"]
+publisher = "Lidong yang <735615901@qq.com>"
+license-file = "LICENSE"
+copyright = "Copyright 2026 screenshot-rs team"
+category = "GraphicsAndDesign"
+
+icons = [
+    "assets/icons/app-128.png",
+    "assets/icons/app-256.png",
+    "assets/icons/screenshot-rs.ico",
+    "assets/icons/screenshot-rs.icns",
+]
+
+out-dir = "./dist"
+before-packaging-command = "cargo build --release"
+binaries = [{ path = "screenshot-rs", main = true }]
+binaries-dir = "target/release"
+
+[linux]
+generate-desktop-entry = true
+
+# 运行库依赖按 ldd 结果整理；GTK 会传递拉入大部分图形栈（cairo/pango/harfbuzz/X11/Wayland），
+# 这里只显式列出非 GTK 传递覆盖的独立库。
+[deb]
+depends = ["libc6", "libgtk-3-0", "libglib2.0-0", "libx11-6", "libxdo3", "libxtst6", "libwayland-client0", "libayatana-appindicator3-1"]
+section = "graphics"
+priority = "optional"
+
+[appimage]
+# 托盘 dlopen 加载 libayatana-appindicator，linuxdeploy 按 ldd 依赖扫描不会自动打包，
+# 需要显式指定，否则 AppImage 里托盘不显示。
+libs = ["libayatana-appindicator3.so.1"]
+
+[appimage.linuxdeploy-plugins]
+gtk = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
+
+[nsis]
+installer-mode = "currentUser"
+
+[macos]
+minimum-system-version = "10.15"
+
+[dmg]
+# 无额外配置，cargo-packager 用 hdiutil 生成标准只读 DMG

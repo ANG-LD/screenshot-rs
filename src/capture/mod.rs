@@ -1,8 +1,9 @@
 //! 屏幕捕获模块：定义跨平台 trait 和数据结构。
 //!
-//! 平台实现见 `windows.rs` 和 `linux.rs`。
+//! 平台实现见 `windows.rs`、`linux.rs` 和 `macos.rs`。
 
 pub mod linux;
+pub mod macos;
 pub mod windows;
 
 use crate::error::{AppError, AppResult};
@@ -70,6 +71,9 @@ pub use windows::PlatformScreenCapture;
 #[cfg(target_os = "linux")]
 pub use linux::PlatformScreenCapture;
 
+#[cfg(target_os = "macos")]
+pub use macos::PlatformScreenCapture;
+
 /// 根据当前平台返回默认实现
 pub fn platform_capture() -> Box<dyn ScreenCapture> {
     #[cfg(target_os = "windows")]
@@ -79,5 +83,9 @@ pub fn platform_capture() -> Box<dyn ScreenCapture> {
     #[cfg(target_os = "linux")]
     {
         Box::new(linux::PlatformScreenCapture::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::PlatformScreenCapture::new())
     }
 }

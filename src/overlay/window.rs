@@ -548,7 +548,7 @@ impl OverlayView {
 
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("输入文字…（换行按 Enter，完成后点击框外）")
+                .placeholder("")
                 .auto_grow(3, 8)
                 .soft_wrap(false)
         });

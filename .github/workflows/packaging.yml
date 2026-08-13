@@ -1,0 +1,112 @@
+name: Packaging
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libx11-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxtst-dev \
+            libxcursor-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libx11-xcb-dev \
+            libxext-dev \
+            libfontconfig-dev \
+            libegl-dev \
+            libgles-dev \
+            libgl-dev \
+            libpng-dev \
+            libjpeg-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        # 固定版本，保证与本地验证过的 packager.toml 配置兼容
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package deb + appimage
+        run: cargo packager -c packager.toml -f deb,appimage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-rs-linux
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+
+  windows-nsis:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package nsis
+        run: cargo packager -c packager.toml -f nsis
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-rs-nsis
+          path: dist/*.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package app + dmg
+        run: cargo packager -c packager.toml -f app,dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-rs-macos
+          path: |
+            dist/*.dmg
+            dist/*.app
