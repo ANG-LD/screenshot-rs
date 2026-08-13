@@ -113,11 +113,4 @@ impl HotkeyService {
     pub fn try_recv(&self) -> Option<HotkeyEvent> {
         self.event_rx.try_recv().ok()
     }
-
-    /// 阻塞接收下一个热键事件
-    ///
-    /// 若监听线程已结束（通道断开），返回 `None`。
-    pub fn recv(&self) -> Option<HotkeyEvent> {
-        self.event_rx.recv().ok()
-    }
 }

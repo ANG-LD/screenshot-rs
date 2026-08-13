@@ -158,12 +158,4 @@ impl TrayService {
     pub fn try_recv(&self) -> Option<TrayMenuEvent> {
         self.event_rx.try_recv().ok()
     }
-
-    /// 阻塞地等待下一个菜单事件。
-    ///
-    /// 当发送端被关闭（`TrayService` 自身被销毁）时返回 `None`，
-    /// 调用方应据此退出处理循环。
-    pub fn recv(&self) -> Option<TrayMenuEvent> {
-        self.event_rx.recv().ok()
-    }
 }

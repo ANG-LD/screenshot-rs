@@ -54,7 +54,9 @@ impl PlatformScreenCapture {
 }
 
 fn get_image(x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame> {
-    let guard = CACHED.lock().expect("CachedConn lock poisoned");
+    let guard = CACHED
+        .lock()
+        .map_err(|e| AppError::Capture(format!("CachedConn 锁中毒: {e}")))?;
     let c = &guard.conn;
     let w = w.max(1);
     let h = h.max(1);
@@ -111,7 +113,9 @@ fn get_image(x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame> {
 impl ScreenCapture for PlatformScreenCapture {
     fn capture_primary(&self) -> AppResult<CapturedFrame> {
         let (cw, ch) = {
-            let guard = CACHED.lock().expect("CachedConn lock poisoned");
+            let guard = CACHED
+                .lock()
+                .map_err(|e| AppError::Capture(format!("CachedConn 锁中毒: {e}")))?;
             (guard.width, guard.height)
         };
         get_image(0, 0, cw, ch)
@@ -122,7 +126,11 @@ impl ScreenCapture for PlatformScreenCapture {
     }
 
     fn list_displays(&self) -> Vec<DisplayInfo> {
-        let guard = CACHED.lock().expect("CachedConn lock poisoned");
+        // 只读宽高，不依赖连接状态；锁中毒时恢复数据而非级联 panic
+        let guard = CACHED.lock().unwrap_or_else(|e| {
+            tracing::warn!("[capture] CachedConn 锁中毒，恢复宽高数据");
+            e.into_inner()
+        });
         vec![DisplayInfo {
             id: 0,
             width: guard.width,

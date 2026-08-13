@@ -266,19 +266,6 @@ pub fn measure_line_advance_px(
     })
 }
 
-/// 计算物理像素包围盒旋转后的尺寸（与 demo 中逻辑一致，对 360° 做浮点修正）
-pub fn rotated_box_size(w: f32, h: f32, angle_deg: f32) -> (f32, f32) {
-    let rad = angle_deg * std::f32::consts::PI / 180.0;
-    let (mut sin, mut cos) = rad.sin_cos();
-    if sin.abs() < 1e-6 { sin = 0.0; }
-    if cos.abs() < 1e-6 { cos = 0.0; }
-    if (sin.abs() - 1.0).abs() < 1e-6 { sin = sin.signum(); }
-    if (cos.abs() - 1.0).abs() < 1e-6 { cos = cos.signum(); }
-    let rw = (w * cos).abs() + (h * sin).abs();
-    let rh = (w * sin).abs() + (h * cos).abs();
-    (rw.ceil().max(4.0), rh.ceil().max(4.0))
-}
-
 /// 把 commands 列表应用到 frame 的指定子区域
 ///
 /// - `frame` 是被裁剪到选区大小的 CapturedFrame
@@ -332,16 +319,14 @@ pub fn apply_commands(
                     let head_w = (line_width * 2.0).max(1.0);
                     let bx = t.0 - ux * head_len;
                     let by = t.1 - uy * head_len;
-                    // 主线：从起点窄到箭头底部宽，渐变过渡
-                    let start_lw = (line_width * 0.3).max(0.2);
-                    draw_tapered_line(frame, f.0, f.1, bx, by, start_lw, *line_width, *color)?;
-                    // 箭头：两条短边从 to 张开成 V 字（不画底边 p1→p2）
+                    // 主线：均匀宽度，直达箭头底部
+                    draw_thick_line(frame, f.0, f.1, bx, by, *line_width, *color)?;
+                    // 实心箭头头：填满三角形，底边完全盖住主线末端，连接无缝
                     let px = -uy;
                     let py = ux;
                     let p1 = (bx + px * head_w, by + py * head_w);
                     let p2 = (bx - px * head_w, by - py * head_w);
-                    draw_thick_line(frame, t.0, t.1, p1.0, p1.1, *line_width, *color)?;
-                    draw_thick_line(frame, t.0, t.1, p2.0, p2.1, *line_width, *color)?;
+                    draw_filled_triangle(frame, t.0, t.1, p1.0, p1.1, p2.0, p2.1, *color)?;
                 } else {
                     // 极短线：至少画一个点
                     draw_thick_line(frame, f.0, f.1, t.0, t.1, *line_width, *color)?;
@@ -356,13 +341,8 @@ pub fn apply_commands(
             }
             DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
-                tracing::info!(
-                    "apply_commands Text: local_anchor=({}, {}) content={:?} size={} weight={:?} max_width={:?}",
-                    a.0, a.1, content, font_size, weight, max_width
-                );
                 // 应用层暂不支持文字旋转，固定 0 度（pivot 传 anchor，旋转分支不生效）
                 rasterize_text(frame, a, a, content, *font_size, *color, *max_width, *weight, 0.0)?;
-                tracing::info!("apply_commands Text: rasterize_text done");
             }
         }
     }
@@ -397,17 +377,6 @@ fn point_to_segment_distance(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f3
     let proj_x = x1 + t * dx;
     let proj_y = y1 + t * dy;
     ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
-}
-
-/// 像素在线段上的投影参数 t ∈ [0, 1]
-fn project_on_segment(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 0.001 {
-        return 0.0;
-    }
-    ((px - x1) * dx + (py - y1) * dy) / len_sq
 }
 
 /// smoothstep: 在 edge0..edge1 之间平滑过渡
@@ -533,105 +502,117 @@ fn draw_thick_line(
     Ok(())
 }
 
-/// 画宽度渐变的线段（窄→宽），用于箭头主线
+/// 三角形一条边的预计算数据：内法线平面 + 单位方向 + 边长。
 ///
-/// 每像素投影到线段上，按投影位置插值半宽，再按垂距计算覆盖率。
-fn draw_tapered_line(
+/// 每个三角形构造一次，像素循环里只做点积，不再重复开方。
+struct TriangleEdge {
+    /// 单位内法线 (nx, ny)，边内侧满足 `nx*x + ny*y - c >= 0`
+    nx: f32,
+    ny: f32,
+    c: f32,
+    /// 单位方向 (ux, uy) 与起点投影 `a0 = 起点·u`，用于算沿边偏移
+    ux: f32,
+    uy: f32,
+    a0: f32,
+    /// 边长度
+    len: f32,
+}
+
+impl TriangleEdge {
+    /// 从 v1 指向 v2 的边；要求三角形顶点逆时针环绕，内法线才指向内部
+    fn new(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let len = (dx * dx + dy * dy).sqrt();
+        // 逆时针三角形，内部在每条边的左侧：内法线 = (-dy, dx) / len
+        let inv = 1.0 / len;
+        let nx = -dy * inv;
+        let ny = dx * inv;
+        Self {
+            nx,
+            ny,
+            c: nx * x1 + ny * y1,
+            ux: dx * inv,
+            uy: dy * inv,
+            a0: (x1 * dx + y1 * dy) * inv,
+            len,
+        }
+    }
+
+    /// 点到边所在直线的有符号垂距（内为正）
+    #[inline]
+    fn side(&self, px: f32, py: f32) -> f32 {
+        self.nx * px + self.ny * py - self.c
+    }
+
+    /// 点到边**线段**的距离平方，切向越界自动收敛到端点
+    #[inline]
+    fn seg_dist_sq(&self, px: f32, py: f32, side: f32) -> f32 {
+        let along = (px * self.ux + py * self.uy) - self.a0;
+        let beyond = (-along).max(along - self.len).max(0.0);
+        side * side + beyond * beyond
+    }
+}
+
+/// 画实心三角形（带 1px 反走样边缘），用于实心箭头头
+///
+/// 对每个像素取三条边**线段**距离的最小值作带符号边界距离（内正外负），
+/// 顶点附近自动收敛到端点，尖角不产生额外模糊。3 次开方在三角形预计算时
+/// 摊销掉（TriangleEdge::new）；像素循环只做点积，仅 |d| <= aa 的边界带
+/// 才额外开方，主体区域直接用内外判定。
+fn draw_filled_triangle(
     frame: &mut CapturedFrame,
     x1: f32, y1: f32,
     x2: f32, y2: f32,
-    start_lw: f32,
-    end_lw: f32,
+    x3: f32, y3: f32,
     color: RGBA,
 ) -> AppResult<()> {
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let len_sq = dx * dx + dy * dy;
-
-    if len_sq < 0.01 {
-        let half = end_lw / 2.0;
-        return fill_round_dot(frame, x1, y1, half, color);
-    }
-    let len = len_sq.sqrt();
+    // 归一化环绕为逆时针，保证 TriangleEdge 的内法线指向内部
+    let (x2, y2, x3, y3) = if (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1) < 0.0 {
+        (x3, y3, x2, y2)
+    } else {
+        (x2, y2, x3, y3)
+    };
+    let edges = [
+        TriangleEdge::new(x1, y1, x2, y2),
+        TriangleEdge::new(x2, y2, x3, y3),
+        TriangleEdge::new(x3, y3, x1, y1),
+    ];
 
     let aa = 0.5_f32;
-    let start_half = start_lw / 2.0;
-    let end_half = end_lw / 2.0;
-    // 使用最大半径做扫描行裁剪
-    let max_half = start_half.max(end_half);
-    let r = max_half + aa;
-
+    let aa_sq = aa * aa;
     let w_px = frame.width as i32;
     let h_px = frame.height as i32;
 
-    let min_y = ((y1.min(y2) - r).floor() as i32).max(0);
-    let max_y = ((y1.max(y2) + r).ceil() as i32).min(h_px - 1);
+    let min_x = ((x1.min(x2).min(x3) - aa).floor() as i32).max(0);
+    let max_x = ((x1.max(x2).max(x3) + aa).ceil() as i32).min(w_px - 1);
+    let min_y = ((y1.min(y2).min(y3) - aa).floor() as i32).max(0);
+    let max_y = ((y1.max(y2).max(y3) + aa).ceil() as i32).min(h_px - 1);
 
     for scan_y in min_y..=max_y {
         let py = scan_y as f32 + 0.5;
-
-        let mut x_min = f32::MAX;
-        let mut x_max = f32::MIN;
-
-        // 端点圆帽（用各自半宽）
-        let dya = py - y1;
-        let ra = start_half + aa;
-        if dya.abs() < ra {
-            let c = (ra * ra - dya * dya).sqrt();
-            x_min = x_min.min(x1 - c);
-            x_max = x_max.max(x1 + c);
-        }
-        let dyb = py - y2;
-        let rb = end_half + aa;
-        if dyb.abs() < rb {
-            let c = (rb * rb - dyb * dyb).sqrt();
-            x_min = x_min.min(x2 - c);
-            x_max = x_max.max(x2 + c);
-        }
-
-        // 主体
-        if dy.abs() > 0.001 {
-            let ux = dx / len;
-            let uy = dy / len;
-            let t_plus = (py - y1 - r * ux) / dy;
-            if (0.0..=1.0).contains(&t_plus) {
-                let xx = x1 + t_plus * dx - r * uy;
-                x_min = x_min.min(xx);
-                x_max = x_max.max(xx);
-            }
-            let t_minus = (py - y1 + r * ux) / dy;
-            if (0.0..=1.0).contains(&t_minus) {
-                let xx = x1 + t_minus * dx + r * uy;
-                x_min = x_min.min(xx);
-                x_max = x_max.max(xx);
-            }
-        } else {
-            if (py - y1).abs() <= r {
-                x_min = x_min.min(x1.min(x2));
-                x_max = x_max.max(x1.max(x2));
-            }
-        }
-
-        if x_min > x_max {
-            continue;
-        }
-
-        let px0 = (x_min.floor() as i32).max(0);
-        let px1 = (x_max.ceil() as i32).min(w_px - 1);
-
-        for scan_x in px0..=px1 {
+        for scan_x in min_x..=max_x {
             let px = scan_x as f32 + 0.5;
-            let t = project_on_segment(px, py, x1, y1, x2, y2).clamp(0.0, 1.0);
-            let half = start_half + (end_half - start_half) * t;
-            let d = point_to_segment_distance(px, py, x1, y1, x2, y2);
 
-            let r_local = half + aa;
-            let coverage = if d <= half {
+            let mut inside = true;
+            let mut min_sq = f32::MAX;
+            for e in &edges {
+                let side = e.side(px, py);
+                inside &= side >= 0.0;
+                min_sq = min_sq.min(e.seg_dist_sq(px, py, side));
+            }
+
+            // 距边界超过 aa：内部全不透明，外部跳过
+            let coverage = if min_sq > aa_sq {
+                if !inside {
+                    continue;
+                }
                 1.0
-            } else if d >= r_local {
-                continue;
             } else {
-                1.0 - smoothstep(half, r_local, d)
+                // 边界带内才开方求真实距离做反走样
+                let d = min_sq.sqrt();
+                let signed = if inside { d } else { -d };
+                smoothstep(-aa, aa, signed)
             };
 
             let alpha = ((color.a as f32) * coverage).round() as u32;
@@ -970,6 +951,48 @@ mod tests {
             "r at (5,5) should be dark (gray tint over black), got {}",
             f.pixels[idx]
         );
+    }
+
+    #[test]
+    fn arrow_renders_solid_filled_head() {
+        let mut f = empty_frame(64, 32);
+        let cmd = DrawCommand::Arrow {
+            from: DrawPoint::new(2.0, 16.0),
+            to: DrawPoint::new(48.0, 16.0),
+            color: RGBA::new(0xFF, 0x00, 0x00, 0xFF),
+            line_width: 2.0,
+        };
+        apply_commands(&mut f, 0.0, 0.0, &[cmd]).unwrap();
+        // 箭杆中点应实心红
+        let idx = (16 * 64 + 10) * 4;
+        assert!(f.pixels[idx] > 200, "shaft r = {}", f.pixels[idx]);
+        // 箭头内部（三角形中轴线附近）应被填实，而非空心 V
+        let idx = (16 * 64 + 38) * 4;
+        assert!(f.pixels[idx] > 200, "head interior r = {}", f.pixels[idx]);
+        // 箭头内部靠上一条边也应填实
+        let idx = (18 * 64 + 36) * 4;
+        assert!(f.pixels[idx] > 100, "head upper r = {}", f.pixels[idx]);
+        // 超过尖端 (48,16) 的像素应完全透明，头不能溢出
+        let idx = (16 * 64 + 50) * 4;
+        assert_eq!(f.pixels[idx + 3], 0, "beyond tip alpha = {}", f.pixels[idx + 3]);
+    }
+
+    #[test]
+    fn filled_triangle_winding_invariant() {
+        let mut ccw = empty_frame(20, 20);
+        draw_filled_triangle(&mut ccw, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, RGBA::RED).unwrap();
+        let mut cw = empty_frame(20, 20);
+        // 顺时针顶点序：应被内部归一化为逆时针后填充一致
+        draw_filled_triangle(&mut cw, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, RGBA::RED).unwrap();
+        for (y, x) in [(3, 3), (5, 2), (2, 5)] {
+            let idx = (y * 20 + x) * 4;
+            assert!(ccw.pixels[idx] > 200, "ccw inside ({x},{y}) r = {}", ccw.pixels[idx]);
+            assert!(cw.pixels[idx] > 200, "cw inside ({x},{y}) r = {}", cw.pixels[idx]);
+        }
+        // 外部 (3,12)：两者都透明
+        let idx = (12 * 20 + 3) * 4;
+        assert_eq!(ccw.pixels[idx + 3], 0, "ccw outside alpha = {}", ccw.pixels[idx + 3]);
+        assert_eq!(cw.pixels[idx + 3], 0, "cw outside alpha = {}", cw.pixels[idx + 3]);
     }
 
     // ====== T5: rasterize_text 真实现测试 ======

@@ -71,15 +71,17 @@ impl ClipboardService {
             )));
         }
 
-        let img_data = ImageData {
+        // 按需构建 ImageData：成功路径只克隆一次像素（原先 set_image 参数再
+        // clone 一次 Cow），重连重试是罕见路径，重复克隆可接受。
+        let build = |pixels: &Vec<u8>| ImageData {
             width: frame.width as usize,
             height: frame.height as usize,
-            bytes: frame.pixels.clone().into(), // Cow<[u8]>
+            bytes: pixels.clone().into(), // Cow<[u8]>
         };
         let clipboard = guard
             .as_mut()
             .expect("刚 ensure 完不应为 None");
-        match clipboard.set_image(img_data.clone()) {
+        match clipboard.set_image(build(&frame.pixels)) {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!("剪贴板写入失败，重连重试一次：{e}");
@@ -87,7 +89,7 @@ impl ClipboardService {
                 let mut new_clipboard =
                     arboard::Clipboard::new().map_err(AppError::Clipboard)?;
                 new_clipboard
-                    .set_image(img_data)
+                    .set_image(build(&frame.pixels))
                     .map_err(AppError::Clipboard)?;
                 *guard = Some(new_clipboard);
                 Ok(())

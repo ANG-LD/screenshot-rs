@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 
+use crate::error::{AppError, AppResult};
+
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Render, RenderImage, Size,
@@ -34,7 +36,7 @@ use smallvec::SmallVec;
 use crate::capture::CapturedFrame;
 use crate::overlay::drawing::{DrawCommand, DrawingState, FontWeight, RGBA};
 use crate::overlay::palette;
-use crate::overlay::selection::SelectionState;
+use crate::overlay::selection::{DragState, SelectionState};
 use crate::overlay::toolbar::{ToolButton, ToolbarPopup, ToolbarState};
 use crate::utils::bounds::{self as ub, Point as BoundsPoint};
 
@@ -101,6 +103,11 @@ pub struct OverlayView {
 
     /// 已提交文字对应的 DrawingState.commands 中的索引，用于重新编辑时移除
     text_input_cmd_idx: Option<usize>,
+
+    /// 活动输入文字测量缓存：`(value, font_size, weight, adv_px, th_px)`。
+    /// render 每帧重测会做两次 cosmic-text shaping，按值缓存避免鼠标移动等
+    /// 无关 notify 触发重复排版。
+    text_measure: Option<(String, f32, FontWeight, f32, f32)>,
 
     /// 原始捕获帧像素（RGBA），用于 OCR 等需要像素数据的操作
     frame_pixels: Vec<u8>,
@@ -228,7 +235,7 @@ pub struct OverlayResult {
 
 impl OverlayView {
     fn new(
-        frame: &CapturedFrame,
+        frame: CapturedFrame,
         screen_bounds: ub::Bounds,
         client_origin: ub::Point,
         scale_factor: f32,
@@ -236,7 +243,7 @@ impl OverlayView {
         cx: &mut Context<Self>,
     ) -> Self {
         let this = Self {
-            frame_image: build_render_image(frame),
+            frame_image: build_render_image(&frame),
             screen_bounds,
             client_origin,
             selection: SelectionState::new(screen_bounds),
@@ -252,7 +259,8 @@ impl OverlayView {
             text_input_drag: None,
             text_input_finalized: false,
             text_input_cmd_idx: None,
-            frame_pixels: frame.pixels.clone(),
+            text_measure: None,
+            frame_pixels: frame.pixels,
             frame_width: frame.width,
             frame_height: frame.height,
             ocr_rect: None,
@@ -289,7 +297,7 @@ impl OverlayView {
             size: ub::Point::new(b.size.x * sx, b.size.y * sy),
         });
         let commands: Vec<DrawCommand> =
-            result.commands.into_iter().map(|c| scale_draw_command(c, sx, sy)).collect();
+            result.commands.iter().map(|c| scale_draw_command(c, sx, sy)).collect();
 
         tracing::info!(
             "commit: selection={:?} commands_count={}",
@@ -533,6 +541,7 @@ impl OverlayView {
         use gpui_component::input::{InputEvent, InputState};
         self.text_input_finalized = false;
         self.text_input_cmd_idx = None;
+        self.text_measure = None;
         self.text_input_anchor = p;
         // 初始输入框大小（logical pixels），auto_grow(3,8) 会根据内容自动扩展。
         // 新输入从紧凑大小起步，重新编辑时沿用旧宽度。
@@ -594,7 +603,7 @@ impl OverlayView {
             InputEvent::Change => {
                 let value = state.read(cx).value().to_string();
                 let r = this.text_input_rect;
-                tracing::info!(
+                tracing::debug!(
                     "text_input Change: value={:?} box_origin=({:.1},{:.1}) box_size=({:.1},{:.1})",
                     value, r.origin.x, r.origin.y, r.size.x, r.size.y
                 );
@@ -656,6 +665,7 @@ impl OverlayView {
         // 保留 Input 组件继续渲染文字，只隐藏 chrome（拖拽条、手柄、边框），
         // 避免因 canvas 渲染路径位置计算差异导致文字跳动。
         self.text_input_finalized = true;
+        self.text_measure = None;
         cx.notify();
     }
 
@@ -1102,7 +1112,7 @@ fn render_simple_button(
                         );
 
                         let scaled_cmds: Vec<DrawCommand> =
-                            cmds.iter().map(|c| scale_draw_command(c.clone(), sx, sy)).collect();
+                            cmds.iter().map(|c| scale_draw_command(c, sx, sy)).collect();
 
                         // 固定：把裁剪+标注后的帧放进 OverlayResult，由主线程交给
                         // OverlayService::open_pin 在同一个 GPUI 应用里开 pin 窗口。
@@ -1673,46 +1683,47 @@ fn to_bounds_point(p: Point<Pixels>) -> BoundsPoint {
     BoundsPoint::new(f32::from(p.x), f32::from(p.y))
 }
 
-/// 把 DrawCommand 中的所有坐标从 canvas 坐标转为帧物理像素坐标
-fn scale_draw_command(cmd: DrawCommand, sx: f32, sy: f32) -> DrawCommand {
+/// 把 DrawCommand 中的所有坐标从 canvas 坐标转为帧物理像素坐标。
+/// 只读借用输入，重建所有字段，避免调用方先 clone 再移交所有权。
+fn scale_draw_command(cmd: &DrawCommand, sx: f32, sy: f32) -> DrawCommand {
     use crate::overlay::drawing::Point as DP;
-    let sp = |p: DP| DP::new(p.x * sx, p.y * sy);
+    let sp = |p: &DP| DP::new(p.x * sx, p.y * sy);
     match cmd {
         DrawCommand::Rectangle { rect, color, line_width } => DrawCommand::Rectangle {
-            rect: (sp(rect.0), sp(rect.1)),
-            color,
-            line_width,
+            rect: (sp(&rect.0), sp(&rect.1)),
+            color: *color,
+            line_width: *line_width,
         },
         DrawCommand::Ellipse { rect, color, line_width } => DrawCommand::Ellipse {
-            rect: (sp(rect.0), sp(rect.1)),
-            color,
-            line_width,
+            rect: (sp(&rect.0), sp(&rect.1)),
+            color: *color,
+            line_width: *line_width,
         },
         DrawCommand::Arrow { from, to, color, line_width } => DrawCommand::Arrow {
             from: sp(from),
             to: sp(to),
-            color,
-            line_width,
+            color: *color,
+            line_width: *line_width,
         },
         DrawCommand::Freehand { points, color, line_width } => DrawCommand::Freehand {
-            points: points.into_iter().map(sp).collect(),
-            color,
-            line_width,
+            points: points.iter().map(sp).collect(),
+            color: *color,
+            line_width: *line_width,
         },
         DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
             DrawCommand::Text {
                 anchor: sp(anchor),
-                content,
-                font_size,
-                color,
+                content: content.clone(),
+                font_size: *font_size,
+                color: *color,
                 max_width: max_width.map(|w| w * sx),
-                weight,
+                weight: *weight,
             }
         }
         DrawCommand::Mosaic { regions, block_size, color } => DrawCommand::Mosaic {
-            regions: regions.into_iter().map(|r| (sp(r.0), sp(r.1))).collect(),
-            block_size: (block_size as f32 * sx).max(1.0) as u32,
-            color,
+            regions: regions.iter().map(|r| (sp(&r.0), sp(&r.1))).collect(),
+            block_size: (*block_size as f32 * sx).max(1.0) as u32,
+            color: *color,
         },
     }
 }
@@ -1767,67 +1778,6 @@ fn paint_thick_line(x1: f32, y1: f32, x2: f32, y2: f32, lw: f32, color: RGBA, wi
                 size: Size::new(gpui::px(size), gpui::px(size)),
             },
             gpui::px(size_half),
-            hsla,
-            gpui::px(0.),
-            gpui::transparent_black(),
-            Default::default(),
-        ));
-    }
-}
-
-/// 画一条宽度渐变的线段
-///
-/// 同 `paint_thick_line`，用重叠圆角正方形实现平滑抗锯齿，
-/// 采样密度随最大线宽自适应。
-fn paint_tapered_line(
-    x1: f32, y1: f32,
-    x2: f32, y2: f32,
-    start_lw: f32,
-    end_lw: f32,
-    color: RGBA,
-    window: &mut Window,
-) {
-    let hsla = Hsla::from(gpui::rgba(rgba_u32(color)));
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let len = (dx * dx + dy * dy).sqrt();
-    let max_lw = start_lw.max(end_lw);
-    if len < 0.5 {
-        let half = (end_lw / 2.0).max(0.8);
-        window.paint_quad(gpui::quad(
-            Bounds {
-                origin: gpui::point(gpui::px(x1 - half), gpui::px(y1 - half)),
-                size: Size::new(gpui::px(end_lw), gpui::px(end_lw)),
-            },
-            gpui::px(half),
-            hsla,
-            gpui::px(0.),
-            gpui::transparent_black(),
-            Default::default(),
-        ));
-        return;
-    }
-    let ux = dx / len;
-    let uy = dy / len;
-    let start_half = (start_lw / 2.0).max(0.8);
-    let end_half = (end_lw / 2.0).max(0.8);
-    let spacing = if max_lw < 3.0 { 0.125 } else if max_lw < 6.0 { 0.2 } else { 0.25 };
-    let steps = (len / spacing).ceil() as usize;
-    for i in 0..=steps {
-        let t = i as f32 * spacing;
-        let frac = (t / len).min(1.0);
-        let cur_half = start_half + (end_half - start_half) * frac;
-        let cur_diam = cur_half * 2.0;
-        let cur_size = (cur_diam * 1.5).max(2.0);
-        let cur_size_half = cur_size / 2.0;
-        let cx = x1 + ux * t;
-        let cy = y1 + uy * t;
-        window.paint_quad(gpui::quad(
-            Bounds {
-                origin: gpui::point(gpui::px(cx - cur_size_half), gpui::px(cy - cur_size_half)),
-                size: Size::new(gpui::px(cur_size), gpui::px(cur_size)),
-            },
-            gpui::px(cur_size_half),
             hsla,
             gpui::px(0.),
             gpui::transparent_black(),
@@ -1898,6 +1848,8 @@ fn paint_drawing_layer(
     let (mut min_x, mut min_y, mut max_x, mut max_y) =
         (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let mut max_lw = 0.0_f32;
+    // 箭头头的底边半宽（head_w = 2*line_width），垂直方向超出箭杆中线，需计入外扩
+    let mut max_arrow_head_w = 0.0_f32;
     for cmd in &shapes {
         match cmd {
             DrawCommand::Rectangle { rect, line_width, .. }
@@ -1915,6 +1867,7 @@ fn paint_drawing_layer(
                 max_x = max_x.max(from.x.max(to.x));
                 max_y = max_y.max(from.y.max(to.y));
                 max_lw = max_lw.max(*line_width);
+                max_arrow_head_w = max_arrow_head_w.max((*line_width * 2.0).max(1.0));
             }
             DrawCommand::Freehand { points, line_width, .. } => {
                 for p in points {
@@ -1929,8 +1882,9 @@ fn paint_drawing_layer(
         }
     }
 
-    // line_width 是物理像素，转逻辑 px 外扩，再给 AA 留 1px
-    let pad = max_lw / scale_factor / 2.0 + 1.0;
+    // line_width 是物理像素，转逻辑 px 外扩；箭头还需覆盖头底边（半宽 head_w），
+    // 再给 AA 留 1px
+    let pad = (max_lw * 0.5 + max_arrow_head_w) / scale_factor + 1.0;
     min_x -= pad;
     min_y -= pad;
     max_x += pad;
@@ -1960,7 +1914,7 @@ fn paint_drawing_layer(
     };
     let scaled: Vec<DrawCommand> = shapes
         .into_iter()
-        .map(|c| scale_draw_command(c.clone(), scale_factor, scale_factor))
+        .map(|c| scale_draw_command(c, scale_factor, scale_factor))
         .collect();
     let _ = crate::overlay::commands::apply_commands(
         &mut frame,
@@ -2001,33 +1955,8 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
             let h = (b.y - a.y).abs();
             paint_ellipse_outline(x1, y1, w, h, *line_width, *color, window);
         }
-        DrawCommand::Arrow { from, to, color, line_width } => {
-            let dx = to.x - from.x;
-            let dy = to.y - from.y;
-            let len = (dx * dx + dy * dy).sqrt();
-            if len < 1.0 {
-                paint_thick_line(from.x, from.y, to.x, to.y, *line_width, *color, window);
-                return;
-            }
-            let ux = dx / len;
-            let uy = dy / len;
-            let head_len = (*line_width * 7.0).max(14.0);
-            let head_w = (*line_width * 2.0).max(4.0);
-            let bx = to.x - ux * head_len;
-            let by = to.y - uy * head_len;
-            // 主线：从起点窄到箭头底部宽
-            let start_lw = (*line_width * 0.3).max(1.0);
-            paint_tapered_line(from.x, from.y, bx, by, start_lw, *line_width, *color, window);
-            // 箭头 V 字
-            let px = -uy;
-            let py = ux;
-            let p1x = bx + px * head_w;
-            let p1y = by + py * head_w;
-            let p2x = bx - px * head_w;
-            let p2y = by - py * head_w;
-            paint_thick_line(to.x, to.y, p1x, p1y, *line_width, *color, window);
-            paint_thick_line(to.x, to.y, p2x, p2y, *line_width, *color, window);
-        }
+        // 箭头由 paint_drawing_layer 走离屏解析式 AA（与最终成图一致），这里无需处理
+        DrawCommand::Arrow { .. } => {}
         DrawCommand::Freehand { ref points, color, line_width } => {
             for w in points.windows(2) {
                 paint_thick_line(w[0].x, w[0].y, w[1].x, w[1].y, *line_width, *color, window);
@@ -2051,7 +1980,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 // 再叠加行高偏移，避免偏移非整数时 pixel_snap 单独取整导致错位。
                 let mut origin_y = window.pixel_snap(px(origin_fy))
                     + px((input_lh - line_height).as_f32() / 2.0);
-                tracing::info!(
+                tracing::debug!(
                     "render Text paint: anchor=({:.1},{:.1}) origin=({:.1},{:.1}) content={:?} fs={:.1} max_w={:?}",
                     anchor.x, anchor.y, origin_fx, origin_fy, content, *font_size, *max_width
                 );
@@ -2231,7 +2160,7 @@ fn run_ocr_sync(
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!(
                     "⚠ 未找到 tesseract，自动下载失败。\n\n请手动安装并加入 PATH：\nWindows: winget install UB-Mannheim.TesseractOCR\nmacOS: brew install tesseract\nLinux: apt install tesseract-ocr tesseract-ocr-chi-sim\n\n或检查下载地址：{}",
-                    tesseract_download_url()
+                    crate::config::download_url()
                 )
             } else {
                 format!("⚠ OCR 执行失败: {e}")
@@ -2240,39 +2169,37 @@ fn run_ocr_sync(
     }
 }
 
-/// tesseract 下载包的 URL：把 `tesseract.zip`（含 tesseract/ 与 tessdata/ 两个目录）
-/// 上传到你的 GitHub Releases，然后把下面的占位地址换成实际的
-/// `https://github.com/<user>/<repo>/releases/latest/download/tesseract.zip`。
-const TESSERACT_DOWNLOAD_URL: &str =
-    "https://github.com/YOUR_USER/YOUR_REPO/releases/latest/download/tesseract.zip";
-
-/// 下载地址：优先读 `TESSERACT_DOWNLOAD_URL` 环境变量，否则用默认常量。
-/// 默认值请在上传 ZIP 后替换为你的 GitHub Releases 地址。
-fn tesseract_download_url() -> String {
-    std::env::var("TESSERACT_DOWNLOAD_URL")
-        .unwrap_or_else(|_| TESSERACT_DOWNLOAD_URL.to_string())
-}
-
-/// 下载缓存目录：`%LOCALAPPDATA%/screenshot-rs`（Linux/macOS 用家目录下）。
-fn tesseract_cache_dir() -> std::path::PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("screenshot-rs")
+/// 当前平台 tesseract 可执行文件名：Windows 带 `.exe` 后缀，其余平台无扩展名。
+fn tesseract_exe_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    { "tesseract.exe" }
+    #[cfg(not(target_os = "windows"))]
+    { "tesseract" }
 }
 
 /// 找到可用的 tesseract 可执行文件；找不到则自动从 GitHub 下载并解压到缓存。
 ///
 /// 返回 `(tesseract_bin, tessdata_dir)`：
-/// - 优先 exe 旁的打包版（`<exe>/tesseract/tesseract.exe`）
-/// - 其次缓存（`<cache>/tesseract/tesseract.exe`，首次使用下载到这里）
+/// - 优先配置/环境变量指定的 engine_path
+/// - 其次 exe 旁的打包版（Windows: `<exe>/tesseract/tesseract.exe`，其余: `<exe>/bin/tesseract`）
+/// - 其次缓存（`<cache>/tesseract/<平台可执行名>`，首次使用下载到这里）
 /// - 最后回退系统 PATH（返回 "tesseract"，让 Command 报错提示安装）
 fn find_or_download_tesseract() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    // 0) 配置/环境变量显式指定的 tesseract 路径
+    if let Some(ep) = crate::config::engine_path() {
+        if ep.exists() {
+            let td = crate::config::tessdata_dir().filter(|p| p.exists());
+            tracing::info!("OCR: 使用配置的 tesseract: {}", ep.display());
+            return (ep, td);
+        }
+        tracing::warn!("OCR: 配置的 tesseract 不存在，回退自动查找: {}", ep.display());
+    }
+
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let cache = tesseract_cache_dir();
-    let cache_bin = cache.join("tesseract").join("tesseract.exe");
+    let cache = crate::config::cache_dir();
+    let cache_bin = cache.join("tesseract").join(tesseract_exe_name());
     let cache_td = cache.join("tessdata");
     let bundled_bin = exe_dir.as_ref().map(|d| {
         #[cfg(target_os = "windows")]
@@ -2292,7 +2219,7 @@ fn find_or_download_tesseract() -> (std::path::PathBuf, Option<std::path::PathBu
         return (cache_bin, Some(cache_td).filter(|p| p.exists()));
     }
 
-    tracing::info!("未检测到 tesseract，尝试从 {} 下载…", tesseract_download_url());
+    tracing::info!("未检测到 tesseract，尝试从 {} 下载…", crate::config::download_url());
     match download_tesseract(&cache) {
         Ok(()) if cache_bin.exists() => {
             tracing::info!("tesseract 已下载到 {}", cache.display());
@@ -2312,7 +2239,7 @@ fn download_tesseract(cache: &std::path::Path) -> Result<(), String> {
     let zip_path = cache.join("tesseract.zip");
 
     // 下载（阻塞；仅首次使用 OCR 时执行一次）
-    let resp = ureq::get(&tesseract_download_url())
+    let resp = ureq::get(&crate::config::download_url())
         .call()
         .map_err(|e| format!("下载失败: {e}"))?;
     let mut body = resp.into_reader();
@@ -2339,6 +2266,18 @@ fn download_tesseract(cache: &std::path::Path) -> Result<(), String> {
             }
             let mut out = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
             std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // 非 Windows 平台解压后补可执行权限（zip 不保留 unix 权限位）
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = cache.join("tesseract").join(tesseract_exe_name());
+        if let Ok(meta) = std::fs::metadata(&bin) {
+            let mut perm = meta.permissions();
+            perm.set_mode(0o755);
+            let _ = std::fs::set_permissions(&bin, perm);
         }
     }
 
@@ -2687,13 +2626,24 @@ impl Render for OverlayView {
                     let sf = self.scale_factor;
                     let fs = self.toolbar.current_size;
                     let weight = self.toolbar.current_weight;
-                    let (_tw_px, th_px, _, _) =
-                        crate::overlay::commands::measure_text_px(&value, fs, None, weight);
-                    // 宽度必须用真实行宽 advance（光标能到的右边界），不能用字形包围盒：
-                    // 包围盒对 CJK 会低估（ink≈0.78×advance），导致长文本下光标贴近右缘时
-                    // 编辑器产生负 scroll_offset 把整行文字左移，首字被 overflow_hidden 裁掉。
-                    let adv_px =
-                        crate::overlay::commands::measure_line_advance_px(&value, fs, weight);
+                    // 命中缓存则跳过两次 cosmic-text shaping；值/字号/字重任一变化才重测。
+                    let (adv_px, th_px) = match &self.text_measure {
+                        Some((v, f, w, a, t)) if *v == value && *f == fs && *w == weight => {
+                            (*a, *t)
+                        }
+                        _ => {
+                            let (_tw_px, th_px, _, _) =
+                                crate::overlay::commands::measure_text_px(&value, fs, None, weight);
+                            // 宽度必须用真实行宽 advance（光标能到的右边界），不能用字形包围盒：
+                            // 包围盒对 CJK 会低估（ink≈0.78×advance），导致长文本下光标贴近右缘时
+                            // 编辑器产生负 scroll_offset 把整行文字左移，首字被 overflow_hidden 裁掉。
+                            let adv_px = crate::overlay::commands::measure_line_advance_px(
+                                &value, fs, weight,
+                            );
+                            self.text_measure = Some((value.clone(), fs, weight, adv_px, th_px));
+                            (adv_px, th_px)
+                        }
+                    };
                     // Input 实际内边距：1px border + 8px padding，每侧 9px 共 18px；
                     // 再留 10px 右缘（RIGHT_MARGIN），使 content = adv + 10 ≥ adv，不触发左滚。
                     const INSET_X: f32 = 18.0;
@@ -3224,8 +3174,11 @@ impl Render for OverlayView {
                 }
                 if this.in_progress.is_some() {
                     this.update_in_progress(p);
-                } else {
+                } else if this.selection.drag != DragState::Idle {
                     this.selection.mouse_move(p);
+                } else {
+                    // 纯 Idle：selection.mouse_move 是无操作，不触发无意义重绘
+                    return;
                 }
                 cx.notify();
             }))
@@ -3257,13 +3210,13 @@ impl Render for OverlayView {
                         this.ocr_drag_start = None;
                         if let Some(rect) = this.ocr_rect {
                             if rect.size.x > 5.0 && rect.size.y > 5.0 {
-                                let pixels = this.frame_pixels.clone();
                                 let fw = this.frame_width;
                                 let fh = this.frame_height;
                                 this.ocr_loading = true;
                                 cx.notify();
                                 let wb = window.bounds();
-                                let text = run_ocr_sync(rect, &pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
+                                // 同步调用，只读切片即可，无需克隆整帧
+                                let text = run_ocr_sync(rect, &this.frame_pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
                                 tracing::info!("OCR result len={}, content={:?}", text.len(), text);
                                 this.ocr_result = if text.is_empty() { None } else { Some(text) };
                                 this.ocr_loading = false;
@@ -4234,10 +4187,10 @@ fn open_progress_window(
     region_px: ub::Bounds,
     screen_px: ub::Bounds,
     cx: &mut App,
-) -> anyhow::Result<WindowHandle<ProgressView>> {
+) -> AppResult<WindowHandle<ProgressView>> {
     let display = cx
         .primary_display()
-        .ok_or_else(|| anyhow::anyhow!("no primary display"))?;
+        .ok_or_else(|| AppError::Gpui("no primary display".into()))?;
     let dbounds = display.bounds();
 
     // 物理像素 → 逻辑像素（选区与主屏都是物理像素，GPUI 用逻辑坐标）
@@ -4316,6 +4269,7 @@ fn open_progress_window(
         },
         |_, cx| cx.new(|_| ProgressView { cancel, done, progress, manual }),
     )
+    .map_err(|e| AppError::Gpui(format!("打开进度窗失败: {e}")))
 }
 
 /// 在常驻应用里打开截图覆盖窗口（原 `run_blocking` 的窗口构建逻辑）。
@@ -4358,14 +4312,20 @@ fn open_overlay_in_app(
             let src_y = (f32::from(actual.origin.y) * sy) as u32;
             let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
             let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
-            let clipped = frame.clip_region(src_x, src_y, clip_w, clip_h).unwrap_or(frame);
+            // 全屏窗口直接复用 frame，避免 clip_region 做一整帧 memcpy
+            let clipped = if src_x == 0 && src_y == 0 && clip_w == frame.width && clip_h == frame.height
+            {
+                frame
+            } else {
+                frame.clip_region(src_x, src_y, clip_w, clip_h).unwrap_or(frame)
+            };
 
             let scale = clipped.width as f32 / actual_w;
             let logical_bounds =
                 ub::Bounds::new(ub::Point::ZERO, ub::Point::new(actual_w, actual_h));
 
             let view = cx.new(|cx| {
-                OverlayView::new(&clipped, logical_bounds, client_origin, scale, tx, cx)
+                OverlayView::new(clipped, logical_bounds, client_origin, scale, tx, cx)
             });
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);

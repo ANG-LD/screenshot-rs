@@ -23,6 +23,9 @@ tray-icon = "0.11"
 arboard = "3"
 image = "0.25"
 
+# 用户配置目录（跨平台 config_dir / home_dir）
+dirs = "6"
+
 # OCR 依赖按需下载（首次使用 OCR 时从 GitHub 拉取 tesseract，不打包进应用）
 ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -39,6 +42,7 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 # 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 # GPUI 内部用的小数组（RenderImage::new 需要）
 smallvec = "1"

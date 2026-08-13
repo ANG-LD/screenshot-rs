@@ -1,0 +1,39 @@
+# screenshot-rs 运行时配置模板
+#
+# 本文件是应用内置的默认模板。应用首次运行时，会自动在配置目录生成一份
+# 同名文件（config.toml），你直接编辑它即可生效，无需手动复制。
+# 生成位置：
+#   Linux:   ~/.config/screenshot-rs/config.toml
+#   macOS:   ~/Library/Application Support/screenshot-rs/config.toml
+#   Windows: %APPDATA%\screenshot-rs\config.toml
+#
+# 也可用环境变量 SCREENSHOT_RS_CONFIG 指定任意路径。
+#
+# 优先级：环境变量 > config.toml > 内置默认值
+# 所有字段均可选，缺失即回落默认；路径支持以 ~ 开头表示用户主目录。
+
+[ocr]
+
+# tesseract 可执行文件绝对路径。
+# 不填则自动查找：exe 旁打包版 → 下载缓存 → 系统 PATH。
+# 也可用环境变量 TESSERACT_ENGINE_PATH 覆盖。
+# engine_path = "/usr/bin/tesseract"
+# engine_path = "C:\\tools\\tesseract\\tesseract.exe"
+
+# tessdata 目录（语言数据目录）。不填则用 tesseract 自带目录。
+# 也可用环境变量 TESSERACT_TESSDATA_DIR 覆盖。
+# tessdata_dir = "/usr/share/tesseract-ocr/4.00/tessdata"
+
+# tesseract 下载包地址（自动下载时使用）。
+# 支持 {platform} 占位符，程序按平台替换为 windows / macos / linux：
+#   即分别下载 tesseract-windows.zip / tesseract-linux.zip / tesseract-macos.zip，
+#   请在 GitHub Releases 上传这三个 asset。
+# 也可填写不含占位符的具体 URL（跨平台同一地址，需自己保证平台匹配）。
+# 默认是占位符，请替换为你的 GitHub Releases 地址。
+# 包结构需为：tesseract/<可执行文件>（Windows 为 tesseract.exe，其余平台为 tesseract）+ tessdata/。
+# 也可用环境变量 TESSERACT_DOWNLOAD_URL 覆盖。
+# download_url = "https://github.com/YOUR_USER/YOUR_REPO/releases/latest/download/tesseract-{platform}.zip"
+
+# 下载缓存目录。默认 %LOCALAPPDATA%/screenshot-rs（其他平台为系统临时目录）。
+# 也可用环境变量 TESSERACT_CACHE_DIR 覆盖。
+# cache_dir = "/data/ocr-cache"

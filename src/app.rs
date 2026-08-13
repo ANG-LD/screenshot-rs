@@ -27,6 +27,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> AppResult<Self> {
+        // 预热配置（OCR 插件/下载路径），静默读取，失败不阻塞启动
+        let _ = crate::config::config();
+
         Ok(Self {
             capture: platform_capture(),
             clipboard: ClipboardService::new(),
