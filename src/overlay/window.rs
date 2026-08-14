@@ -163,6 +163,9 @@ pub struct OverlayView {
     /// 对选中命令的活跃拖拽操作
     cmd_drag: Option<CmdDragState>,
 
+    /// 鼠标当前是否悬停在某个可选中形状的描边线条上（用于 hover 小手光标）
+    hover_shape: bool,
+
     /// HiDPI 缩放因子（物理像素 / 逻辑像素）。
     ///
     /// screen_bounds 和所有鼠标交互使用逻辑像素（与 GPUI 坐标系一致），
@@ -185,14 +188,14 @@ struct TextDragState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextDragMode {
-    /// 拖顶部 bar 移动整框
+    /// 拖边框移动整框
     Move,
     /// 四角 resize
     ResizeNW,
     ResizeNE,
     ResizeSW,
     ResizeSE,
-    /// 四边中点 resize
+    /// 四边中点 resize（与矩形选中框一致：8 个手柄）
     ResizeN,
     ResizeS,
     ResizeW,
@@ -306,6 +309,7 @@ impl OverlayView {
             ocr_panel_hovered: false,
             selected_cmd_actual_idx: None,
             cmd_drag: None,
+            hover_shape: false,
             scale_factor,
             dim_opacity: 1.0,
         };
@@ -598,12 +602,15 @@ impl OverlayView {
         self.text_input_anchor = p;
         // 初始输入框大小（logical pixels），auto_grow(3,8) 会根据内容自动扩展。
         // 新输入从紧凑大小起步，重新编辑时沿用旧宽度。
-        // 高度随字号缩放（行盒=1.5×字号 + 顶部拖拽条），保证大字号能完整显示。
+        // 高度随字号缩放，保证大字号能完整显示。
         // 裁剪到选区范围内，防止靠近边缘时文字框/手柄超出截图区域。
         let limits = self.selection.current().unwrap_or(self.screen_bounds);
-        let w = max_w_override.unwrap_or(100.0);
-        let logical_fs = self.toolbar.current_size / self.scale_factor;
-        let init_h = (logical_fs * 1.5 + 6.0).max(48.0);
+        // 初始框刻意做小：64×1行，输字后 auto_grow 按内容扩宽/扩高。
+        let w = max_w_override.unwrap_or(64.0);
+        // 空框行高由窗口 line_height 决定；输字后 auto_grow 测量里会再按
+        // max(窗口行高, 1.4×字号) 补足，避免大字号溢出。
+        let line_h = window.line_height().as_f32();
+        let init_h = (line_h + 14.0).max(40.0);
         self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + w, p.y + init_h))
             .clamp_inside(limits);
         tracing::debug!("open_text_input: anchor=({:.1}, {:.1}) initial={}", p.x, p.y, initial.is_some());
@@ -611,7 +618,7 @@ impl OverlayView {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("")
-                .auto_grow(3, 8)
+                .auto_grow(1, 8)
                 .soft_wrap(false)
         });
         // 预填旧内容（重新编辑场景）：直接移交所有权，避免 clone。
@@ -722,6 +729,9 @@ impl OverlayView {
         // 避免因 canvas 渲染路径位置计算差异导致文字跳动。
         self.text_input_finalized = true;
         self.text_measure = None;
+        // 文字提交后退出 Text 工具：否则 active_tool 一直是 Text，后续点击
+        // 矩形/椭圆/箭头会被 Text 分支跳过命令命中检测，没法再选中出拖动手柄。
+        self.toolbar.active_tool = None;
         cx.notify();
     }
 
@@ -1408,27 +1418,34 @@ fn rgba_to_bgra(pixels: &mut [u8]) {
     }
 }
 
-/// 检测点击是否落在文字输入框的拖动条或 resize 手柄上，返回对应的 DragState
+/// 检测点击是否落在文字输入框的边框（Move）或 resize 手柄上，返回对应的 DragState
 fn hit_test_text_drag(rect: ub::Bounds, p: BoundsPoint) -> Option<TextDragState> {
-    const H: f32 = 6.0;
-    let hit = |x: f32, y: f32| -> bool {
-        p.x >= x && p.x <= x + H && p.y >= y && p.y <= y + H
+    // 手柄命中容差：±4px（对应 8px 手柄，与矩形选中框一致）
+    const HANDLE_HALF: f32 = 4.0;
+    // 边框移动环厚度（px）
+    const MOVE_RING: f32 = 6.0;
+    // 手柄中心在边框线上（跨线一半在外侧），与矩形选中框的 8 个手柄一致
+    let hit = |cx: f32, cy: f32| -> bool {
+        p.x >= cx - HANDLE_HALF && p.x <= cx + HANDLE_HALF
+            && p.y >= cy - HANDLE_HALF && p.y <= cy + HANDLE_HALF
     };
     let x = rect.origin.x;
     let y = rect.origin.y;
     let w = rect.size.x;
     let h = rect.size.y;
+    let mx = x + w / 2.0;
+    let my = y + h / 2.0;
 
-    // 优先检测 8 个 resize 手柄（角 + 边中点）
+    // 优先检测 8 个 resize 手柄（四角 + 四边中点）
     let checks: &[(TextDragMode, f32, f32)] = &[
         (TextDragMode::ResizeNW, x, y),
-        (TextDragMode::ResizeN,  x + w / 2.0 - H / 2.0, y),
-        (TextDragMode::ResizeNE, x + w - H, y),
-        (TextDragMode::ResizeW,  x, y + h / 2.0 - H / 2.0),
-        (TextDragMode::ResizeE,  x + w - H, y + h / 2.0 - H / 2.0),
-        (TextDragMode::ResizeSW, x, y + h - H),
-        (TextDragMode::ResizeS,  x + w / 2.0 - H / 2.0, y + h - H),
-        (TextDragMode::ResizeSE, x + w - H, y + h - H),
+        (TextDragMode::ResizeN, mx, y),
+        (TextDragMode::ResizeNE, x + w, y),
+        (TextDragMode::ResizeW, x, my),
+        (TextDragMode::ResizeE, x + w, my),
+        (TextDragMode::ResizeSW, x, y + h),
+        (TextDragMode::ResizeS, mx, y + h),
+        (TextDragMode::ResizeSE, x + w, y + h),
     ];
     for &(mode, hx, hy) in checks {
         if hit(hx, hy) {
@@ -1440,8 +1457,12 @@ fn hit_test_text_drag(rect: ub::Bounds, p: BoundsPoint) -> Option<TextDragState>
         }
     }
 
-    // 顶部 6px 整条为 Move 拖动区（排除已被手柄命中的区域，手柄优先检测）
-    if p.y >= y && p.y <= y + H && p.x >= x && p.x <= x + w {
+    // 四条边框内侧 6px 环为 Move 拖动区（与四边覆盖层一致；手柄优先命中）
+    let on_ring = (p.x >= x && p.x <= x + w
+        && (p.y >= y && p.y <= y + MOVE_RING || (p.y >= y + h - MOVE_RING && p.y <= y + h)))
+        || (p.y >= y && p.y <= y + h
+            && (p.x >= x && p.x <= x + MOVE_RING || (p.x >= x + w - MOVE_RING && p.x <= x + w)));
+    if on_ring {
         return Some(TextDragState {
             mode: TextDragMode::Move,
             start_mouse: p,
@@ -1449,6 +1470,45 @@ fn hit_test_text_drag(rect: ub::Bounds, p: BoundsPoint) -> Option<TextDragState>
         });
     }
     None
+}
+
+/// 计算 Move 拖动后的新 rect：只钳制 origin、保持尺寸不变（不能用 clamp_inside，
+/// 它会在越界时收缩 height，导致框贴底后"往下拖不动"——实为被压扁）。
+fn text_move_rect(
+    start: ub::Bounds,
+    start_mouse: BoundsPoint,
+    p: BoundsPoint,
+    limits: ub::Bounds,
+) -> ub::Bounds {
+    let dx = p.x - start_mouse.x;
+    let dy = p.y - start_mouse.y;
+    let max_x = (limits.origin.x + limits.size.x - start.size.x).max(limits.origin.x);
+    let max_y = (limits.origin.y + limits.size.y - start.size.y).max(limits.origin.y);
+    ub::Bounds {
+        origin: BoundsPoint::new(
+            (start.origin.x + dx).clamp(limits.origin.x, max_x),
+            (start.origin.y + dy).clamp(limits.origin.y, max_y),
+        ),
+        size: start.size,
+    }
+}
+
+/// 计算 ResizeN（顶部中点手柄）拖动后的新 rect：顶边跟随鼠标、高度随之增减，
+/// 高度低于 MIN_H 时钳制并让顶边停在对应位置。
+fn text_resize_n_rect(start: ub::Bounds, start_mouse: BoundsPoint, p: BoundsPoint) -> ub::Bounds {
+    const MIN_H: f32 = 40.0;
+    let dy = p.y - start_mouse.y;
+    let new_y = start.origin.y + dy;
+    let new_h = (start.size.y - dy).max(MIN_H);
+    let clamped_y = if new_h == MIN_H {
+        start.origin.y + (start.size.y - MIN_H)
+    } else {
+        new_y
+    };
+    ub::Bounds {
+        origin: BoundsPoint::new(start.origin.x, clamped_y),
+        size: BoundsPoint::new(start.size.x, new_h),
+    }
 }
 
 /// 应用文字框拖动 / resize 增量到 `text_input_rect`
@@ -1459,11 +1519,9 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
     // 最小尺寸限制：避免拖成 1px
     const MIN_W: f32 = 80.0;
     const MIN_H: f32 = 40.0;
+    let limits = this.selection.current().unwrap_or(this.screen_bounds);
     let new_rect = match drag.mode {
-        TextDragMode::Move => ub::Bounds {
-            origin: BoundsPoint::new(start.origin.x + dx, start.origin.y + dy),
-            size: start.size,
-        },
+        TextDragMode::Move => text_move_rect(start, drag.start_mouse, p, limits),
         TextDragMode::ResizeNW => {
             let new_x = start.origin.x + dx;
             let new_y = start.origin.y + dy;
@@ -1474,15 +1532,6 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
             ub::Bounds {
                 origin: BoundsPoint::new(clamped_x, clamped_y),
                 size: BoundsPoint::new(new_w, new_h),
-            }
-        }
-        TextDragMode::ResizeN => {
-            let new_y = start.origin.y + dy;
-            let new_h = (start.size.y - dy).max(MIN_H);
-            let clamped_y = if new_h == MIN_H { start.origin.y + (start.size.y - MIN_H) } else { new_y };
-            ub::Bounds {
-                origin: BoundsPoint::new(start.origin.x, clamped_y),
-                size: BoundsPoint::new(start.size.x, new_h),
             }
         }
         TextDragMode::ResizeNE => {
@@ -1521,6 +1570,7 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
                 size: BoundsPoint::new(new_w, new_h),
             }
         }
+        TextDragMode::ResizeN => text_resize_n_rect(start, drag.start_mouse, p),
         TextDragMode::ResizeS => {
             let new_h = (start.size.y + dy).max(MIN_H);
             ub::Bounds {
@@ -1537,10 +1587,74 @@ fn apply_text_drag(this: &mut OverlayView, drag: TextDragState, p: BoundsPoint) 
             }
         }
     };
-    this.text_input_rect = new_rect.clamp_inside(this.selection.current().unwrap_or(this.screen_bounds));
+    this.text_input_rect = match drag.mode {
+        TextDragMode::Move => new_rect,
+        _ => new_rect.clamp_inside(limits),
+    };
 }
 
-/// 检测点击是否落在已绘制命令的手柄或主体上
+/// 点到线段的最近距离
+fn point_segment_distance(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-6 {
+        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
+    }
+    let t = (((px - x1) * dx + (py - y1) * dy) / len_sq).clamp(0.0, 1.0);
+    let proj_x = x1 + t * dx;
+    let proj_y = y1 + t * dy;
+    ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+}
+
+/// 描边命中半径：线宽一半 + 固定容差（下限保证细线也容易点中）
+fn stroke_hit_radius(line_width: f32) -> f32 {
+    (line_width * 0.5 + 4.0).max(6.0)
+}
+
+/// 判断点是否落在形状的「描边线条」上（点击选中 / hover 小手光标共用）
+fn hit_test_stroke(cmd: &DrawCommand, p: BoundsPoint) -> bool {
+    match cmd {
+        DrawCommand::Rectangle { rect, line_width, .. } => {
+            let x1 = rect.0.x.min(rect.1.x);
+            let y1 = rect.0.y.min(rect.1.y);
+            let x2 = rect.0.x.max(rect.1.x);
+            let y2 = rect.0.y.max(rect.1.y);
+            let r = stroke_hit_radius(*line_width);
+            point_segment_distance(p.x, p.y, x1, y1, x2, y1) <= r
+                || point_segment_distance(p.x, p.y, x1, y2, x2, y2) <= r
+                || point_segment_distance(p.x, p.y, x1, y1, x1, y2) <= r
+                || point_segment_distance(p.x, p.y, x2, y1, x2, y2) <= r
+        }
+        DrawCommand::Ellipse { rect, line_width, .. } => {
+            let cx = (rect.0.x + rect.1.x) / 2.0;
+            let cy = (rect.0.y + rect.1.y) / 2.0;
+            let rx = (rect.0.x - rect.1.x).abs() / 2.0;
+            let ry = (rect.0.y - rect.1.y).abs() / 2.0;
+            let r = stroke_hit_radius(*line_width);
+            let n = 128;
+            let mut prev: Option<(f32, f32)> = None;
+            for i in 0..=n {
+                let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+                let cur = (cx + rx * theta.cos(), cy + ry * theta.sin());
+                if let Some((ax, ay)) = prev {
+                    if point_segment_distance(p.x, p.y, ax, ay, cur.0, cur.1) <= r {
+                        return true;
+                    }
+                }
+                prev = Some(cur);
+            }
+            false
+        }
+        DrawCommand::Arrow { from, to, line_width, .. } => {
+            let r = stroke_hit_radius(*line_width).max(HANDLE_HIT_HALF * 2.0);
+            point_segment_distance(p.x, p.y, from.x, from.y, to.x, to.y) <= r
+        }
+        _ => false,
+    }
+}
+
+/// 检测点击是否落在已绘制命令的手柄或描边线条上
 fn hit_test_cmd_drag(cmd: &DrawCommand, p: BoundsPoint) -> Option<CmdDragMode> {
     match cmd {
         DrawCommand::Rectangle { rect, .. }
@@ -1554,7 +1668,8 @@ fn hit_test_cmd_drag(cmd: &DrawCommand, p: BoundsPoint) -> Option<CmdDragMode> {
             if let Some(handle) = bounds.hit_handle(p, HANDLE_HIT_HALF) {
                 return Some(CmdDragMode::ResizeRect { handle, start_rect: *rect });
             }
-            if bounds.contains(p) {
+            // 只有点在描边（线条）上才算命中（选中）；内部空白/外部都不命中。
+            if hit_test_stroke(cmd, p) {
                 return Some(CmdDragMode::MoveRect { start_rect: *rect });
             }
             None
@@ -1588,6 +1703,13 @@ fn hit_test_cmd_drag(cmd: &DrawCommand, p: BoundsPoint) -> Option<CmdDragMode> {
         }
         _ => None,
     }
+}
+
+/// 鼠标是否悬停在某个可选中形状的描边线条上（矩形/椭圆/箭头）
+fn any_shape_stroke_hit(drawing: &DrawingState, p: BoundsPoint) -> bool {
+    drawing
+        .visible_commands_with_indices()
+        .any(|(_, cmd)| hit_test_stroke(cmd, p))
 }
 
 /// 文字输入框内，文字相对于外层 box 原点的偏移量
@@ -1699,15 +1821,38 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
     this.drawing.revision += 1;
 }
 
+/// 鼠标按下时开始文字框拖动/缩放：直接设置 `text_input_drag`（记录起点 rect 与
+/// 按下位置），不再依赖 root.on_mouse_down 的几何命中检测。拖动/缩放过程由
+/// root.on_mouse_move 与文字框自身的 on_mouse_move 共同驱动，松手由 on_mouse_up 结束。
+fn begin_text_drag(
+    this: &mut OverlayView,
+    mode: TextDragMode,
+    ev: &MouseDownEvent,
+    window: &mut Window,
+    cx: &mut Context<OverlayView>,
+) {
+    let p = to_bounds_point(ev.position);
+    this.text_input_drag = Some(TextDragState {
+        mode,
+        start_mouse: p,
+        start_rect: this.text_input_rect,
+    });
+    window.prevent_default();
+    cx.stop_propagation();
+}
+
 /// 构造文字输入框的角 resize handle（6×6 方块）
 ///
 /// 鼠标按下时把 `text_input_drag` 置为对应 mode + 记录起点 rect。
 /// 鼠标移动在 root.on_mouse_move 里统一处理（用户可以拖到框外）。
+/// 在 handle 上直接绑 on_mouse_down 并 stop_propagation，避免依赖 root 的
+/// 几何命中检测（此前点手柄/拖动条偶尔不响应）。
 fn make_resize_handle(
     id: impl Into<gpui::ElementId>,
     left: f32,
     top: f32,
     mode: TextDragMode,
+    cx: &mut Context<OverlayView>,
 ) -> impl IntoElement {
     let cursor = match mode {
         TextDragMode::ResizeNW | TextDragMode::ResizeSE => gpui::CursorStyle::ResizeUpRightDownLeft,
@@ -1721,11 +1866,14 @@ fn make_resize_handle(
         .absolute()
         .top(px(top))
         .left(px(left))
-        .size(px(6.0))
+        .size(px(HANDLE_VISUAL_SIZE))
         .bg(gpui::rgba(0xFFFFFFFF))
         .border_1()
-        .border_color(gpui::rgba(0x000000CC))
+        .border_color(gpui::rgba(0x0066CCFF))
         .cursor(cursor)
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev, window, cx| {
+            begin_text_drag(this, mode, ev, window, cx);
+        }))
 }
 
 /// 由 RGBA 像素数据构建 GPUI RenderImage（原地转 BGRA 后移交所有权，
@@ -2465,10 +2613,87 @@ impl Render for OverlayView {
         let ocr_rect = self.ocr_rect;
         let ocr_dragging = self.ocr_drag_start.is_some();
         let dim_opacity = self.dim_opacity;
+        let hover_shape = self.hover_shape;
+        // 文字框 auto_grow 测量提前到 render 开头：canvas 边框与 Input 必须基于
+        // 同一份 text_input_rect。若在 Input 渲染时才更新 size，canvas closure 捕获
+        // 的是测量前的旧值，导致边框与输入框错位（光标跑到框外、文字被边框盖住）。
+        if let Some(ref input) = self.text_input {
+            if !self.text_input_finalized {
+                let value: String = input.read(cx).value().to_string();
+                if !value.is_empty() {
+                    let sf = self.scale_factor;
+                    let fs = self.toolbar.current_size;
+                    let weight = self.toolbar.current_weight;
+                    // 命中缓存则跳过两次 cosmic-text shaping；值/字号/字重任一变化才重测。
+                    let (adv_px, th_px) = match &self.text_measure {
+                        Some((v, f, w, a, t)) if *v == value && *f == fs && *w == weight => {
+                            (*a, *t)
+                        }
+                        _ => {
+                            let (_tw_px, th_px, _, _) =
+                                crate::overlay::commands::measure_text_px(&value, fs, None, weight);
+                            // 宽度必须用真实行宽 advance（光标能到的右边界），不能用字形包围盒：
+                            // 包围盒对 CJK 会低估（ink≈0.78×advance），导致长文本下光标贴近右缘时
+                            // 编辑器产生负 scroll_offset 把整行文字左移，首字被 overflow_hidden 裁掉。
+                            let adv_px = crate::overlay::commands::measure_line_advance_px(
+                                &value, fs, weight,
+                            );
+                            self.text_measure = Some((value.clone(), fs, weight, adv_px, th_px));
+                            (adv_px, th_px)
+                        }
+                    };
+                    // Input 实际内边距：1px border + 8px padding，每侧 9px 共 18px；
+                    // 再留 10px 右缘（RIGHT_MARGIN），使 content = adv + 10 ≥ adv，不触发左滚。
+                    const INSET_X: f32 = 18.0;
+                    const RIGHT_MARGIN: f32 = 10.0;
+                    const MIN_W: f32 = 100.0;
+                    const MIN_H: f32 = 40.0;
+                    let new_w = if adv_px > 0.0 {
+                        (adv_px / sf + INSET_X + RIGHT_MARGIN).max(MIN_W)
+                    } else {
+                        MIN_W
+                    };
+                    // 高度按 Input 实际行盒计算，避免多行文字向下溢出编辑框：
+                    // th_px 是字形包围盒高，对多行会低估行距（字形 < 行盒）。
+                    // Input 编辑器（TextElement）行高 = window.line_height()；
+                    // 大字号下 cosmic-text 行距 ≥ 1.4×字号，取较大值。
+                    // auto_grow(1,8) → 框高度锁定在 1..8 行，超出 8 行 Input 内部滚动。
+                    let rows = value.matches('\n').count() + 1;
+                    let effective_rows = rows.clamp(1, 8);
+                    let line_h = window.line_height().as_f32().max(fs / sf * 1.4);
+                    let new_h =
+                        (effective_rows as f32 * line_h + 6.0 + 2.0 + 2.0 + 4.0).max(MIN_H);
+                    let old_w = self.text_input_rect.size.x;
+                    let old_h = self.text_input_rect.size.y;
+                    self.text_input_rect.size = BoundsPoint::new(new_w, new_h);
+                    // 高度随行数增长后裁剪回截图框（selection）内，防止文字画出截图区域
+                    let limits = self.selection.current().unwrap_or(self.screen_bounds);
+                    self.text_input_rect = self.text_input_rect.clamp_inside(limits);
+                    if (old_w - new_w).abs() > 0.01 || (old_h - new_h).abs() > 0.01 {
+                        tracing::info!(
+                            "textbox auto-grow: value={:?} fs={:.1} sf={:.1} th_px={:.1} adv_px={:.1} box=({:.1},{:.1})->({:.1},{:.1})",
+                            value, fs, sf, th_px, adv_px,
+                            old_w, old_h, new_w, new_h,
+                        );
+                    }
+                }
+            }
+        }
+
+        // 文字框编辑态：canvas 负责绘制边框与 8 个手柄（与矩形选中框同款），
+        // 元素层只留透明命中区，避免 div 渲染被裁剪/遮挡导致手柄缺失。
+        let text_editing = self.text_input.is_some() && !self.text_input_finalized;
+        let text_input_rect = self.text_input_rect;
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect), window, cx| {
+                // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
+                // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
+                if hover_shape {
+                    window.set_window_cursor_style(gpui::CursorStyle::PointingHand);
+                }
+
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
@@ -2723,6 +2948,54 @@ impl Render for OverlayView {
                             ));
                         }
                     }
+
+                    // 4.5) 文字框编辑态：灰色边框 + 8 个手柄（与矩形选中框同款）。
+                    // 直接画在 canvas 层（元素层 div 的 border/手柄可能被裁剪或遮挡），
+                    // 保证四边灰色边框、8 个手柄都居中在边框线上且一定可见。
+                    if text_editing {
+                        let tr = text_input_rect;
+                        let tx = px(tr.origin.x);
+                        let ty = px(tr.origin.y);
+                        let tw = px(tr.size.x.max(1.0));
+                        let th = px(tr.size.y.max(1.0));
+                        let gray = Hsla::from(rgba(0x999999FF));
+                        let clear = gpui::transparent_black();
+                        // 四条 1px 灰色边框线
+                        window.paint_quad(quad(
+                            Bounds { origin: point(tx, ty), size: Size::new(tw, px(1.0)) },
+                            px(0.), gray, px(0.), clear, Default::default(),
+                        ));
+                        window.paint_quad(quad(
+                            Bounds { origin: point(tx, ty + th - px(1.0)), size: Size::new(tw, px(1.0)) },
+                            px(0.), gray, px(0.), clear, Default::default(),
+                        ));
+                        window.paint_quad(quad(
+                            Bounds { origin: point(tx, ty), size: Size::new(px(1.0), th) },
+                            px(0.), gray, px(0.), clear, Default::default(),
+                        ));
+                        window.paint_quad(quad(
+                            Bounds { origin: point(tx + tw - px(1.0), ty), size: Size::new(px(1.0), th) },
+                            px(0.), gray, px(0.), clear, Default::default(),
+                        ));
+                        // 8 个手柄
+                        let handle_fill = Hsla::from(rgba(0xFFFFFFFFu32));
+                        let handle_border = Hsla::from(rgba(0x0066CCFFu32));
+                        let half = px(HANDLE_VISUAL_SIZE / 2.0);
+                        let edge = px(HANDLE_VISUAL_SIZE);
+                        for hp in tr.handle_positions() {
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(px(hp.x) - half, px(hp.y) - half),
+                                    size: Size::new(edge, edge),
+                                },
+                                px(0.),
+                                handle_fill,
+                                px(1.0),
+                                handle_border,
+                                Default::default(),
+                            ));
+                        }
+                    }
                 } else {
                     // 没选区：整屏 dim（提示用户拖拽）
                     window.paint_quad(quad(
@@ -2759,70 +3032,7 @@ impl Render for OverlayView {
         // text_input_rect 存储逻辑像素（与 GPUI 坐标系一致），直接用 px() 做 CSS 定位。
         // 不传 max_width → 不自动换行，仅手动 Enter 换行；宽度在 render 前测量。
         if let Some(ref input) = self.text_input {
-            // 先测量文字尺寸，更新 text_input_rect 后再渲染，避免宽度不足导致换行
-            if !self.text_input_finalized {
-                let value: String = input.read(cx).value().to_string();
-                if !value.is_empty() {
-                    let sf = self.scale_factor;
-                    let fs = self.toolbar.current_size;
-                    let weight = self.toolbar.current_weight;
-                    // 命中缓存则跳过两次 cosmic-text shaping；值/字号/字重任一变化才重测。
-                    let (adv_px, th_px) = match &self.text_measure {
-                        Some((v, f, w, a, t)) if *v == value && *f == fs && *w == weight => {
-                            (*a, *t)
-                        }
-                        _ => {
-                            let (_tw_px, th_px, _, _) =
-                                crate::overlay::commands::measure_text_px(&value, fs, None, weight);
-                            // 宽度必须用真实行宽 advance（光标能到的右边界），不能用字形包围盒：
-                            // 包围盒对 CJK 会低估（ink≈0.78×advance），导致长文本下光标贴近右缘时
-                            // 编辑器产生负 scroll_offset 把整行文字左移，首字被 overflow_hidden 裁掉。
-                            let adv_px = crate::overlay::commands::measure_line_advance_px(
-                                &value, fs, weight,
-                            );
-                            self.text_measure = Some((value.clone(), fs, weight, adv_px, th_px));
-                            (adv_px, th_px)
-                        }
-                    };
-                    // Input 实际内边距：1px border + 8px padding，每侧 9px 共 18px；
-                    // 再留 10px 右缘（RIGHT_MARGIN），使 content = adv + 10 ≥ adv，不触发左滚。
-                    const INSET_X: f32 = 18.0;
-                    const RIGHT_MARGIN: f32 = 10.0;
-                    const MIN_W: f32 = 100.0;
-                    const MIN_H: f32 = 40.0;
-                    let new_w = if adv_px > 0.0 {
-                        (adv_px / sf + INSET_X + RIGHT_MARGIN).max(MIN_W)
-                    } else {
-                        MIN_W
-                    };
-                    let new_h = if th_px > 0.0 {
-                        (th_px / sf + TO_Y * 2.0).max(MIN_H)
-                    } else {
-                        MIN_H
-                    };
-                    let old_w = self.text_input_rect.size.x;
-                    let old_h = self.text_input_rect.size.y;
-                    self.text_input_rect.size = BoundsPoint::new(new_w, new_h);
-                    // 诊断「自动扩增时文字左移」：content 宽度 vs 行宽 advance。
-                    // 若 content - RIGHT_MARGIN < adv_px，光标贴近右缘时编辑器会
-                    // 产生负 scroll_offset 把整行左移（首字被 overflow_hidden 裁掉）。
-                    let content_w = new_w - INSET_X;
-                    let scroll = if content_w - RIGHT_MARGIN < adv_px {
-                        content_w - RIGHT_MARGIN - adv_px
-                    } else {
-                        0.0
-                    };
-                    if (old_w - new_w).abs() > 0.01 || (old_h - new_h).abs() > 0.01 {
-                        tracing::info!(
-                            "textbox auto-grow: value={:?} fs={:.1} sf={:.1} th_px={:.1} adv_px={:.1} box=({:.1},{:.1})->({:.1},{:.1}) content={:.1} scroll={:+.1}px",
-                            value, fs, sf, th_px, adv_px,
-                            old_w, old_h, new_w, new_h,
-                            content_w, scroll
-                        );
-                    }
-                }
-            }
-
+            // text_input_rect 已在 render 开头按内容 auto_grow，canvas 与这里读同一份值
             let rect = self.text_input_rect;
             let (lx, ly, lw, lh) = (rect.origin.x, rect.origin.y, rect.size.x, rect.size.y);
 
@@ -2870,11 +3080,14 @@ impl Render for OverlayView {
                 );
             } else {
                 let h_size = 6.0_f32;
-                let hh = h_size / 2.0;
-                let h_cx = lw / 2.0 - hh;
-                let h_cy = lh / 2.0 - hh;
-                let h_r = lw - h_size;
-                let h_b = lh - h_size;
+                // 手柄 8×8（与矩形选中框一致），中心在边框线上（跨线各一半）：
+                // 外侧一半靠去掉 overflow_hidden 保持可见
+                let hh = HANDLE_VISUAL_SIZE / 2.0;
+                let h_neg = -hh;
+                let h_mx = lw / 2.0 - hh;
+                let h_my = lh / 2.0 - hh;
+                let h_rx = lw - hh;
+                let h_by = lh - hh;
                 root = root.child(
                     div()
                         .absolute()
@@ -2882,18 +3095,14 @@ impl Render for OverlayView {
                         .left(px(lx))
                         .w(px(lw))
                         .h(px(lh))
-                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .child(
-                            // 顶部拖动 bar
+                            // 顶部透明占位（6px）：保证 Input 位置与提交态一致。
+                            // 边框线与移动由 text-move-top 覆盖层负责（单实线 + 小手拖动）。
                             div()
-                                .id("text-drag-bar")
                                 .w_full()
-                                .h(px(h_size))
-                                .bg(gpui::rgba(0x4A4A4AEE))
-                                .rounded_t_md()
-                                .cursor_move(),
+                                .h(px(h_size)),
                         )
                         .child(
                             div()
@@ -2902,7 +3111,7 @@ impl Render for OverlayView {
                                 .child(
                                     gpui_component::input::Input::new(input)
                                         .appearance(false)
-                                        .bordered(true)
+                                        .bordered(false)
                                         .text_color(gpui::rgba(rgba_u32(self.toolbar.current_color)))
                                         .with_size(gpui_component::Size::Size(gpui::px(
                                             self.toolbar.current_size / 0.875 / self.scale_factor,
@@ -2917,14 +3126,91 @@ impl Render for OverlayView {
                                         .line_height(gpui::relative(1.5)),
                                 ),
                         )
-                        .child(make_resize_handle("text-resize-nw", 0.0, 0.0, TextDragMode::ResizeNW))
-                        .child(make_resize_handle("text-resize-n", h_cx, 0.0, TextDragMode::ResizeN))
-                        .child(make_resize_handle("text-resize-ne", h_r, 0.0, TextDragMode::ResizeNE))
-                        .child(make_resize_handle("text-resize-w", 0.0, h_cy, TextDragMode::ResizeW))
-                        .child(make_resize_handle("text-resize-e", h_r, h_cy, TextDragMode::ResizeE))
-                        .child(make_resize_handle("text-resize-sw", 0.0, h_b, TextDragMode::ResizeSW))
-                        .child(make_resize_handle("text-resize-s", h_cx, h_b, TextDragMode::ResizeS))
-                        .child(make_resize_handle("text-resize-se", h_r, h_b, TextDragMode::ResizeSE)),
+                        // 四条单实线边框（1px，覆盖在 Input 边缘之上），同时也是移动
+                        // 抓取区：悬停四条边任意位置显示小手，按住即可拖动整框。
+                        // （Input 自身不再画边框，避免双线。）
+                        .child(
+                            div()
+                                .id("text-move-top")
+                                .absolute()
+                                .top(px(0.0))
+                                .left(px(0.0))
+                                .w(px(lw))
+                                .h(px(h_size))
+                                .border_t_1()
+                                .border_color(gpui::rgba(0x999999FF))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
+                                    begin_text_drag(this, TextDragMode::Move, ev, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("text-move-bottom")
+                                .absolute()
+                                .top(px(lh - h_size))
+                                .left(px(0.0))
+                                .w(px(lw))
+                                .h(px(h_size))
+                                .border_b_1()
+                                .border_color(gpui::rgba(0x999999FF))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
+                                    begin_text_drag(this, TextDragMode::Move, ev, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("text-move-left")
+                                .absolute()
+                                .top(px(0.0))
+                                .left(px(0.0))
+                                .w(px(h_size))
+                                .h(px(lh))
+                                .border_l_1()
+                                .border_color(gpui::rgba(0x999999FF))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
+                                    begin_text_drag(this, TextDragMode::Move, ev, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("text-move-right")
+                                .absolute()
+                                .top(px(0.0))
+                                .left(px(lw - h_size))
+                                .w(px(h_size))
+                                .h(px(lh))
+                                .border_r_1()
+                                .border_color(gpui::rgba(0x999999FF))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
+                                    begin_text_drag(this, TextDragMode::Move, ev, window, cx);
+                                })),
+                        )
+                        .child(make_resize_handle("text-resize-nw", h_neg, h_neg, TextDragMode::ResizeNW, cx))
+                        .child(make_resize_handle("text-resize-n", h_mx, h_neg, TextDragMode::ResizeN, cx))
+                        .child(make_resize_handle("text-resize-ne", h_rx, h_neg, TextDragMode::ResizeNE, cx))
+                        .child(make_resize_handle("text-resize-w", h_neg, h_my, TextDragMode::ResizeW, cx))
+                        .child(make_resize_handle("text-resize-e", h_rx, h_my, TextDragMode::ResizeE, cx))
+                        .child(make_resize_handle("text-resize-sw", h_neg, h_by, TextDragMode::ResizeSW, cx))
+                        .child(make_resize_handle("text-resize-s", h_mx, h_by, TextDragMode::ResizeS, cx))
+                        .child(make_resize_handle("text-resize-se", h_rx, h_by, TextDragMode::ResizeSE, cx))
+                        // 文字框自身的 mouse_move/mouse_up 兜底：拖动/缩放过程中鼠标
+                        // 始终落在框内（抓取点随框移动），即使事件没冒泡到 root 也能
+                        // 继续拖动，保证移动跟手、不卡顿。
+                        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                            if let Some(drag) = this.text_input_drag {
+                                apply_text_drag(this, drag, to_bounds_point(ev.position));
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                            if this.text_input_drag.is_some() {
+                                this.text_input_drag = None;
+                            }
+                        })),
                 );
             }
         }
@@ -3122,7 +3408,8 @@ impl Render for OverlayView {
                             this.text_input_finalized = false;
                             this.text_input_cmd_idx = None;
                             cx.notify();
-                            return;
+                            // 不 return：继续向下走命令命中检测，让这次点击能
+                            // 直接选中矩形/椭圆/箭头或重新编辑文字，而非只关闭输入框。
                         } else {
                             if let Some(drag) = hit_test_text_drag(this.text_input_rect, p) {
                                 this.text_input_drag = Some(drag);
@@ -3198,15 +3485,18 @@ impl Render for OverlayView {
                                         cmd_index: *idx,
                                     });
                                     tracing::debug!("mouse_down: HIT cmd idx={}", idx);
+                                    // 命中后立即重绘，否则手柄要等下一次 mouse_move 才出现
+                                    // （干净点击 down+up 不产生 move，会看起来"点不中"）。
+                                    cx.notify();
                                     return;
                                 }
                             }
                         }
-                        // 未命中任何命令 + 无绘图工具 → 取消选中
-                        if this.toolbar.active_tool.is_none()
-                            || this.toolbar.active_tool == Some(ToolButton::Text)
-                        {
+                        // 未命中任何命令 → 取消选中：只有点线条才选中，
+                        // 点其他任何区域（内部空白/外部/选区手柄）都取消选中。
+                        if this.selected_cmd_actual_idx.is_some() {
                             this.selected_cmd_actual_idx = None;
+                            cx.notify();
                         }
                     }
 
@@ -3320,7 +3610,15 @@ impl Render for OverlayView {
                 } else if this.selection.drag != DragState::Idle {
                     this.selection.mouse_move(p);
                 } else {
-                    // 纯 Idle：selection.mouse_move 是无操作，不触发无意义重绘
+                    // 纯 Idle：无拖拽/绘制。更新 hover 状态——鼠标悬停在可选中形状的
+                    // 描边线条上时显示小手光标；状态变化才重绘。
+                    let over = this.mode == OverlayMode::Editing
+                        && this.toolbar.active_tool != Some(ToolButton::Text)
+                        && any_shape_stroke_hit(&this.drawing, p);
+                    if over != this.hover_shape {
+                        this.hover_shape = over;
+                        cx.notify();
+                    }
                     return;
                 }
                 cx.notify();
@@ -3381,6 +3679,9 @@ impl Render for OverlayView {
                     // 先结束正在画的那一笔
                     if this.in_progress.is_some() {
                         this.finish_draw();
+                        // finish_draw 会 push 命令并自动选中，需立即重绘才能显示
+                        // 提交后的形状与拖拽手柄（否则停留在上一帧的 in-progress 画面）。
+                        cx.notify();
                         return;
                     }
                     this.selection.mouse_up();
@@ -4782,5 +5083,79 @@ mod tests {
         assert_eq!(search_path(&path, "missing"), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_move_down_keeps_size_and_clamps_to_selection() {
+        // 选区 (100,100)~(600,500)（size 500x400），文字框 (200,150)~(300,198)（size 100x48）
+        let limits = ub::Bounds::new(
+            BoundsPoint::new(100.0, 100.0),
+            BoundsPoint::new(600.0, 500.0),
+        );
+        let start = ub::Bounds::new(
+            BoundsPoint::new(200.0, 150.0),
+            BoundsPoint::new(300.0, 198.0),
+        );
+        // 从拖动条 (250,155) 按住往下拖 100px → dy=100，origin.y=150+100=250
+        let moved = text_move_rect(
+            start,
+            BoundsPoint::new(250.0, 155.0),
+            BoundsPoint::new(250.0, 255.0),
+            limits,
+        );
+        assert_eq!(moved.origin.y, 250.0);
+        assert_eq!(moved.size.y, 48.0, "尺寸必须保持，不能被压扁");
+        // 继续拖到底：max_y = 100+400-48 = 452
+        let bottom = text_move_rect(
+            start,
+            BoundsPoint::new(250.0, 155.0),
+            BoundsPoint::new(250.0, 500.0),
+            limits,
+        );
+        assert_eq!(bottom.origin.y, 452.0);
+        assert_eq!(bottom.size.y, 48.0);
+        // 水平方向同样只钳制 origin、保持宽度
+        let right = text_move_rect(
+            start,
+            BoundsPoint::new(250.0, 155.0),
+            BoundsPoint::new(600.0, 155.0),
+            limits,
+        );
+        assert_eq!(right.origin.x, 500.0, "max_x = 100+500-100 = 500");
+        assert_eq!(right.size.x, 100.0);
+    }
+
+    #[test]
+    fn text_resize_n_grows_up_and_clamps_at_min_height() {
+        // 文字框 (200,150)~(300,198)（size 100x48），抓顶部中点手柄
+        let start = ub::Bounds::new(
+            BoundsPoint::new(200.0, 150.0),
+            BoundsPoint::new(300.0, 198.0),
+        );
+        // 往上拖 20px：顶边跟随到 130，高度增至 68
+        let up = text_resize_n_rect(
+            start,
+            BoundsPoint::new(250.0, 150.0),
+            BoundsPoint::new(250.0, 130.0),
+        );
+        assert_eq!(up.origin.y, 130.0, "往上拖：顶边 y=150-20");
+        assert_eq!(up.size.y, 68.0, "高度=48+20");
+        assert_eq!(up.size.x, 100.0, "宽度不变");
+        // 往下拖 6px：顶边下移到 156、高度减至 42（仍 ≥ MIN_H）
+        let down = text_resize_n_rect(
+            start,
+            BoundsPoint::new(250.0, 150.0),
+            BoundsPoint::new(250.0, 156.0),
+        );
+        assert_eq!(down.origin.y, 156.0);
+        assert_eq!(down.size.y, 42.0);
+        // 拖过头：高度钳制到 MIN_H=40，顶边停在 150 + (48-40) = 158
+        let clamp = text_resize_n_rect(
+            start,
+            BoundsPoint::new(250.0, 150.0),
+            BoundsPoint::new(250.0, 400.0),
+        );
+        assert_eq!(clamp.size.y, 40.0);
+        assert_eq!(clamp.origin.y, 158.0, "MIN_H 时顶边 = origin + (size - MIN_H)");
     }
 }
