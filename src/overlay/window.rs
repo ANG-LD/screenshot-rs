@@ -49,6 +49,23 @@ enum OverlayMode {
     Editing,
 }
 
+/// 已提交形状（矩形/椭圆/箭头/自由线）的离屏光栅化缓存。
+///
+/// 形状光栅化（解析式 AA）是拖拽绘制热路径里最贵的部分：原实现每帧把所有
+/// 已提交形状重新光栅化一遍。这里按 `DrawingState.revision` 缓存：仅提交/
+/// 撤销/拖动等命令变更时重建，拖拽绘制期间每帧复用，只增量重绘
+/// `in_progress` 那一笔。
+struct ShapeLayerCache {
+    /// 快照时的 `DrawingState.revision`（失效判据）
+    revision: u64,
+    /// 快照时的 scale_factor（缩放改变则失效）
+    scale_factor: f32,
+    /// 已转 BGRA 的 RenderImage，可直接 paint_image
+    image: Arc<RenderImage>,
+    /// 联合包围盒（逻辑像素，含 AA 外扩），即 paint_image 的目标 Bounds
+    bounds: ub::Bounds,
+}
+
 /// GPUI 视图：覆盖窗口内容
 pub struct OverlayView {
     /// 捕获帧的 GPUI 渲染图（已转 BGRA）
@@ -75,6 +92,9 @@ pub struct OverlayView {
     drawing: DrawingState,
     /// 当前正在画的一笔（mouse_down 到 mouse_up 之间）
     in_progress: Option<DrawCommand>,
+
+    /// 已提交形状的离屏光栅化缓存（见 `ShapeLayerCache`）
+    shape_layer_cache: Option<ShapeLayerCache>,
 
     /// Text 工具：是否正在编辑一段文字
     ///
@@ -115,6 +135,10 @@ pub struct OverlayView {
     frame_width: u32,
     /// 捕获帧高度（物理像素）
     frame_height: u32,
+
+    /// 全屏原始捕获帧（仅当窗口被系统压缩、显示帧被裁剪时才保留）。
+    /// 会话结束时由 commit 原样归还给主线程，避免主线程整帧 clone。
+    original_frame: Option<CapturedFrame>,
 
     /// OCR 工具：选中的识别区域（None 表示尚未框选）
     ocr_rect: Option<ub::Bounds>,
@@ -231,11 +255,16 @@ pub struct OverlayResult {
     pub scroll_region_px: Option<ub::Bounds>,
     /// true 表示用户点了「手动滚动」：滚动由用户手动进行，应用只检测拼接
     pub scroll_manual: bool,
+    /// 覆盖层归还的原始捕获帧（移动，非复制）：主线程用它做最终裁剪，
+    /// 避免主线程先整帧 clone 再 clip_region。取消/滚动截屏等路径也会归还，
+    /// 调用方按需使用或直接丢弃。
+    pub frame: Option<CapturedFrame>,
 }
 
 impl OverlayView {
     fn new(
         frame: CapturedFrame,
+        original_frame: Option<CapturedFrame>,
         screen_bounds: ub::Bounds,
         client_origin: ub::Point,
         scale_factor: f32,
@@ -243,7 +272,11 @@ impl OverlayView {
         cx: &mut Context<Self>,
     ) -> Self {
         let this = Self {
-            frame_image: build_render_image(&frame),
+            frame_image: build_render_image_from_pixels(
+                frame.width,
+                frame.height,
+                frame.pixels.clone(),
+            ),
             screen_bounds,
             client_origin,
             selection: SelectionState::new(screen_bounds),
@@ -253,6 +286,7 @@ impl OverlayView {
             toolbar: ToolbarState::default(),
             drawing: DrawingState::new(),
             in_progress: None,
+            shape_layer_cache: None,
             text_input: None,
             text_input_anchor: BoundsPoint::ZERO,
             text_input_rect: ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO),
@@ -263,6 +297,7 @@ impl OverlayView {
             frame_pixels: frame.pixels,
             frame_width: frame.width,
             frame_height: frame.height,
+            original_frame,
             ocr_rect: None,
             ocr_result: None,
             ocr_loading: false,
@@ -283,7 +318,7 @@ impl OverlayView {
     /// 内部将 selection 和 commands 的坐标从逻辑像素转为物理像素，
     /// 以匹配 `CapturedFrame` 的物理像素坐标系（app.rs 的 clip_region 和
     /// commands.rs 的栅格化都用物理像素）。
-    fn commit(&self, result: OverlayResult, window: &mut Window) {
+    fn commit(&mut self, result: OverlayResult, window: &mut Window) {
         // 用实际窗口尺寸计算 canvas 坐标 → 帧物理像素的缩放比。
         // paint_image 会把帧图像缩放到 window.bounds() 内显示，因此
         // canvas 坐标要乘上 frame_dim / window_dim 才能正确映射到帧像素。
@@ -320,7 +355,25 @@ impl OverlayView {
         // scroll_region_px 在 Scroll 按钮处已换算成物理像素，这里原样透传，不参与缩放
         let scroll_region_px = result.scroll_region_px;
         let scroll_manual = result.scroll_manual;
-        let _ = self.tx.send(OverlayResult { selection, commands, no_clipboard, pin, scroll_region_px, scroll_manual });
+        // 归还原始帧（移动，零拷贝）：全屏时 frame_pixels 就是原帧；
+        // 窗口被系统压缩、显示帧被裁剪时返回单独保存的 original_frame。
+        let frame = match self.original_frame.take() {
+            Some(f) => f,
+            None => CapturedFrame {
+                width: self.frame_width,
+                height: self.frame_height,
+                pixels: std::mem::take(&mut self.frame_pixels),
+            },
+        };
+        let _ = self.tx.send(OverlayResult {
+            selection,
+            commands,
+            no_clipboard,
+            pin,
+            scroll_region_px,
+            scroll_manual,
+            frame: Some(frame),
+        });
         window.remove_window();
     }
 
@@ -561,10 +614,13 @@ impl OverlayView {
                 .auto_grow(3, 8)
                 .soft_wrap(false)
         });
-        // 预填旧内容（重新编辑场景）
+        // 预填旧内容（重新编辑场景）：直接移交所有权，避免 clone。
+        // 先重新借用 window，使 move 闭包只捕获该借用而非整个 &mut Window，
+        // 闭包用完后原借用自动失效，后续代码可继续使用 window。
         if let Some(text) = initial {
-            input.update(cx, |state, cx| {
-                state.set_value(text.clone(), window, cx);
+            let window = &mut *window;
+            input.update(cx, move |state, cx| {
+                state.set_value(text, window, cx);
             });
         }
         // 立即 focus，让键盘事件路由到这里（IME 组合也走 focus handle）
@@ -1079,6 +1135,7 @@ fn render_simple_button(
                                 pin: None,
                                 scroll_region_px: None,
                                 scroll_manual: false,
+                                frame: None,
                             },
                             window,
                         );
@@ -1132,16 +1189,14 @@ fn render_simple_button(
                                 sel_px.origin.x, sel_px.origin.y, sel_px.size.x, sel_px.size.y
                             );
 
-                            let full_pixels = this.frame_pixels.clone();
                             let fw = this.frame_width;
                             let fh = this.frame_height;
 
-                            let pin_frame = CapturedFrame {
-                                width: fw,
-                                height: fh,
-                                pixels: full_pixels,
-                            };
-                            if let Ok(mut clipped) = pin_frame.clip_region(
+                            // 直接从帧像素切片裁剪，避免先整帧 clone 再裁
+                            if let Ok(mut clipped) = CapturedFrame::clip_pixels(
+                                fw,
+                                fh,
+                                &this.frame_pixels,
                                 sel_px.origin.x as u32,
                                 sel_px.origin.y as u32,
                                 sel_px.size.x as u32,
@@ -1172,7 +1227,7 @@ fn render_simple_button(
                             }
                         }
 
-                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true, pin, scroll_region_px: None, scroll_manual: false }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: true, pin, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                     }
                     ToolButton::Scroll | ToolButton::ScrollManual => {
                         // 滚动截屏：把选区（物理像素）交给主线程去滚动拼接。
@@ -1201,6 +1256,7 @@ fn render_simple_button(
                                 pin: None,
                                 scroll_region_px: Some(region),
                                 scroll_manual: manual,
+                                frame: None,
                             },
                             window,
                         );
@@ -1211,7 +1267,7 @@ fn render_simple_button(
                         let s = this.selection.current().or(Some(this.screen_bounds));
                         let cmds: Vec<DrawCommand> =
                             this.drawing.visible_commands().cloned().collect();
-                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
+                        this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                     }
                     _ => {}
                 }
@@ -1519,7 +1575,7 @@ fn hit_test_cmd_drag(cmd: &DrawCommand, p: BoundsPoint) -> Option<CmdDragMode> {
             let len_sq = dx * dx + dy * dy;
             if len_sq > 0.0 {
                 let t = ((p.x - from.x) * dx + (p.y - from.y) * dy) / len_sq;
-                if t >= 0.0 && t <= 1.0 {
+                if (0.0..=1.0).contains(&t) {
                     let proj_x = from.x + t * dx;
                     let proj_y = from.y + t * dy;
                     let dist = ((p.x - proj_x).powi(2) + (p.y - proj_y).powi(2)).sqrt();
@@ -1639,6 +1695,8 @@ fn apply_cmd_drag(this: &mut OverlayView, drag: CmdDragState, p: BoundsPoint) {
             }
         }
     }
+    // 命令已原地修改：递增 revision，让形状层缓存在下一帧失效重建
+    this.drawing.revision += 1;
 }
 
 /// 构造文字输入框的角 resize handle（6×6 方块）
@@ -1670,10 +1728,11 @@ fn make_resize_handle(
         .cursor(cursor)
 }
 
-fn build_render_image(frame: &CapturedFrame) -> Arc<RenderImage> {
-    let mut pixels = frame.pixels.clone();
+/// 由 RGBA 像素数据构建 GPUI RenderImage（原地转 BGRA 后移交所有权，
+/// 避免整帧 clone）。调用方不再需要该像素时直接传入，零拷贝。
+fn build_render_image_from_pixels(width: u32, height: u32, mut pixels: Vec<u8>) -> Arc<RenderImage> {
     rgba_to_bgra(&mut pixels);
-    let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, pixels)
+    let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
         .expect("CapturedFrame 像素长度必须与 width*height*4 一致");
     Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)))
 }
@@ -1816,32 +1875,29 @@ fn paint_ellipse_outline(x: f32, y: f32, w: f32, h: f32, lw: f32, color: RGBA, w
 /// 把矩形/椭圆/箭头/画图这 4 类形状用解析式抗锯齿光栅化到离屏缓冲，再整幅贴到 canvas。
 ///
 /// 原 preview 用 `paint_thick_line` 叠很多小圆角 quad，每个 quad 的 bounds 会被
-/// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感。这里复用
-/// commit 路径的 `commands::apply_commands` 逐像素解析式 AA（smoothstep 覆盖率），
-/// 得到与最终成图一致的平滑线条。Text（元素层渲染）与 Mosaic（棋盘模拟）不经过这里。
-fn paint_drawing_layer(
-    visible_cmds: &[DrawCommand],
-    in_progress: Option<&DrawCommand>,
+/// 是否为走离屏解析式 AA 的形状命令（Text/Mosaic 由元素层 / 即时模式绘制）
+fn is_shape_command(c: &DrawCommand) -> bool {
+    matches!(
+        c,
+        DrawCommand::Rectangle { .. }
+            | DrawCommand::Ellipse { .. }
+            | DrawCommand::Arrow { .. }
+            | DrawCommand::Freehand { .. }
+    )
+}
+
+/// 光栅化一组形状命令到 BGRA 图像 + 联合包围盒（逻辑像素，含 AA 外扩）。
+///
+/// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感，所以这里
+/// 复用 commit 路径的 `commands::apply_commands` 逐像素解析式 AA，得到与最终成图
+/// 一致的平滑线条。返回 `None` 若无形状。
+fn rasterize_shapes(
+    shapes: &[&DrawCommand],
     scale_factor: f32,
-    window: &mut Window,
-) {
-    let is_shape = |c: &DrawCommand| {
-        matches!(
-            c,
-            DrawCommand::Rectangle { .. }
-                | DrawCommand::Ellipse { .. }
-                | DrawCommand::Arrow { .. }
-                | DrawCommand::Freehand { .. }
-        )
-    };
-    let mut shapes: Vec<&DrawCommand> = visible_cmds.iter().filter(|c| is_shape(c)).collect();
-    if let Some(ip) = in_progress {
-        if is_shape(ip) {
-            shapes.push(ip);
-        }
-    }
+    window: &Window,
+) -> Option<(Arc<RenderImage>, ub::Bounds)> {
     if shapes.is_empty() {
-        return;
+        return None;
     }
 
     // 联合包围盒（逻辑像素）+ 最大线宽，外扩 padding 覆盖描边/箭头外扩
@@ -1850,7 +1906,7 @@ fn paint_drawing_layer(
     let mut max_lw = 0.0_f32;
     // 箭头头的底边半宽（head_w = 2*line_width），垂直方向超出箭杆中线，需计入外扩
     let mut max_arrow_head_w = 0.0_f32;
-    for cmd in &shapes {
+    for cmd in shapes.iter().copied() {
         match cmd {
             DrawCommand::Rectangle { rect, line_width, .. }
             | DrawCommand::Ellipse { rect, line_width, .. } => {
@@ -1901,7 +1957,7 @@ fn paint_drawing_layer(
     let phys_w = (size_w * scale_factor).round() as u32;
     let phys_h = (size_h * scale_factor).round() as u32;
     if phys_w == 0 || phys_h == 0 {
-        return;
+        return None;
     }
     let phys_origin_x = origin_x * scale_factor;
     let phys_origin_y = origin_y * scale_factor;
@@ -1913,7 +1969,8 @@ fn paint_drawing_layer(
         pixels: vec![0; (phys_w * phys_h * 4) as usize],
     };
     let scaled: Vec<DrawCommand> = shapes
-        .into_iter()
+        .iter()
+        .copied()
         .map(|c| scale_draw_command(c, scale_factor, scale_factor))
         .collect();
     let _ = crate::overlay::commands::apply_commands(
@@ -1923,14 +1980,25 @@ fn paint_drawing_layer(
         &scaled,
     );
 
-    let img = build_render_image(&frame);
+    let img = build_render_image_from_pixels(frame.width, frame.height, frame.pixels);
+    Some((
+        img,
+        ub::Bounds {
+            origin: ub::Point::new(origin_x, origin_y),
+            size: ub::Point::new(size_w, size_h),
+        },
+    ))
+}
+
+/// 把已光栅化的形状层画到窗口
+fn paint_raster(window: &mut Window, image: &Arc<RenderImage>, bounds: ub::Bounds) {
     let _ = window.paint_image(
         Bounds {
-            origin: gpui::point(gpui::px(origin_x), gpui::px(origin_y)),
-            size: Size::new(gpui::px(size_w), gpui::px(size_h)),
+            origin: gpui::point(gpui::px(bounds.origin.x), gpui::px(bounds.origin.y)),
+            size: Size::new(gpui::px(bounds.size.x), gpui::px(bounds.size.y)),
         },
         Default::default(),
-        img,
+        image.clone(),
         0,
         false,
     );
@@ -1955,7 +2023,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
             let h = (b.y - a.y).abs();
             paint_ellipse_outline(x1, y1, w, h, *line_width, *color, window);
         }
-        // 箭头由 paint_drawing_layer 走离屏解析式 AA（与最终成图一致），这里无需处理
+        // 箭头由形状层走离屏解析式 AA（与最终成图一致），这里无需处理
         DrawCommand::Arrow { .. } => {}
         DrawCommand::Freehand { ref points, color, line_width } => {
             for w in points.windows(2) {
@@ -1995,7 +2063,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 // 只把 max_width 传给 paint 作对齐宽度（TextAlign::Left 下无效）。
                 // 不能传 force_width 给 shape_line：GPUI 会把超出宽度的字形按
                 // glyph_index*force_width 重排，文本宽于框时中间出现整段空隙（"文字分开"）。
-                let force_width = max_width.map(|mw| px(mw));
+                let force_width = max_width.map(px);
 
                 for line_text in content.split('\n') {
                     if line_text.is_empty() {
@@ -2121,17 +2189,39 @@ fn run_ocr_sync(
         }
     }
 
-    // 写入调试 PNG（用系统临时目录，Linux 的 /tmp 在 Windows/macOS 上不存在）
+    // tesseract 按 ~300dpi 训练，屏幕截图 1x 文本偏小，中英混排/小字号极易误识
+    // （如「整帧 clone → 零拷贝借用」被读成乱码）。放大到长边 ≤4096px（最多 3 倍）
+    // 再转灰度，消除亚像素彩边，能显著提升识别率。
+    let upscale = (4096u32 / w.max(h).max(1)).clamp(1, 3);
+    let src =
+        image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| image::RgbImage::new(w, h));
+    let up = if upscale > 1 {
+        image::imageops::resize(
+            &src,
+            w.saturating_mul(upscale).max(1),
+            h.saturating_mul(upscale).max(1),
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        src
+    };
+    let gray = image::DynamicImage::ImageRgb8(up).into_luma8();
+
+    // 写入预处理后的调试 PNG（作为 tesseract 输入；用系统临时目录，Linux 的
+    // /tmp 在 Windows/macOS 上不存在）
     let debug_path = std::env::temp_dir().join("screenshot_ocr_debug.png");
-    {
-        let img = image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| {
-            image::RgbImage::new(w, h)
-        });
-        if let Err(e) = img.save(&debug_path) {
-            tracing::error!("OCR: 保存调试 PNG 失败: {}", e);
-        } else {
-            tracing::info!("OCR: 调试 PNG 已保存到 {}", debug_path.display());
-        }
+    if let Err(e) = gray.save(&debug_path) {
+        tracing::error!("OCR: 保存调试 PNG 失败: {}", e);
+    } else {
+        tracing::info!(
+            "OCR: 调试 PNG 已保存到 {} ({}x{} → {}x{} ×{})",
+            debug_path.display(),
+            w,
+            h,
+            gray.width(),
+            gray.height(),
+            upscale,
+        );
     }
 
     // 调用 tesseract：优先 exe 旁的打包版 → 缓存（已下载）→ 系统 PATH；
@@ -2177,13 +2267,27 @@ fn tesseract_exe_name() -> &'static str {
     { "tesseract" }
 }
 
+/// 在系统 PATH 中查找可执行文件（如 apt/brew 装的 `/usr/bin/tesseract`）。
+fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    search_path(&path_var, name)
+}
+
+/// 在给定的 PATH 字符串中查找可执行文件；纯函数便于测试。
+fn search_path(path_var: &std::ffi::OsStr, name: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(name))
+        .find(|c| c.is_file())
+}
+
 /// 找到可用的 tesseract 可执行文件；找不到则自动从 GitHub 下载并解压到缓存。
 ///
 /// 返回 `(tesseract_bin, tessdata_dir)`：
 /// - 优先配置/环境变量指定的 engine_path
 /// - 其次 exe 旁的打包版（Windows: `<exe>/tesseract/tesseract.exe`，其余: `<exe>/bin/tesseract`）
 /// - 其次缓存（`<cache>/tesseract/<平台可执行名>`，首次使用下载到这里）
-/// - 最后回退系统 PATH（返回 "tesseract"，让 Command 报错提示安装）
+/// - 其次系统 PATH（如 apt/brew 装的 `/usr/bin/tesseract`）
+/// - 最后自动下载
 fn find_or_download_tesseract() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
     // 0) 配置/环境变量显式指定的 tesseract 路径
     if let Some(ep) = crate::config::engine_path() {
@@ -2217,6 +2321,11 @@ fn find_or_download_tesseract() -> (std::path::PathBuf, Option<std::path::PathBu
     }
     if cache_bin.exists() {
         return (cache_bin, Some(cache_td).filter(|p| p.exists()));
+    }
+    // 系统已安装（PATH 中的 tesseract）直接用，不下载
+    if let Some(sys) = find_in_path(tesseract_exe_name()) {
+        tracing::info!("OCR: 使用系统 tesseract: {}", sys.display());
+        return (sys, None);
     }
 
     tracing::info!("未检测到 tesseract，尝试从 {} 下载…", crate::config::download_url());
@@ -2286,7 +2395,7 @@ fn download_tesseract(cache: &std::path::Path) -> Result<(), String> {
 }
 
 impl Render for OverlayView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // dim 遮罩直接到位（无淡入动画）——动画造成"两次变暗"的视觉，感知上拖慢响应
 
         let frame_image = self.frame_image.clone();
@@ -2314,6 +2423,40 @@ impl Render for OverlayView {
             }
         });
         let scale_factor = self.scale_factor;
+
+        // 已提交形状层：命令/缩放未变则复用缓存，仅在提交/撤销/拖动等编辑时重建
+        let drawing_revision = self.drawing.revision;
+        let cache_stale = match &self.shape_layer_cache {
+            None => true,
+            Some(c) => c.revision != drawing_revision || c.scale_factor != scale_factor,
+        };
+        if cache_stale {
+            let committed: Vec<&DrawCommand> = self
+                .drawing
+                .visible_commands()
+                .filter(|c| is_shape_command(c))
+                .collect();
+            self.shape_layer_cache =
+                rasterize_shapes(&committed, scale_factor, window).map(|(image, bounds)| {
+                    ShapeLayerCache {
+                        revision: drawing_revision,
+                        scale_factor,
+                        image,
+                        bounds,
+                    }
+                });
+        }
+        let committed_shape_layer = self
+            .shape_layer_cache
+            .as_ref()
+            .map(|c| (c.image.clone(), c.bounds));
+
+        // 当前笔画：每帧增量重绘（只含 in_progress 那一笔，量小）
+        let in_progress_shape_layer = match &self.in_progress {
+            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[ip], scale_factor, window),
+            _ => None,
+        };
+
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
         // （已提交文字由元素层 Input 绘制）。
         let skip_canvas_idx: Option<usize> =
@@ -2324,8 +2467,8 @@ impl Render for OverlayView {
         let dim_opacity = self.dim_opacity;
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
-            move |_, (in_progress, visible_cmds, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity), window, cx| {
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
@@ -2415,32 +2558,29 @@ impl Render for OverlayView {
 
                     // 2.5) 可见的 DrawCommand + 当前 in_progress（在 dim 之上、border 之下）
                     // 跳过已提交但由元素层展示的 Text 命令，避免文字重复
-                    // 矩形/椭圆/箭头/画图 → paint_drawing_layer 离屏解析式 AA；
+                    // 矩形/椭圆/箭头/画图 → 已提交形状走缓存 + in_progress 增量重绘；
                     // Text（GPUI 文字）/ Mosaic（棋盘模拟）仍走 paint_command。
-                    let is_buffer_shape = |c: &DrawCommand| {
-                        matches!(
-                            c,
-                            DrawCommand::Rectangle { .. }
-                                | DrawCommand::Ellipse { .. }
-                                | DrawCommand::Arrow { .. }
-                                | DrawCommand::Freehand { .. }
-                        )
-                    };
                     for (i, cmd) in visible_cmds.iter().enumerate() {
                         if skip_canvas_idx == Some(i) {
                             continue;
                         }
-                        if is_buffer_shape(cmd) {
+                        if is_shape_command(cmd) {
                             continue;
                         }
                         paint_command(cmd, window, cx, scale_factor);
                     }
                     if let Some(ref ip) = in_progress {
-                        if !is_buffer_shape(ip) {
+                        if !is_shape_command(ip) {
                             paint_command(ip, window, cx, scale_factor);
                         }
                     }
-                    paint_drawing_layer(&visible_cmds, in_progress.as_ref(), scale_factor, window);
+                    // 形状层：已提交形状（缓存）先画，in_progress 那一笔增量叠在其上
+                    if let Some((img, b)) = &committed_shape_layer {
+                        paint_raster(window, img, *b);
+                    }
+                    if let Some((img, b)) = &in_progress_shape_layer {
+                        paint_raster(window, img, *b);
+                    }
 
                     // 2.55) OCR 框选矩形（高亮半透明 + 绿色描边）
                     if let Some(ocr) = ocr_rect {
@@ -2796,7 +2936,7 @@ impl Render for OverlayView {
             let panel_y = screen_bounds.origin.y;
             let panel_h = screen_bounds.size.y;
             let weak = cx.weak_entity();
-            let text_for_ui = text.clone();
+            let text_for_ui = text.as_str();
             root = root.child(
                 div()
                     .absolute()
@@ -2831,18 +2971,21 @@ impl Render for OverlayView {
                             .child(
                                 div().flex().gap(px(4.0))
                                     .child({
-                                        let t = text_for_ui.clone();
+                                        let t = text_for_ui.to_owned();
                                         Button::new("ocr-copy")
                                             .icon(IconName::Copy)
                                             .compact()
-                                            .on_click(move |_, _window, cx| {
-                                                // 用 GPUI 的 write_to_clipboard（底层 X11
-                                                // Clipboard 长存于 client），而不是每次
-                                                // arboard::Clipboard::new()——后者 drop 即
-                                                // 释放 X11 所有权，粘贴拿到空 → "复制没效果"。
-                                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                    t.clone(),
-                                                ));
+                                            .on_click(move |_, _window, _cx| {
+                                                // 走进程级长存 arboard 剪贴板单例：X11 上
+                                                // Clipboard drop 即释放所有权、粘贴拿到空，
+                                                // 所以必须复用长存实例（而非 GPUI 的
+                                                // write_to_clipboard，其底层错误被吞掉、
+                                                // Wayland 下还要求窗口持有焦点才写）。
+                                                if let Err(e) =
+                                                    crate::clipboard::global().write_text(&t)
+                                                {
+                                                    tracing::error!("[OCR] 复制失败: {e}");
+                                                }
                                             })
                                     })
                                     .child({
@@ -3269,7 +3412,7 @@ impl Render for OverlayView {
                             .visible_commands()
                             .cloned()
                             .collect();
-                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
+                        this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                     }
                 }),
             )
@@ -3281,7 +3424,7 @@ impl Render for OverlayView {
                         cx.notify();
                         return;
                     }
-                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
+                    this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                 } else if ev.keystroke.key == "enter" {
                     // Enter 先尝试提交活跃的 Text 输入（如果 Text 工具正在输入）。
                     // 若 finalize 了 Text 命令，说明这次 Enter 是\"写字时按 Enter 提交\"
@@ -3298,7 +3441,7 @@ impl Render for OverlayView {
                         .visible_commands()
                         .cloned()
                         .collect();
-                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false }, window);
+                    this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                 } else if ev.keystroke.key == "z" && ev.keystroke.modifiers.control {
                     // Ctrl+Z 撤销 / Ctrl+Shift+Z 重做
                     if ev.keystroke.modifiers.shift {
@@ -3310,9 +3453,11 @@ impl Render for OverlayView {
                     cx.notify();
                 } else if ev.keystroke.key == "c" && ev.keystroke.modifiers.control {
                     // Ctrl+C：若 OCR 结果面板可见，复制全部识别文字
-                    // 与复制按钮一样走 GPUI 长存剪贴板，避免 arboard drop 丢 X11 所有权
+                    // 与复制按钮一样走长存 arboard 剪贴板单例。
                     if let Some(ref text) = this.ocr_result {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                        if let Err(e) = crate::clipboard::global().write_text(text) {
+                            tracing::error!("[OCR] 复制失败: {e}");
+                        }
                     }
                 }
             }))
@@ -3356,13 +3501,13 @@ struct PinWindowView {
 }
 
 impl PinWindowView {
-    fn new(frame: &CapturedFrame, cx: &mut Context<Self>) -> Self {
+    fn new(frame: CapturedFrame, cx: &mut Context<Self>) -> Self {
         tracing::info!(
             "[Pin] PinWindowView::new: frame={}x{}",
             frame.width, frame.height
         );
         Self {
-            image: build_render_image(frame),
+            image: build_render_image_from_pixels(frame.width, frame.height, frame.pixels),
             focus_handle: cx.focus_handle(),
             is_always_on_top: false,
             hovered_button: None,
@@ -3788,7 +3933,7 @@ fn send_wm_state_above(window: &mut Window, add: bool) {
                             32,
                             xcb_wh.window.into(),
                             state_atom,
-                            [action, above_atom.into(), 0, 1, 0],
+                            [action, above_atom, 0, 1, 0],
                         );
                         let _ = send_event(
                             &conn,
@@ -3896,7 +4041,7 @@ fn pin_toggle_maximize(window: &mut Window) {
                             32,
                             xcb_wh.window.into(),
                             state,
-                            [2, h.into(), v.into(), 1, 0], // 2=Toggle
+                            [2, h, v, 1, 0], // 2=Toggle
                         );
                         let _ = send_event(
                             &conn,
@@ -3977,6 +4122,7 @@ impl OverlayService {
             pin: None,
             scroll_region_px: None,
             scroll_manual: false,
+            frame: None,
         });
 
         result
@@ -4312,20 +4458,25 @@ fn open_overlay_in_app(
             let src_y = (f32::from(actual.origin.y) * sy) as u32;
             let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
             let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
-            // 全屏窗口直接复用 frame，避免 clip_region 做一整帧 memcpy
-            let clipped = if src_x == 0 && src_y == 0 && clip_w == frame.width && clip_h == frame.height
-            {
-                frame
+            // 全屏窗口直接复用 frame（避免整帧 clone）；窗口被系统压缩时才
+            // 裁剪出显示区域，并保留原帧供会话结束时归还主线程做最终裁剪。
+            let fullscreen =
+                src_x == 0 && src_y == 0 && clip_w == frame.width && clip_h == frame.height;
+            let (display, original) = if fullscreen {
+                (frame, None)
             } else {
-                frame.clip_region(src_x, src_y, clip_w, clip_h).unwrap_or(frame)
+                match frame.clip_region(src_x, src_y, clip_w, clip_h) {
+                    Ok(clipped) => (clipped, Some(frame)),
+                    Err(_) => (frame, None),
+                }
             };
 
-            let scale = clipped.width as f32 / actual_w;
+            let scale = display.width as f32 / actual_w;
             let logical_bounds =
                 ub::Bounds::new(ub::Point::ZERO, ub::Point::new(actual_w, actual_h));
 
             let view = cx.new(|cx| {
-                OverlayView::new(clipped, logical_bounds, client_origin, scale, tx, cx)
+                OverlayView::new(display, original, logical_bounds, client_origin, scale, tx, cx)
             });
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
@@ -4558,7 +4709,7 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
                 }
             }
 
-            let view = cx.new(|cx| PinWindowView::new(&pin_frame, cx));
+            let view = cx.new(|cx| PinWindowView::new(pin_frame, cx));
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
             view
@@ -4608,5 +4759,28 @@ fn adjust_window_client_top(window: &mut Window, desired_client_top: i32) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_path_finds_existing_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("screenshot-rs-path-test-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("tesseract");
+        std::fs::write(&bin, b"x").unwrap();
+        let path = std::env::join_paths([&dir]).unwrap();
+
+        assert_eq!(search_path(&path, "tesseract"), Some(bin));
+        assert_eq!(search_path(&path, "missing"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

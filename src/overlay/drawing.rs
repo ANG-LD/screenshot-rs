@@ -111,6 +111,9 @@ pub struct DrawingState {
     pub commands: Vec<DrawCommand>,
     /// 当前可见的命令数量（0..=commands.len()）
     pub history_index: usize,
+    /// 任何命令内容/可见集变更都递增：渲染缓存据此判断是否需要重建
+    /// （push / undo / redo / remove 内部自增；命令拖拽等原地修改在调用方自增）。
+    pub revision: u64,
 }
 
 impl DrawingState {
@@ -118,6 +121,7 @@ impl DrawingState {
         Self {
             commands: Vec::new(),
             history_index: 0,
+            revision: 0,
         }
     }
 
@@ -128,12 +132,14 @@ impl DrawingState {
         self.commands.truncate(self.history_index);
         self.commands.push(cmd);
         self.history_index = self.commands.len();
+        self.revision += 1;
     }
 
     /// 撤销：将 history_index 减 1（不会真正删除命令）
     pub fn undo(&mut self) {
         if self.history_index > 0 {
             self.history_index -= 1;
+            self.revision += 1;
         }
     }
 
@@ -141,6 +147,7 @@ impl DrawingState {
     pub fn redo(&mut self) {
         if self.history_index < self.commands.len() {
             self.history_index += 1;
+            self.revision += 1;
         }
     }
 
@@ -178,6 +185,7 @@ impl DrawingState {
         }
         let cmd = self.commands.remove(index);
         self.history_index -= 1;
+        self.revision += 1;
         Some(cmd)
     }
 }

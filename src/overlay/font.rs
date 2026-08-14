@@ -26,8 +26,8 @@ static BOLD_BYTES: once_cell::sync::Lazy<Vec<u8>> =
     once_cell::sync::Lazy::new(|| FontWeight::Bold.font_bytes().to_vec());
 
 thread_local! {
-    static FONT_SYSTEM: RefCell<Option<FontSystem>> = RefCell::new(None);
-    static SWASH_CACHE: RefCell<Option<SwashCache>> = RefCell::new(None);
+    static FONT_SYSTEM: RefCell<Option<FontSystem>> = const { RefCell::new(None) };
+    static SWASH_CACHE: RefCell<Option<SwashCache>> = const { RefCell::new(None) };
 }
 
 /// 当前线程懒初始化并借用 FontSystem（Regular + Bold 已 load）
@@ -67,6 +67,6 @@ mod tests {
 
     #[test]
     fn swash_cache_initializes_without_panic() {
-        let _ = with_swash_cache(|_| ());
+        with_swash_cache(|_| ());
     }
 }

@@ -29,8 +29,7 @@ impl CachedConn {
         let screen = conn
             .setup()
             .roots
-            .iter()
-            .nth(screen_num)
+            .get(screen_num)
             .ok_or_else(|| AppError::Window("找不到 X 屏幕".into()))?;
         Ok(Self {
             root: screen.root,

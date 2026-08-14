@@ -21,22 +21,39 @@ impl CapturedFrame {
     ///
     /// 用于在 EDITING 阶段只取选区对应的像素，丢弃不必要的数据。
     pub fn clip_region(&self, x: u32, y: u32, w: u32, h: u32) -> AppResult<CapturedFrame> {
-        if x + w > self.width || y + h > self.height {
+        Self::clip_pixels(self.width, self.height, &self.pixels, x, y, w, h)
+    }
+
+    /// 从 (width, height, pixels) 原始像素切片直接裁剪 (w, h) 子区域。
+    ///
+    /// 与 `clip_region` 等价，但接受任意像素切片：调用方手里只有整帧像素
+    /// （如覆盖层视图的 `frame_pixels`）时，无需先构造整帧 `CapturedFrame`
+    /// 再裁剪，省去一整帧的 clone。
+    pub fn clip_pixels(
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> AppResult<CapturedFrame> {
+        if x + w > width || y + h > height {
             return Err(AppError::Window(format!(
                 "裁剪区域 ({}x{} @ {},{}) 超出图像尺寸 {}x{}",
-                w, h, x, y, self.width, self.height
+                w, h, x, y, width, height
             )));
         }
-        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
         for row in y..(y + h) {
-            let start = (row * self.width + x) as usize * 4;
+            let start = (row * width + x) as usize * 4;
             let end = start + w as usize * 4;
-            pixels.extend_from_slice(&self.pixels[start..end]);
+            out.extend_from_slice(&pixels[start..end]);
         }
         Ok(CapturedFrame {
             width: w,
             height: h,
-            pixels,
+            pixels: out,
         })
     }
 }

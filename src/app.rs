@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use crate::capture::platform_capture;
 use crate::clipboard::ClipboardService;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::hotkey::{HotkeyEvent, HotkeyService};
 use crate::overlay::window::OverlayService;
 use crate::scroll::ScrollProgress;
@@ -105,8 +105,10 @@ impl AppState {
         );
         tracing::info!("捕获到 {}x{} 帧 (capture={:.0}ms)", frame.width, frame.height, t1.as_millis());
 
-        // GPUI 覆盖层（阻塞直到用户选完/取消；常驻应用内开窗）
-        let result = self.overlay.open_overlay(frame.clone(), screen_bounds);
+        // GPUI 覆盖层（阻塞直到用户选完/取消；常驻应用内开窗）。
+        // 整帧所有权移交给覆盖层，会话结束时原样归还（OverlayResult.frame），
+        // 避免主线程先整帧 clone 再在覆盖层内各自持有。
+        let result = self.overlay.open_overlay(frame, screen_bounds);
         let t2 = t0.elapsed();
         tracing::info!("overlay 打开 (overlay_open={:.0}ms total={:.0}ms)", (t2 - t1).as_millis(), t2.as_millis());
         // 滚动截屏：selection=None（会被当取消）必须先于选区分支处理
@@ -139,6 +141,12 @@ impl AppState {
 
         // 裁剪并写入剪贴板（Pin 固定时跳过）
         if !result.no_clipboard {
+            // 覆盖层归还的原帧（移动，非复制）；仅当覆盖层线程异常退出、
+            // 回复通道断开（recv 失败）时才可能为 None，而那种情况 selection
+            // 也是 None、早已提前返回，这里兜底报错即可。
+            let frame = result
+                .frame
+                .ok_or_else(|| AppError::Window("覆盖层未归还捕获帧，无法裁剪".into()))?;
             let mut clipped = frame.clip_region(
                 region.origin.x as u32,
                 region.origin.y as u32,

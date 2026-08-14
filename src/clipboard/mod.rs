@@ -12,12 +12,25 @@
 //! `ClipboardService` 因此必须把 `Clipboard` 实例存为字段，长存于整个进程
 //! 生命周期内。Mutex 保护是为了在第一次写入失败后能 lazy 重连。
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use arboard::ImageData;
 
 use crate::capture::CapturedFrame;
 use crate::error::{AppError, AppResult};
+
+/// 用帧的宽高与像素切片构建 arboard ImageData。
+///
+/// `bytes` 借用调用方像素（Cow::Borrowed）：`set_image` 在调用期间同步完成
+/// 编码（Linux 编 PNG / Windows 建 DIB），不会在返回后持有数据，因此
+/// 成功路径零拷贝。
+fn image_data<'a>(frame: &CapturedFrame, pixels: &'a [u8]) -> ImageData<'a> {
+    ImageData {
+        width: frame.width as usize,
+        height: frame.height as usize,
+        bytes: std::borrow::Cow::Borrowed(pixels),
+    }
+}
 
 /// 跨平台剪贴板服务
 ///
@@ -71,17 +84,13 @@ impl ClipboardService {
             )));
         }
 
-        // 按需构建 ImageData：成功路径只克隆一次像素（原先 set_image 参数再
-        // clone 一次 Cow），重连重试是罕见路径，重复克隆可接受。
-        let build = |pixels: &Vec<u8>| ImageData {
-            width: frame.width as usize,
-            height: frame.height as usize,
-            bytes: pixels.clone().into(), // Cow<[u8]>
-        };
+        // 按需构建 ImageData：借用帧像素（Cow::Borrowed）。arboard 的 set_image
+        // 在调用期间同步编码（Linux 编 PNG / Windows 建 DIB），不会持有数据，
+        // 因此成功路径零拷贝；重连重试路径同样只是借用，仍无复制。
         let clipboard = guard
             .as_mut()
             .expect("刚 ensure 完不应为 None");
-        match clipboard.set_image(build(&frame.pixels)) {
+        match clipboard.set_image(image_data(frame, &frame.pixels)) {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!("剪贴板写入失败，重连重试一次：{e}");
@@ -89,11 +98,47 @@ impl ClipboardService {
                 let mut new_clipboard =
                     arboard::Clipboard::new().map_err(AppError::Clipboard)?;
                 new_clipboard
-                    .set_image(build(&frame.pixels))
+                    .set_image(image_data(frame, &frame.pixels))
                     .map_err(AppError::Clipboard)?;
                 *guard = Some(new_clipboard);
                 Ok(())
             }
         }
     }
+
+    /// 把文本写入剪贴板（OCR 结果复制用）
+    ///
+    /// 与 `write_frame` 一样复用长存的 arboard 连接：X11 上 `Clipboard` drop
+    /// 即释放剪贴板所有权、粘贴拿到空，所以必须长存实例。失败时重连重试一次。
+    pub fn write_text(&self, text: &str) -> AppResult<()> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| AppError::Window(format!("ClipboardService Mutex poisoned: {e}")))?;
+        if guard.is_none() {
+            *guard = Some(arboard::Clipboard::new().map_err(AppError::Clipboard)?);
+        }
+        let clipboard = guard.as_mut().expect("刚 ensure 完不应为 None");
+        match clipboard.set_text(text) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!("剪贴板文本写入失败，重连重试一次：{e}");
+                *guard = None;
+                let mut new_clipboard = arboard::Clipboard::new().map_err(AppError::Clipboard)?;
+                new_clipboard.set_text(text).map_err(AppError::Clipboard)?;
+                *guard = Some(new_clipboard);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// 进程级剪贴板服务单例。
+///
+/// GPUI 覆盖线程的 OCR 复制与主线程的图像写入可能在不同线程调用；arboard 的
+/// `Clipboard` 底层是进程内全局单例（各实例共享同一 X11 连接/窗口），因此这里
+/// 也用一个全局 `ClipboardService` 保证实例长存、X11 剪贴板所有权不丢。
+pub fn global() -> &'static ClipboardService {
+    static SVC: OnceLock<ClipboardService> = OnceLock::new();
+    SVC.get_or_init(ClipboardService::new)
 }

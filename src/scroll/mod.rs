@@ -144,8 +144,12 @@ pub fn run_scroll_capture(
         let frame_w = a.width;
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        // 诊断：全屏基线，用于对比滚动发生后全屏变化的位置
-        let mut last_full = capture.capture_primary().ok();
+        // 诊断：全屏基线，用于对比滚动发生后全屏变化的位置（仅诊断模式启用）
+        let mut last_full = if diagnostics_enabled() {
+            capture.capture_primary().ok()
+        } else {
+            None
+        };
         let displays = capture.list_displays();
         tracing::info!(
             "[scroll] displays={:?}",
@@ -190,8 +194,10 @@ pub fn run_scroll_capture(
                 let b = capture
                     .capture_area(x, y, w, h)
                     .ok();
-                let b_energy = b.as_ref().map(|f| avg_adjacent_diff(f)).unwrap_or(0.0);
-                let same_size = b.as_ref().map_or(false, |f| f.width == a.width && f.height == a.height);
+                let b_energy = b.as_ref().map(avg_adjacent_diff).unwrap_or(0.0);
+                let same_size = b
+                    .as_ref()
+                    .is_some_and(|f| f.width == a.width && f.height == a.height);
                 let differ = if same_size {
                     frames_differ(&a, b.as_ref().unwrap())
                 } else {
@@ -344,33 +350,36 @@ pub fn run_scroll_capture(
                         );
                         // 诊断：全屏变化位置 + 区域捕获与全屏裁剪的一致性，
                         // 定位「屏幕在滚但区域 capture 不变」是陈旧帧还是区域错位。
-                        if let Ok(full) = capture.capture_primary() {
-                            let full_bbox = last_full.as_ref().map(|lf| diff_bbox(lf, &full));
-                            let (fw, fh) = (full.width as i32, full.height as i32);
-                            let mismatch = if x >= 0
-                                && y >= 0
-                                && x + w as i32 <= fw
-                                && y + h as i32 <= fh
-                            {
-                                region_mismatch(
-                                    &full,
-                                    x as usize,
-                                    y as usize,
-                                    w as usize,
-                                    h as usize,
-                                    &b,
-                                )
-                            } else {
-                                u32::MAX
-                            };
-                            tracing::info!(
-                                "[scroll] iter={iter} diag full_bbox={full_bbox:?} region_vs_full_mismatch={mismatch} full={}x{}",
-                                full.width,
-                                full.height
-                            );
-                            dump_png(&full, &format!("static_full_iter{iter}"));
-                            dump_png(&b, &format!("static_region_iter{iter}"));
-                            last_full = Some(full);
+                        // 仅诊断模式启用：正常滚动路径不做全屏捕获 / bbox / PNG 落盘。
+                        if diagnostics_enabled() {
+                            if let Ok(full) = capture.capture_primary() {
+                                let full_bbox = last_full.as_ref().map(|lf| diff_bbox(lf, &full));
+                                let (fw, fh) = (full.width as i32, full.height as i32);
+                                let mismatch = if x >= 0
+                                    && y >= 0
+                                    && x + w as i32 <= fw
+                                    && y + h as i32 <= fh
+                                {
+                                    region_mismatch(
+                                        &full,
+                                        x as usize,
+                                        y as usize,
+                                        w as usize,
+                                        h as usize,
+                                        &b,
+                                    )
+                                } else {
+                                    u32::MAX
+                                };
+                                tracing::info!(
+                                    "[scroll] iter={iter} diag full_bbox={full_bbox:?} region_vs_full_mismatch={mismatch} full={}x{}",
+                                    full.width,
+                                    full.height
+                                );
+                                dump_png(&full, &format!("static_full_iter{iter}"));
+                                dump_png(&b, &format!("static_region_iter{iter}"));
+                                last_full = Some(full);
+                            }
                         }
                         let mut revived: Option<CapturedFrame> = None;
                         if let Some(((npx, npy), frame)) =
@@ -405,14 +414,16 @@ pub fn run_scroll_capture(
                                     tracing::info!(
                                         "[scroll] iter={iter} reconnect round={r} moved={moved}"
                                     );
-                                    // 诊断：全屏变化位置（定位滚动发生在屏幕哪里）
-                                    if let Ok(full) = capture.capture_primary() {
-                                        let bbox =
-                                            last_full.as_ref().map(|lf| diff_bbox(lf, &full));
-                                        tracing::info!(
-                                            "[scroll] iter={iter} reconnect round={r} full_bbox={bbox:?}"
-                                        );
-                                        last_full = Some(full);
+                                    // 诊断：全屏变化位置（定位滚动发生在屏幕哪里）；仅诊断模式启用
+                                    if diagnostics_enabled() {
+                                        if let Ok(full) = capture.capture_primary() {
+                                            let bbox =
+                                                last_full.as_ref().map(|lf| diff_bbox(lf, &full));
+                                            tracing::info!(
+                                                "[scroll] iter={iter} reconnect round={r} full_bbox={bbox:?}"
+                                            );
+                                            last_full = Some(full);
+                                        }
                                     }
                                     if moved {
                                         revived = Some(frame);
@@ -525,9 +536,11 @@ pub fn run_manual_scroll_capture(
         let frame_w = a.width;
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        // anchor：最近一次成功拼接（或刷新）的基线；prev：上一帧（做帧间运动检测）
-        let mut anchor = a.clone();
-        let mut prev = a;
+        // anchor：最近一次成功拼接（或刷新）的基线，直接接管首帧所有权；
+        // prev：上一帧（做帧间运动检测），首帧之前不存在，用 Option 延迟持有，
+        // 省去对首帧的一次整帧 clone（原来 anchor/prev 各持一份）。
+        let mut anchor = a;
+        let mut prev: Option<CapturedFrame> = None;
         let mut moving_frames = 0usize;
         let mut stop_reason = "max_iters";
 
@@ -567,7 +580,7 @@ pub fn run_manual_scroll_capture(
                     );
                 }
                 anchor = b.clone();
-                prev = b;
+                prev = Some(b);
                 moving_frames = 0;
                 continue;
             }
@@ -579,7 +592,7 @@ pub fn run_manual_scroll_capture(
                 // 避免把已拼接的行重复拼进去
                 moving_frames = 0;
                 tracing::info!("[scroll-manual] iter={iter} scrolled_up keep_baseline");
-            } else if frames_differ(&prev, &b) {
+            } else if prev.as_ref().is_some_and(|p| frames_differ(p, &b)) {
                 // 相邻帧仍在变化 → 动画/滚动进行中；不更新 anchor，等它停
                 moving_frames += 1;
                 tracing::info!("[scroll-manual] iter={iter} moving moving_frames={moving_frames}");
@@ -593,7 +606,7 @@ pub fn run_manual_scroll_capture(
                 // 与 anchor 基本一致（没滚 / 滚回原位）→ 无事发生
                 moving_frames = 0;
             }
-            prev = b;
+            prev = Some(b);
         }
 
         tracing::info!("[scroll-manual] stop_reason={stop_reason} stitched_h={stitched_h}");
@@ -708,8 +721,27 @@ fn region_mismatch(
     cnt
 }
 
+/// 是否启用滚动诊断（环境变量 `SCREENSHOT_RS_DIAGNOSTICS=1`）。
+///
+/// 诊断会做全屏基线捕获、diff bbox 计算与 PNG 落盘，都是滚动热路径里的
+/// 额外开销（尤其 PNG 编码 + 写盘）。默认关闭，仅在排查滚动拼接问题时打开。
+fn diagnostics_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SCREENSHOT_RS_DIAGNOSTICS")
+            .map(|v| v == "1" || v == "true" || v == "on")
+            .unwrap_or(false)
+    })
+}
+
 /// 诊断：把帧保存为 PNG（/tmp/scroll_<tag>.png）
+///
+/// 默认 no-op（见 `diagnostics_enabled`）：PNG 编码 + 落盘开销大，仅调试时启用。
 fn dump_png(frame: &CapturedFrame, tag: &str) {
+    if !diagnostics_enabled() {
+        return;
+    }
     let path = format!("/tmp/scroll_{tag}.png");
     match image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels.clone()) {
         Some(img) => match img.save(&path) {
