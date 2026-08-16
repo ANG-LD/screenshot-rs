@@ -38,11 +38,22 @@ impl ScreenCapture for PlatformScreenCapture {
         })
     }
 
-    /// 滚动截屏暂不支持 Windows（区域截屏可行，但自动滚动注入未实现）
-    fn capture_area(&self, _x: i32, _y: i32, _w: u32, _h: u32) -> AppResult<CapturedFrame> {
-        Err(crate::error::AppError::Window(
-            "滚动截屏暂不支持 Windows".into(),
-        ))
+    /// 捕获主显示器上 (x, y) 起 (w, h) 的区域（物理像素，主屏相对坐标）。
+    /// 越界部分由底层 clamp，返回的实际尺寸可能小于请求值，调用方需校验。
+    fn capture_area(&self, x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame> {
+        let screen = Screen::all()
+            .map_err(|e| crate::error::AppError::Capture(e.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::error::AppError::Window("未检测到任何显示器".into()))?;
+        let image = screen
+            .capture_area(x, y, w, h)
+            .map_err(|e| crate::error::AppError::Capture(e.to_string()))?;
+        Ok(CapturedFrame {
+            width: image.width(),
+            height: image.height(),
+            pixels: image.into(), // screenshots crate 输出 RGBA
+        })
     }
 
     fn list_displays(&self) -> Vec<DisplayInfo> {

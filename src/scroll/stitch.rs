@@ -141,41 +141,105 @@ fn fill_row_signatures(f: &CapturedFrame, w: usize, h: usize, cols: &[usize], si
 
 /// 重叠带（a 的 s..h 行）必须有内容：相邻行签名差的均值过低说明整带均匀，
 /// 此时任何偏移都能“匹配”，无法可靠判定。
+///
+/// 但「均值过低」对**大部分空白/平滑、夹一条窄纹理带**的帧会误判：空白行把均值
+/// 稀释到阈值以下，而那条纹理带其实是能钉住偏移的（空白行任意偏移都匹配，只有
+/// 纹理带能区分真实滚动量）。因此除了均值判定，还要看带内**有纹理的行数**——
+/// 存在可观纹理行（≥1/8 行相邻差达标）就仍可判定，否则才整带均匀拒绝。
 fn band_has_energy(sig_a: &[u64], s: usize, h: usize) -> bool {
     let n = h - s;
     if n < 2 {
         return false;
     }
     let mut total = 0u64;
+    let mut textured = 0u32;
     for r in (s + 1)..h {
-        total += sig_a[r].abs_diff(sig_a[r - 1]);
+        let d = sig_a[r].abs_diff(sig_a[r - 1]);
+        total += d;
+        if d >= MIN_ENERGY {
+            textured += 1;
+        }
     }
-    total / n as u64 >= MIN_ENERGY
+    total / n as u64 >= MIN_ENERGY || textured * 8 >= n as u32
 }
 
-/// 对候选滚动量 s 做逐像素抽样验证：重叠带内取 5 行 × 8 列，比较 RGB。
+/// 对候选滚动量 s 做抽样验证：重叠带内取 16 行 × 8 列，比较局部 3×3 平均 RGB。
+///
+/// 用局部平均而非逐像素：平滑滚动中间帧有亚像素偏移，抗锯齿让同一行像素在
+/// 两次抓帧间偏差过大，逐像素比较会使**真实**滚动量验证失败，find_scroll_delta
+/// 就退回自相似的更大假偏移 → 拼接段与上一段重叠（下一页头重复上一页尾）。
+/// 3×3 平均对 ±1px 的亚像素偏移不敏感，真实滚动量（评分最低、最优先返回）能
+/// 通过验证。
+///
+/// 采样行从 5 加到 16：平均比较比逐像素宽松，采样点少时自相似内容会在个别点
+/// 巧合匹配（静态帧误判为滚动 → 重复拼接）；多采样行让这种巧合在整个重叠带
+/// 同时成立的概率趋近于零，静态帧仍返回 None。
 fn verify_rows(a: &CapturedFrame, b: &CapturedFrame, s: usize, w: usize, vcols: &[usize]) -> bool {
     let h = a.height as usize;
     let n = h - s; // 重叠行数
-    if n < 5 {
+    if n < 8 {
         return false;
     }
-    // 5 等分采样行，覆盖重叠带全高，降低局部误匹配概率
-    let rows = [n / 6, n * 2 / 6, n * 3 / 6, n * 4 / 6, n * 5 / 6];
+    // 15 等分采样行（n/16..15n/16），避开重叠带两端：顶部 r=0 的 3×3 会混入
+    // a 更早的行，底部 r=n-1 的 3×3 会混入 b 新增内容，都会误判为不匹配
+    let rows = [
+        n * 1 / 16,
+        n * 2 / 16,
+        n * 3 / 16,
+        n * 4 / 16,
+        n * 5 / 16,
+        n * 6 / 16,
+        n * 7 / 16,
+        n * 8 / 16,
+        n * 9 / 16,
+        n * 10 / 16,
+        n * 11 / 16,
+        n * 12 / 16,
+        n * 13 / 16,
+        n * 14 / 16,
+        n * 15 / 16,
+    ];
+    let mut passed = 0u32;
+    let mut total = 0u32;
     for &r in &rows {
         let ar = s + r; // a 侧行
         let br = r; // b 侧行
+        let mut row_ok = true;
         for &c in vcols {
-            let pa = (ar * w + c) * 4;
-            let pb = (br * w + c) * 4;
             for ch in 0..3 {
-                if a.pixels[pa + ch].abs_diff(b.pixels[pb + ch]) > PIXEL_TOLERANCE {
-                    return false;
+                let da = box_avg(a, ar, c, w, h, ch);
+                let db = box_avg(b, br, c, w, h, ch);
+                if da.abs_diff(db) > PIXEL_TOLERANCE {
+                    row_ok = false;
                 }
             }
         }
+        if row_ok {
+            passed += 1;
+        }
+        total += 1;
     }
-    true
+    // 真实滚动整体对齐，个别采样行会因边缘/噪声/亚像素小幅超标而失败；自相似假
+    // 匹配在大多数采样行都不对齐。要求 ≥80% 采样行通过即可，既容忍噪声又排除假匹配。
+    passed * 5 >= total * 4
+}
+
+/// (row, col) 处 3×3 邻域的某通道平均值（越界夹取到图像边缘）。
+fn box_avg(f: &CapturedFrame, row: usize, col: usize, w: usize, h: usize, ch: usize) -> u8 {
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    let r0 = row.saturating_sub(1);
+    let r1 = (row + 1).min(h - 1);
+    let c0 = col.saturating_sub(1);
+    let c1 = (col + 1).min(w - 1);
+    for rr in r0..=r1 {
+        for cc in c0..=c1 {
+            let p = (rr * w + cc) * 4 + ch;
+            sum += f.pixels[p] as u64;
+            n += 1;
+        }
+    }
+    (sum / n) as u8
 }
 
 #[cfg(test)]
@@ -255,4 +319,109 @@ mod tests {
         let b = frame(200, 300);
         assert_eq!(find_scroll_delta(&a, &b), None);
     }
+
+    /// 平滑滚动中间帧有亚像素偏移：b 每行是 a 相邻两行的 50/50 混合（抗锯齿）。
+    /// 逐像素验证会被这种模糊击穿（相邻行值差异大时混合值与任一行偏差超容差）
+    /// → 真实偏移检测失败 → 退回自相似假偏移 → 拼接重复。修复后（3×3 局部平均
+    /// 验证）必须仍返回真实偏移 120。
+    ///
+    /// 三通道都用行号哈希 v，且不含 +37/×3 这类会被 u8 回绕破坏「混合-逐值」一致
+    /// 性的变化；保证 3×3 平均对真实偏移的偏差恒 < 50：平均差 = |v(行+3)-v(行)|/6
+    /// ≤ 255/6 ≈ 42。
+    #[test]
+    fn detects_scroll_delta_with_subpixel_blur() {
+        let w = 200usize;
+        let h = 600usize;
+        let mk = |pixels: &mut Vec<u8>, w: usize, row: usize, v: u8| {
+            for c in 0..w {
+                let p = (row * w + c) * 4;
+                pixels[p] = v;
+                pixels[p + 1] = v;
+                pixels[p + 2] = v;
+                pixels[p + 3] = 255;
+            }
+        };
+        let mut ap = vec![0u8; w * h * 4];
+        for row in 0..h {
+            mk(&mut ap, w, row, row_val(row));
+        }
+        let a = CapturedFrame { width: w as u32, height: h as u32, pixels: ap };
+        let mut bp = vec![0u8; w * h * 4];
+        for row in 0..h {
+            // 顶部 480 行 = a[120..] 的相邻行混合；底部 120 行新内容（更大行号）
+            let src: usize = if row + 120 < h { row + 120 } else { h + row };
+            let v0 = row_val(src);
+            let v1 = row_val(src + 1);
+            let v = (v0 as u16 + v1 as u16) / 2; // 亚像素模糊：两行各半
+            mk(&mut bp, w, row, v as u8);
+        }
+        let b = CapturedFrame { width: w as u32, height: h as u32, pixels: bp };
+        // 亚像素模糊使真实偏移 120 与 121 的评分几乎相同（±1 行歧义），二者都合理；
+        // 关键是**不能**返回更大假偏移（如把 30 检测成 280 → 拼接重复）。
+        match find_scroll_delta(&a, &b) {
+            Some(s) if s == 120 || s == 121 => {}
+            other => panic!("expected Some(120|121), got {other:?}"),
+        }
+    }
+
+    /// 大部分空白、中间夹一条纹理带的帧：空白行稀释了重叠带平均能量，但纹理带
+    /// 能钉住偏移。band_has_energy 修复后必须仍能测出真实滚动量。
+    #[test]
+    fn detects_scroll_delta_with_sparse_texture() {
+        let w = 1261usize;
+        let h = 312usize;
+        let mk = |textured: std::ops::Range<usize>| {
+            let mut px = vec![0u8; w * h * 4];
+            for row in textured {
+                let v = row_val(row);
+                for x in 0..w {
+                    let p = (row * w + x) * 4;
+                    px[p] = v;
+                    px[p + 1] = v.wrapping_add(37);
+                    px[p + 2] = v.wrapping_mul(3);
+                    px[p + 3] = 255;
+                }
+            }
+            CapturedFrame { width: w as u32, height: h as u32, pixels: px }
+        };
+        // a：行 100..220 有纹理，其余空白
+        let a = mk(100..220);
+        // b = a 向下滚 80 行：内容上移，纹理带移到 20..140（顶部 0..20 空白，底部 140..312 空白）
+        let b = mk(20..140);
+        match find_scroll_delta(&a, &b) {
+            Some(s) if (60..=100).contains(&s) => {}
+            other => panic!("expected Some(~80), got {other:?}"),
+        }
+    }
+
+    /// 大部分空白、夹一条纹理带的**相同**帧：没滚动时 find_scroll_delta 必须返回
+    /// None。若空白自相似让最大偏移(如 274)拿到低分并过验证，就会误拼出重复。
+    #[test]
+    fn sparse_identical_frames_return_none() {
+        let w = 1282usize;
+        let h = 304usize;
+        let mk = |textured: std::ops::Range<usize>| {
+            let mut px = vec![0u8; w * h * 4];
+            for row in textured {
+                let v = row_val(row);
+                for x in 0..w {
+                    let p = (row * w + x) * 4;
+                    px[p] = v;
+                    px[p + 1] = v.wrapping_add(37);
+                    px[p + 2] = v.wrapping_mul(3);
+                    px[p + 3] = 255;
+                }
+            }
+            CapturedFrame { width: w as u32, height: h as u32, pixels: px }
+        };
+        // 纹理带在中间(100..220)，底部 274..304 空白
+        let a = mk(100..220);
+        let b = a.clone();
+        let r = find_scroll_delta(&a, &b);
+        eprintln!("sparse identical (band mid) -> delta={r:?}");
+        if r.is_some() {
+            panic!("sparse identical frames should return None, got {r:?}");
+        }
+    }
+
 }

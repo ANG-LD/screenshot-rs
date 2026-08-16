@@ -60,8 +60,8 @@ fn main() {
         Err(e) => eprintln!("get_image 失败：{e}"),
     }
 
-    // 把原图也写一份 PNG 到 /tmp，方便用户目测
-    let path = "/tmp/screenshot-rs-smoke.png";
+    // 把原图也写一份 PNG 到当前目录，方便用户目测
+    let path = "screenshot-rs-smoke.png";
     let img: image::RgbaImage =
         image::ImageBuffer::from_raw(clipped.width, clipped.height, clipped.pixels.clone())
             .expect("ImageBuffer 构造");

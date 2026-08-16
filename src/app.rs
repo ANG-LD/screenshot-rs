@@ -235,9 +235,10 @@ impl ScrollProgress for ScrollProgressAdapter<'_> {
         cancel: Arc<AtomicBool>,
         done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
+        moving: Arc<AtomicBool>,
     ) {
         self.0
-            .open_manual_scroll_progress(done, cancel, progress, *region, *screen_bounds);
+            .open_manual_scroll_progress(done, cancel, progress, *region, *screen_bounds, moving);
     }
 
     fn hide(&self) {

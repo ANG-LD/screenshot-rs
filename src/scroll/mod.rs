@@ -20,11 +20,27 @@ use crate::utils::bounds::Bounds;
 
 /// 遮罩窗口销毁后等待桌面恢复，避免首帧抓到遮罩残留
 const STARTUP_DELAY: Duration = Duration::from_millis(250);
-/// 每轮滚动后等待平滑滚动稳定
+/// 每轮滚动后等待平滑滚动稳定。
+///
+/// Windows 上浏览器默认平滑滚动（滚轮触发动画），动画未结束就抓帧会得到中间态，
+/// 重叠带对不上 → 检测失败 → 丢段（长图中间缺内容）。因此 Windows 要多等滚动
+/// 完全落定再抓帧。Linux/XTest 是离散滚轮事件，120ms 足够。
+#[cfg(target_os = "windows")]
+const SETTLE_DELAY: Duration = Duration::from_millis(300);
+#[cfg(not(target_os = "windows"))]
 const SETTLE_DELAY: Duration = Duration::from_millis(120);
 /// 检测失败后（疑似动画未结束）额外等待再重抓一帧
+#[cfg(target_os = "windows")]
+const EXTRA_SETTLE: Duration = Duration::from_millis(450);
+#[cfg(not(target_os = "windows"))]
 const EXTRA_SETTLE: Duration = Duration::from_millis(250);
-/// 每轮注入的滚轮 tick 数（默认值；检测不到时自适应减半）
+/// 每轮注入的滚轮 tick 数（默认值；检测不到时自适应减半）。
+///
+/// Windows 每 tick 滚动量更大/更不稳定，减到 1 格让重叠带更大、检测更可靠，
+/// 减少「滚了但检测不到 → 丢段」的发生。
+#[cfg(target_os = "windows")]
+const TICKS_PER_ITER: u8 = 1;
+#[cfg(not(target_os = "windows"))]
 const TICKS_PER_ITER: u8 = 2;
 /// 最小有效滚动量（低于视为内容没动）
 const MIN_SCROLL: usize = 4;
@@ -35,8 +51,12 @@ const MAX_ITERS: usize = 300;
 /// 连续无法检测滚动的次数上限（只对「有纹理且静止」累计，动画/步长问题不算）
 const MAX_STREAK: usize = 3;
 /// 连续低纹理（空白/纯色/平滑段）迭代次数上限——此时无法判定是否在滚动，
-/// 先按「还在滚」继续，达到配额仍无变化才放弃
-const MAX_BLANK_STREAK: usize = 8;
+/// 先按「还在滚」继续，达到配额仍无变化才放弃。
+///
+/// 主要靠空白段的「全屏是否还在动」判断提前停（页面到底），这里是兜底：
+/// 屏幕若有无关动画导致全屏总在变，才靠它收敛。25×BLANK_TICKS≈7.5 视口高度，
+/// 足够滚过稀疏页面的长空白段。
+const MAX_BLANK_STREAK: usize = 25;
 /// 相邻采样行平均差的阈值：低于此值视为低纹理（空白/纯色/平滑图）
 const TEXTURED_ENERGY: f32 = 12.0;
 /// 低纹理段每轮注入的滚轮 tick 数：大步长快速滚过空白区
@@ -56,14 +76,39 @@ const RECONNECT_ROUNDS: usize = 3;
 /// 暂停期间内容静止且指针不回来时允许的最大迭代数（50ms×100 ≈ 5s）。
 /// 超时视为本次滚动已卡死，干净收尾返回已拼接结果，避免无限空转。
 const MAX_PAUSED_STATIC: usize = 100;
+/// 暂停期间判定「已到达页面底部」所需的连续空白帧数（50ms×3 ≈ 150ms）。
+///
+/// 与主循环的 MAX_BLANK_STREAK 一致地要求多帧证据：单帧空白可能是平滑滚动
+/// 中间帧 / DWM 合成间隙 / 瞬时捕获失败，立即停止会提前终止尚未到底的长图
+/// （拼接不全）；连续多帧「空白且静止」才可信为真的到底。
+const PAUSED_BLANK_REQUIRED: usize = 3;
 
 /// 指针偏离注入目标多少像素视为「用户要把鼠标划到别处」（如点进度窗按钮）：
 /// 此时暂停注入/重定位，让指针自由移动，回到目标附近再自动恢复
 const PAUSE_RADIUS: f64 = 60.0;
 /// 暂停期间的轮询间隔
 const PAUSE_POLL: Duration = Duration::from_millis(50);
-/// 手动滚动模式的轮询间隔
-const MANUAL_POLL: Duration = Duration::from_millis(50);
+/// 手动滚动模式的轮询间隔。
+///
+/// 越短越能抓到滚动过程中的中间帧（滚太快时一轮轮询就滚超视口 → 无重叠 → 丢段）。
+/// 受抓帧耗时限制（Windows GDI 区域抓帧约 20-40ms），12ms 即可使迭代周期减半。
+const MANUAL_POLL: Duration = Duration::from_millis(12);
+/// 手动模式判定大 delta 可信所需的帧间最大像素差：超过半屏的滚动量，只有内容
+/// 确实变化才可信；未滚动（帧几乎相同）会被 find_scroll_delta 因空白自相似误报
+/// 为大偏移，此时 maxdiff ≈ 0，跳过拼接避免重复。
+///
+/// 启动期假大偏移已由「取首帧前稳定等待」挡掉，这里只需要拦「帧几乎相同」的
+/// 假匹配，因此阈值取低（16，与 frames_differ 的 24 同量级），避免误伤真实快速
+/// 滚动（稀疏页面 maxdiff 偏小，过高的阈值会把真实滚动量也拒掉 → 拼接缺失）。
+const CREDIBLE_DIFF: u8 = 16;
+/// 手动模式取首帧前的稳定等待：连续两帧 max_frame_diff ≤ 此值视为屏幕已静止。
+/// 遮罩关闭/进度窗出现的过渡期帧差异大，直接取首帧会让 find_scroll_delta 误报
+/// 大滚动量（空白自相似）→ 重复拼接。
+const STARTUP_STABLE_DIFF: u8 = 16;
+/// 稳定等待每轮的间隔
+const STARTUP_STABLE_POLL: Duration = Duration::from_millis(50);
+/// 稳定等待的最大轮数（50ms×10 ≈ 0.5s；超时用最近一帧兜底，不强求静止）
+const STARTUP_STABLE_ATTEMPTS: usize = 10;
 /// 手动模式最大迭代次数（50ms × 20k ≈ 16 分钟，纯兜底；正常由用户点「完成」结束）
 const MAX_MANUAL_ITERS: usize = 20_000;
 
@@ -77,7 +122,9 @@ pub trait ScrollProgress: Send + Sync {
         cancel: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
     );
-    /// 打开手动滚动进度小窗：多一个「完成」按钮，用户滚完点它结束
+    /// 打开手动滚动进度小窗：多一个「完成」按钮，用户滚完点它结束。
+    /// `moving` 由引擎每轮按「相邻帧是否不同」更新，进度窗据此只在内容静止时
+    /// 显示「完成」按钮（避免滚动动画中途误点，导致最后一段没拼进去）。
     fn show_manual(
         &self,
         region: &Bounds,
@@ -85,6 +132,7 @@ pub trait ScrollProgress: Send + Sync {
         cancel: Arc<AtomicBool>,
         done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
+        moving: Arc<AtomicBool>,
     );
     /// 关闭进度小窗
     fn hide(&self);
@@ -144,12 +192,9 @@ pub fn run_scroll_capture(
         let frame_w = a.width;
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        // 诊断：全屏基线，用于对比滚动发生后全屏变化的位置（仅诊断模式启用）
-        let mut last_full = if diagnostics_enabled() {
-            capture.capture_primary().ok()
-        } else {
-            None
-        };
+        // 全屏基线：空白段用它判断页面是否还在滚动（还在动 → 在滚过空白，继续；
+        // 不动 → 已到底，提前停止）。正常滚动路径不读它，只在空白段与诊断时捕获。
+        let mut last_full = capture.capture_primary().ok();
         let displays = capture.list_displays();
         tracing::info!(
             "[scroll] displays={:?}",
@@ -158,16 +203,15 @@ pub fn run_scroll_capture(
                 .map(|d| format!("{}x{}@{:.1}", d.width, d.height, d.scale_factor))
                 .collect::<Vec<_>>()
         );
-        if let Some(fl) = &last_full {
-            dump_png(fl, "start_full");
-        }
-        dump_png(&a, "start_region");
         let mut streak = 0usize;
         // 低纹理段（空白/平滑图）的连续迭代计数，不并入 streak
         let mut blank_streak = 0usize;
         // 暂停状态下「内容持续静止」的连续迭代计数：指针离开注入目标后，若内容
         // 也不在动（用户没在手动滚），累计到上限就干净收尾，防止无限空转
         let mut paused_static = 0usize;
+        // 暂停状态下「空白且静止」的连续帧计数：连续达到 PAUSED_BLANK_REQUIRED
+        // 才判定真的到底并停止，单帧空白不累计退出
+        let mut paused_blank = 0usize;
         // 自适应滚动步长：检测不到时减半，避免每轮滚动量超过视口导致无法重叠
         let mut ticks = TICKS_PER_ITER;
         let mut stop_reason = "max_iters";
@@ -194,14 +238,23 @@ pub fn run_scroll_capture(
                 let b = capture
                     .capture_area(x, y, w, h)
                     .ok();
-                let b_energy = b.as_ref().map(avg_adjacent_diff).unwrap_or(0.0);
                 let same_size = b
                     .as_ref()
                     .is_some_and(|f| f.width == a.width && f.height == a.height);
+                // 捕获是否成功（在下方 `if let Some(b) = b` 部分移动 b 之前取好，日志要用）
+                let capture_ok = b.is_some();
                 let differ = if same_size {
                     frames_differ(&a, b.as_ref().unwrap())
                 } else {
                     false
+                };
+                // 仅当捕获成功且尺寸一致才评估「空白」。捕获失败（b=None）或尺寸
+                // 异常（b_energy 兜底 f32::MAX）都不能当作内容空白：否则一次瞬时
+                // capture_area 失败就会把整次滚动截屏误判为「已到底」而终止。
+                let b_energy = if same_size {
+                    b.as_ref().map(avg_adjacent_diff).unwrap_or(f32::MAX)
+                } else {
+                    f32::MAX
                 };
                 if differ {
                     // 用户正在手动滚动目标窗口：跟住新基线
@@ -209,10 +262,20 @@ pub fn run_scroll_capture(
                         a = b;
                     }
                 }
-                // 暂停中到达底部：内容空白且静止 → 立即停止，不等 MAX_PAUSED_STATIC
+                // 暂停中到达底部：需要连续 PAUSED_BLANK_REQUIRED 帧「空白且静止」
+                // 才停止。单帧空白可能是平滑滚动中间帧 / DWM 合成间隙 / 瞬时捕获
+                // 失败，立即停止会提前终止尚未到底的长图（拼接不全）。
                 if !differ && b_energy < TEXTURED_ENERGY {
-                    stop_reason = "blank_while_paused";
-                    break;
+                    paused_blank += 1;
+                    if paused_blank >= PAUSED_BLANK_REQUIRED {
+                        tracing::info!(
+                            "[scroll] iter={iter} blank_while_paused dist={dist:.0}px energy={b_energy:.1} capture_ok={capture_ok} same_size={same_size}"
+                        );
+                        stop_reason = "blank_while_paused";
+                        break;
+                    }
+                } else {
+                    paused_blank = 0;
                 }
                 if differ {
                     paused_static = 0;
@@ -221,7 +284,7 @@ pub fn run_scroll_capture(
                 }
                 std::thread::sleep(PAUSE_POLL);
                 tracing::info!(
-                    "[scroll] iter={iter} pointer_moved dist={dist:.0}px pause paused_static={paused_static}"
+                    "[scroll] iter={iter} pointer_moved dist={dist:.0}px pause paused_static={paused_static} paused_blank={paused_blank}"
                 );
                 if paused_static >= MAX_PAUSED_STATIC {
                     stop_reason = "pointer_left_static";
@@ -243,6 +306,7 @@ pub fn run_scroll_capture(
                 }
             }
             paused_static = 0;
+            paused_blank = 0;
 
             // 每轮重新 warp 指针到当前落点，防止指针漂移导致滚轮事件没投递到目标窗口；
             // 同时把 X 输入焦点给目标窗口（Chromium/Electron 忽略投给未聚焦窗口的合成滚轮）
@@ -327,6 +391,22 @@ pub fn run_scroll_capture(
                         a = b;
                         ticks = BLANK_TICKS;
                         tracing::info!("[scroll] iter={iter} low_energy={energy:.1} blank_streak={blank_streak}");
+                        // 空白段滚动后全屏不再变化 → 页面已到底，提前停止；否则是在
+                        // 滚过空白，继续大步长滚到下一个内容段。稀疏页面长空白段不再
+                        // 被 MAX_BLANK_STREAK 提前误停（拼接不全）。
+                        if let Ok(full) = capture.capture_primary() {
+                            let stopped = last_full
+                                .as_ref()
+                                .is_some_and(|lf| !frames_differ(lf, &full));
+                            last_full = Some(full);
+                            if stopped {
+                                stop_reason = "blank_page_stopped";
+                                tracing::info!(
+                                    "[scroll] iter={iter} blank screen_stopped -> page bottom"
+                                );
+                                break;
+                            }
+                        }
                         if blank_streak >= MAX_BLANK_STREAK {
                             stop_reason = "blank";
                             break;
@@ -348,39 +428,6 @@ pub fn run_scroll_capture(
                             injector.describe_pointer(),
                             injector.describe_focus()
                         );
-                        // 诊断：全屏变化位置 + 区域捕获与全屏裁剪的一致性，
-                        // 定位「屏幕在滚但区域 capture 不变」是陈旧帧还是区域错位。
-                        // 仅诊断模式启用：正常滚动路径不做全屏捕获 / bbox / PNG 落盘。
-                        if diagnostics_enabled() {
-                            if let Ok(full) = capture.capture_primary() {
-                                let full_bbox = last_full.as_ref().map(|lf| diff_bbox(lf, &full));
-                                let (fw, fh) = (full.width as i32, full.height as i32);
-                                let mismatch = if x >= 0
-                                    && y >= 0
-                                    && x + w as i32 <= fw
-                                    && y + h as i32 <= fh
-                                {
-                                    region_mismatch(
-                                        &full,
-                                        x as usize,
-                                        y as usize,
-                                        w as usize,
-                                        h as usize,
-                                        &b,
-                                    )
-                                } else {
-                                    u32::MAX
-                                };
-                                tracing::info!(
-                                    "[scroll] iter={iter} diag full_bbox={full_bbox:?} region_vs_full_mismatch={mismatch} full={}x{}",
-                                    full.width,
-                                    full.height
-                                );
-                                dump_png(&full, &format!("static_full_iter{iter}"));
-                                dump_png(&b, &format!("static_region_iter{iter}"));
-                                last_full = Some(full);
-                            }
-                        }
                         let mut revived: Option<CapturedFrame> = None;
                         if let Some(((npx, npy), frame)) =
                             try_relocate(&injector, capture, &a, region, warp)
@@ -414,17 +461,6 @@ pub fn run_scroll_capture(
                                     tracing::info!(
                                         "[scroll] iter={iter} reconnect round={r} moved={moved}"
                                     );
-                                    // 诊断：全屏变化位置（定位滚动发生在屏幕哪里）；仅诊断模式启用
-                                    if diagnostics_enabled() {
-                                        if let Ok(full) = capture.capture_primary() {
-                                            let bbox =
-                                                last_full.as_ref().map(|lf| diff_bbox(lf, &full));
-                                            tracing::info!(
-                                                "[scroll] iter={iter} reconnect round={r} full_bbox={bbox:?}"
-                                            );
-                                            last_full = Some(full);
-                                        }
-                                    }
                                     if moved {
                                         revived = Some(frame);
                                         tracing::info!(
@@ -528,11 +564,38 @@ pub fn run_manual_scroll_capture(
     let cancel = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let progress_h = Arc::new(AtomicU32::new(h));
-    progress.show_manual(region, screen_bounds, cancel.clone(), done.clone(), progress_h.clone());
+    // 内容是否在动（相邻帧不同）：静止时才让进度窗显示「完成」
+    let moving = Arc::new(AtomicBool::new(false));
+    progress.show_manual(
+        region,
+        screen_bounds,
+        cancel.clone(),
+        done.clone(),
+        progress_h.clone(),
+        moving.clone(),
+    );
 
     // 内部闭包包住主循环：任何 `?` 提前退出，外层都统一 hide 进度窗。
     let result = (|| -> AppResult<CapturedFrame> {
-        let a = capture.capture_area(x, y, w, h)?;
+        // 首帧等画面稳定后再取：遮罩关闭 / 进度窗出现的过渡期，画面轻微变化会被
+        // find_scroll_delta 因「空白自相似」误判成最大滚动量（如 300）→ 重复拼接。
+        // 连续两帧几乎相同（max_frame_diff ≤ 阈值）才算稳定；超时则用最近一帧兜底。
+        let mut a = capture.capture_area(x, y, w, h)?;
+        for _ in 0..STARTUP_STABLE_ATTEMPTS {
+            std::thread::sleep(STARTUP_STABLE_POLL);
+            let Ok(f) = capture.capture_area(x, y, w, h) else {
+                break;
+            };
+            if f.width != a.width || f.height != a.height {
+                a = f;
+                break;
+            }
+            if max_frame_diff(&a, &f) <= STARTUP_STABLE_DIFF {
+                a = f;
+                break; // 屏幕已静止
+            }
+            a = f;
+        }
         let frame_w = a.width;
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
@@ -564,20 +627,38 @@ pub fn run_manual_scroll_capture(
                 stop_reason = "size_changed";
                 break;
             }
+            // 告知进度窗内容是否在动（相邻帧不同）：静止时才显示「完成」按钮。
+            // 首帧前 prev=None → false，初始单页即可点「完成」。
+            let is_moving = prev.as_ref().is_some_and(|p| frames_differ(p, &b));
+            moving.store(is_moving, Ordering::Relaxed);
 
             // 优先尝试重叠检测：帧足够锐利（未处于平滑滚动动画中）且重叠可靠 → 直接拼接。
             // 处于动画中间（亚像素偏移导致相邻行混合）的帧会被 verify_rows 拒绝返回 None。
             if let Some(s) = stitch::find_scroll_delta(&anchor, &b) {
                 if s >= MIN_SCROLL {
-                    let append_off = (b.height as usize - s) * frame_w as usize * 4;
-                    if append_off < b.pixels.len() {
-                        stitched.extend_from_slice(&b.pixels[append_off..]);
-                        stitched_h += s as u32;
-                        progress_h.store(stitched_h, Ordering::Relaxed);
+                    // 可信度门槛：小滚动（≤半屏）直接可信；大滚动必须内容确实显著
+                    // 变化（帧间最大像素差大）才拼。空白自相似会让 find_scroll_delta
+                    // 在「没滚动但画面有轻微变化」时误报最大偏移（如 274），把重叠
+                    // 内容拼进去 → 重复。真实大滚动的 maxdiff 巨大（纹理带移动），
+                    // 启动期/未滚动的轻微变化 maxdiff 小。
+                    let credible = s <= (b.height as usize) / 2
+                        || max_frame_diff(&anchor, &b) > CREDIBLE_DIFF;
+                    if credible {
+                        let append_off = (b.height as usize - s) * frame_w as usize * 4;
+                        if append_off < b.pixels.len() {
+                            stitched.extend_from_slice(&b.pixels[append_off..]);
+                            stitched_h += s as u32;
+                            progress_h.store(stitched_h, Ordering::Relaxed);
+                        }
+                        tracing::info!(
+                            "[scroll-manual] iter={iter} append delta={s} stitched_h={stitched_h}"
+                        );
+                    } else {
+                        tracing::info!(
+                            "[scroll-manual] iter={iter} delta={s} not_credible maxdiff={} skip_append",
+                            max_frame_diff(&anchor, &b)
+                        );
                     }
-                    tracing::info!(
-                        "[scroll-manual] iter={iter} append delta={s} stitched_h={stitched_h}"
-                    );
                 }
                 anchor = b.clone();
                 prev = Some(b);
@@ -596,12 +677,19 @@ pub fn run_manual_scroll_capture(
                 // 相邻帧仍在变化 → 动画/滚动进行中；不更新 anchor，等它停
                 moving_frames += 1;
                 tracing::info!("[scroll-manual] iter={iter} moving moving_frames={moving_frames}");
-            } else if frames_differ(&anchor, &b) {
-                // 已静止但 delta 测不出（均匀内容 / 单次滚动超过 MAX_SCROLL 无重叠）：
-                // 放弃这一段，把基线跟到新位置，后续滚动从新基线继续算
+            } else if frames_differ(&anchor, &b)
+                || max_frame_diff(&anchor, &b) > CREDIBLE_DIFF
+            {
+                // 已静止但 delta 测不出（均匀内容 / 滚动过快无重叠）：放弃这一段，把基线
+                // 跟到新位置，后续滚动从新基线继续算。稀疏页面下 frames_differ 会漏检
+                // 「明显变化」，加 maxdiff 兜底，避免滚动过快后 anchor 冻结导致后续全丢。
+                let md = max_frame_diff(&anchor, &b);
                 anchor = b.clone();
                 moving_frames = 0;
-                tracing::info!("[scroll-manual] iter={iter} settled_at_new_position undetectable");
+                tracing::info!(
+                    "[scroll-manual] iter={iter} settled_at_new_position undetectable energy={:.1} maxdiff={md}",
+                    avg_adjacent_diff(&b),
+                );
             } else {
                 // 与 anchor 基本一致（没滚 / 滚回原位）→ 无事发生
                 moving_frames = 0;
@@ -656,104 +744,29 @@ fn frames_differ(a: &CapturedFrame, b: &CapturedFrame) -> bool {
     changed * 2 > total
 }
 
-/// 两帧差异像素的包围盒（每 4px 采样，每通道容差 24）。无差异返回 None。
-fn diff_bbox(a: &CapturedFrame, b: &CapturedFrame) -> Option<(u32, u32, u32, u32)> {
+/// 两帧在采样网格上的最大单通道像素差（255 表示尺寸不同）。
+fn max_frame_diff(a: &CapturedFrame, b: &CapturedFrame) -> u8 {
     if a.width != b.width || a.height != b.height {
-        return None;
+        return 255;
     }
     let w = a.width as usize;
     let h = a.height as usize;
     if w == 0 || h == 0 {
-        return None;
+        return 0;
     }
-    let (mut min_x, mut min_y) = (usize::MAX, usize::MAX);
-    let (mut max_x, mut max_y) = (0usize, 0usize);
-    let mut found = false;
-    for y in (0..h).step_by(4) {
-        for x in (0..w).step_by(4) {
+    let mut m = 0u8;
+    for y in (0..h).step_by(8) {
+        for x in (0..w).step_by(8) {
             let p = (y * w + x) * 4;
-            let mut diff = false;
             for ch in 0..3 {
-                if a.pixels[p + ch].abs_diff(b.pixels[p + ch]) > 24 {
-                    diff = true;
-                    break;
-                }
-            }
-            if diff {
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-                found = true;
-            }
-        }
-    }
-    if found {
-        Some((min_x as u32, min_y as u32, max_x as u32, max_y as u32))
-    } else {
-        None
-    }
-}
-
-/// 统计 full 在 (x,y,w,h) 处裁剪出的区域与 region 帧的差异采样点数（每 4px）。
-fn region_mismatch(
-    full: &CapturedFrame,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    region: &CapturedFrame,
-) -> u32 {
-    let fw = full.width as usize;
-    let mut cnt = 0u32;
-    for r in (0..h).step_by(4) {
-        for c in (0..w).step_by(4) {
-            let src = ((y + r) * fw + x + c) * 4;
-            let dst = (r * w + c) * 4;
-            for ch in 0..3 {
-                if full.pixels[src + ch].abs_diff(region.pixels[dst + ch]) > 24 {
-                    cnt += 1;
-                    break;
+                let d = a.pixels[p + ch].abs_diff(b.pixels[p + ch]);
+                if d > m {
+                    m = d;
                 }
             }
         }
     }
-    cnt
-}
-
-/// 是否启用滚动诊断（环境变量 `SCREENSHOT_RS_DIAGNOSTICS=1`）。
-///
-/// 诊断会做全屏基线捕获、diff bbox 计算与 PNG 落盘，都是滚动热路径里的
-/// 额外开销（尤其 PNG 编码 + 写盘）。默认关闭，仅在排查滚动拼接问题时打开。
-fn diagnostics_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("SCREENSHOT_RS_DIAGNOSTICS")
-            .map(|v| v == "1" || v == "true" || v == "on")
-            .unwrap_or(false)
-    })
-}
-
-/// 诊断：把帧保存为 PNG（/tmp/scroll_<tag>.png）
-///
-/// 默认 no-op（见 `diagnostics_enabled`）：PNG 编码 + 落盘开销大，仅调试时启用。
-fn dump_png(frame: &CapturedFrame, tag: &str) {
-    if !diagnostics_enabled() {
-        return;
-    }
-    let path = format!("/tmp/scroll_{tag}.png");
-    match image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels.clone()) {
-        Some(img) => match img.save(&path) {
-            Ok(()) => tracing::info!("[scroll] saved {path}"),
-            Err(e) => tracing::warn!("[scroll] save {path} failed: {e}"),
-        },
-        None => tracing::warn!(
-            "[scroll] save {tag}: bad dims {}x{}",
-            frame.width,
-            frame.height
-        ),
-    }
+    m
 }
 
 /// 相邻采样行 RGB 平均差：越小越均匀。空白/纯色/平滑大图偏低，
@@ -842,11 +855,18 @@ fn try_relocate(
         }
         let delta = stitch::find_scroll_delta(baseline, &frame);
         let differ = frames_differ(baseline, &frame);
+        // 候选可信判定：内容显著变化（differ=true，真实滚动/动画），或检测到的小
+        // 滚动量（≤半屏）可信。**大滚动量（>半屏）但内容几乎没变（differ=false）是
+        // 自相似误匹配**：真实滚过 s 行会让区域顶部 s 行换成新内容，过半采样行变化
+        // → differ 必为 true；静态内容里 find_scroll_delta 会找出行签名巧合相似的
+        // 假偏移。把这种候选当成功复活，会把未滚动的帧按大 delta 拼进长图（重复
+        // 内容/跳段），且引擎停在其实滚不动的落点上（随后 delta_too_small 误停）。
+        let credible = differ || delta.is_some_and(|s| s <= (h as usize) / 2);
         tracing::info!(
-            "[scroll] relocate candidate ({px},{py}) at col{}% row{}% delta={delta:?} differ={differ}",
+            "[scroll] relocate candidate ({px},{py}) at col{}% row{}% delta={delta:?} differ={differ} credible={credible}",
             cols[ci], rows[ri],
         );
-        if delta.is_some() || differ {
+        if credible {
             return Some(((px, py), frame));
         }
     }
@@ -856,14 +876,97 @@ fn try_relocate(
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn new_injector() -> AppResult<xtest::XtestInjector> {
     xtest::XtestInjector::open()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn new_injector() -> AppResult<xtest::XtestInjector> {
     Err(AppError::Window(
-        "滚动截屏仅支持 Linux/X11 会话".into(),
+        "滚动截屏仅支持 Linux/X11 或 Windows 会话".into(),
     ))
+}
+
+#[cfg(test)]
+mod manual_diag_tests {
+    use super::*;
+
+    fn mk_frame(w: usize, h: usize, row_val: impl Fn(usize) -> u8) -> CapturedFrame {
+        let mut px = vec![0u8; w * h * 4];
+        for row in 0..h {
+            let v = row_val(row);
+            for x in 0..w {
+                let p = (row * w + x) * 4;
+                px[p] = v;
+                px[p + 1] = v;
+                px[p + 2] = v;
+                px[p + 3] = 255;
+            }
+        }
+        CapturedFrame { width: w as u32, height: h as u32, pixels: px }
+    }
+
+    /// 真实滚动帧：b = a 向下滚 200 行。frames_differ 必须为 true，
+    /// find_scroll_delta 必须能测出 200。
+    #[test]
+    fn detection_on_scrolled_frame() {
+        let w = 1083usize;
+        let h = 326usize;
+        let a = mk_frame(w, h, |r| ((r * 7) % 250) as u8);
+        let b = mk_frame(w, h, |r| {
+            let src = if r + 200 < h { r + 200 } else { h + r };
+            ((src * 7) % 250) as u8
+        });
+        assert!(frames_differ(&a, &b), "纯滚动帧 frames_differ 必须为 true");
+        assert!(max_frame_diff(&a, &b) > 24, "maxdiff 应显著");
+        assert_eq!(stitch::find_scroll_delta(&a, &b), Some(200));
+    }
+
+    /// 只改右 1/4 区域（模拟「变化发生在采样列之外」）。
+    #[test]
+    fn detection_when_change_localized() {
+        let w = 1083usize;
+        let h = 326usize;
+        let a = mk_frame(w, h, |r| ((r * 7) % 250) as u8);
+        // b 只在右 1/4 列带(813..1083)变化，其余与 a 相同
+        let mut b = a.clone();
+        for row in 0..h {
+            for x in (w * 3 / 4)..w {
+                let p = (row * w + x) * 4;
+                let v = (((row + 200) * 7) % 250) as u8;
+                b.pixels[p] = v;
+                b.pixels[p + 1] = v;
+                b.pixels[p + 2] = v;
+            }
+        }
+        // 变化在右 1/4（含采样列 3w/4=812）→ frames_differ 必须为 true
+        assert!(frames_differ(&a, &b), "右 1/4 变化应被 frames_differ 捕获");
+        assert!(max_frame_diff(&a, &b) > 24);
+    }
+
+    /// 变化只在最左侧窄带（0..w/4-2，采样列 w/4=270 之外）。
+    /// 记录行为：3 列采样会漏掉这种窄带变化（frames_differ=false），
+    /// 且这种「局部 patch」不是干净滚动，find_scroll_delta 也返回 None。
+    #[test]
+    fn frames_differ_misses_narrow_left_change() {
+        let w = 1083usize;
+        let h = 326usize;
+        let a = mk_frame(w, h, |r| ((r * 7) % 250) as u8);
+        let mut b = a.clone();
+        for row in 0..h {
+            for x in 0..(w / 4 - 2) {
+                let p = (row * w + x) * 4;
+                let v = (((row + 200) * 7) % 250) as u8;
+                b.pixels[p] = v;
+                b.pixels[p + 1] = v;
+                b.pixels[p + 2] = v;
+            }
+        }
+        // 变化在最左窄带：3 列采样(270/541/812)抓不到 → frames_differ=false
+        assert!(!frames_differ(&a, &b));
+        assert!(max_frame_diff(&a, &b) > 24);
+        // 局部 patch 非干净滚动 → find_scroll_delta 正确返回 None
+        assert_eq!(stitch::find_scroll_delta(&a, &b), None);
+    }
 }

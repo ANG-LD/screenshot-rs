@@ -14,7 +14,24 @@
 
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(not(target_os = "windows"))]
 use arboard::ImageData;
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{GetLastError, GlobalFree};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::{
+    DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    },
+    Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+    Ole::{CF_BITMAP, CF_DIB, CF_DIBV5},
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Graphics::Gdi::{
+    BITMAPINFO, BITMAPINFOHEADER, BITMAPV5HEADER, BI_BITFIELDS, CBM_INIT, CreateCompatibleDC,
+    CreateDIBitmap, DeleteDC, DeleteObject, DIB_RGB_COLORS, LCS_GM_IMAGES, RGBQUAD,
+};
 
 use crate::capture::CapturedFrame;
 use crate::error::{AppError, AppResult};
@@ -23,7 +40,8 @@ use crate::error::{AppError, AppResult};
 ///
 /// `bytes` 借用调用方像素（Cow::Borrowed）：`set_image` 在调用期间同步完成
 /// 编码（Linux 编 PNG / Windows 建 DIB），不会在返回后持有数据，因此
-/// 成功路径零拷贝。
+/// 成功路径零拷贝。Windows 图像写入走原生多格式，不走 arboard。
+#[cfg(not(target_os = "windows"))]
 fn image_data<'a>(frame: &CapturedFrame, pixels: &'a [u8]) -> ImageData<'a> {
     ImageData {
         width: frame.width as usize,
@@ -59,49 +77,59 @@ impl ClipboardService {
     /// 时连接被 server 端断开）。失败时把连接 drop 重连一次再试，
     /// 避免一次偶发错误让本次截图直接丢。
     pub fn write_frame(&self, frame: &CapturedFrame) -> AppResult<()> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| AppError::Window(format!("ClipboardService Mutex poisoned: {e}")))?;
-        if guard.is_none() {
-            *guard = Some(arboard::Clipboard::new().map_err(AppError::Clipboard)?);
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 用原生多格式写入（CF_DIBV5 + CF_PNG），不经过 arboard：
+            // arboard 在 Windows 只写 CF_DIBV5 单一格式，部分目标应用不接受；
+            // 且 arboard Clipboard 有线程亲和性，跨线程共享可能损坏剪贴板状态。
+            return write_frame_windows(frame);
         }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| AppError::Window(format!("ClipboardService Mutex poisoned: {e}")))?;
+            if guard.is_none() {
+                *guard = Some(arboard::Clipboard::new().map_err(AppError::Clipboard)?);
+            }
 
-        // 校验像素长度与 width*height*4 一致：arboard set_image 内部会
-        // 把 RGBA8 编码为 PNG，长度不匹配直接 ConversionFailure，
-        // 报出来的错误是"could not be converted to the appropriate format"——
-        // 看不出来是长度问题，反而像格式问题，让人误以为是颜色通道顺序。
-        let expected = frame.width as usize * frame.height as usize * 4;
-        if frame.pixels.len() != expected {
-            tracing::error!(
-                "CapturedFrame 长度不一致：width={} height={} pixels.len()={} expected={}",
-                frame.width, frame.height, frame.pixels.len(), expected
-            );
-            return Err(AppError::Window(format!(
-                "CapturedFrame pixels 长度不匹配：得到 {}，期望 {}",
-                frame.pixels.len(),
-                expected
-            )));
-        }
+            // 校验像素长度与 width*height*4 一致：arboard set_image 内部会
+            // 把 RGBA8 编码为 PNG，长度不匹配直接 ConversionFailure，
+            // 报出来的错误是"could not be converted to the appropriate format"——
+            // 看不出来是长度问题，反而像格式问题，让人误以为是颜色通道顺序。
+            let expected = frame.width as usize * frame.height as usize * 4;
+            if frame.pixels.len() != expected {
+                tracing::error!(
+                    "CapturedFrame 长度不一致：width={} height={} pixels.len()={} expected={}",
+                    frame.width, frame.height, frame.pixels.len(), expected
+                );
+                return Err(AppError::Window(format!(
+                    "CapturedFrame pixels 长度不匹配：得到 {}，期望 {}",
+                    frame.pixels.len(),
+                    expected
+                )));
+            }
 
-        // 按需构建 ImageData：借用帧像素（Cow::Borrowed）。arboard 的 set_image
-        // 在调用期间同步编码（Linux 编 PNG / Windows 建 DIB），不会持有数据，
-        // 因此成功路径零拷贝；重连重试路径同样只是借用，仍无复制。
-        let clipboard = guard
-            .as_mut()
-            .expect("刚 ensure 完不应为 None");
-        match clipboard.set_image(image_data(frame, &frame.pixels)) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!("剪贴板写入失败，重连重试一次：{e}");
-                *guard = None;
-                let mut new_clipboard =
-                    arboard::Clipboard::new().map_err(AppError::Clipboard)?;
-                new_clipboard
-                    .set_image(image_data(frame, &frame.pixels))
-                    .map_err(AppError::Clipboard)?;
-                *guard = Some(new_clipboard);
-                Ok(())
+            // 按需构建 ImageData：借用帧像素（Cow::Borrowed）。arboard 的 set_image
+            // 在调用期间同步编码（Linux 编 PNG / Windows 建 DIB），不会持有数据，
+            // 因此成功路径零拷贝；重连重试路径同样只是借用，仍无复制。
+            let clipboard = guard
+                .as_mut()
+                .expect("刚 ensure 完不应为 None");
+            match clipboard.set_image(image_data(frame, &frame.pixels)) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    tracing::warn!("剪贴板写入失败，重连重试一次：{e}");
+                    *guard = None;
+                    let mut new_clipboard =
+                        arboard::Clipboard::new().map_err(AppError::Clipboard)?;
+                    new_clipboard
+                        .set_image(image_data(frame, &frame.pixels))
+                        .map_err(AppError::Clipboard)?;
+                    *guard = Some(new_clipboard);
+                    Ok(())
+                }
             }
         }
     }
@@ -131,6 +159,228 @@ impl ClipboardService {
             }
         }
     }
+}
+
+/// Windows 原生把帧写入剪贴板：一次会话里同时提供 CF_DIBV5 与 CF_PNG，
+/// 最大化目标应用的粘贴兼容性。
+///
+/// - CF_DIBV5（BITMAPV5HEADER + 32bit BGRA，底部向上）：Word / Paint / 编辑器等
+///   标准 Windows 应用。
+/// - CF_PNG：浏览器 / 聊天工具等多认 PNG。
+///
+/// arboard 在 Windows 只写 CF_DIBV5 单一格式，部分应用（尤其只认 PNG 或
+/// CF_BITMAP 的）粘贴失败；且 arboard 的 Clipboard 有线程亲和性，覆盖线程
+/// OCR 复制与主线程图像写入共用实例时可能损坏状态。这里直接走 Win32 原生，
+/// 与本进程其它剪贴板操作解耦。
+/// 分配一块 HGLOBAL 并写入字节，返回句柄；失败返回 null（内部已释放）。
+#[cfg(target_os = "windows")]
+unsafe fn global_from_bytes(data: &[u8]) -> *mut core::ffi::c_void {
+    let h = GlobalAlloc(GMEM_MOVEABLE, data.len());
+    if h.is_null() {
+        return h;
+    }
+    let ptr = GlobalLock(h) as *mut u8;
+    if ptr.is_null() {
+        GlobalFree(h);
+        return std::ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+    GlobalUnlock(h);
+    h
+}
+
+#[cfg(target_os = "windows")]
+fn write_frame_windows(frame: &CapturedFrame) -> AppResult<()> {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 || frame.pixels.len() != w * h * 4 {
+        return Err(AppError::Window(format!(
+            "CapturedFrame pixels 长度不匹配：得到 {}，期望 {}",
+            frame.pixels.len(),
+            w * h * 4
+        )));
+    }
+
+    // RGBA → BGRA，并垂直翻转（DIB 底部向上，与 arboard 一致：MS Word 不接受
+    // 负高度顶向下的 DIB）。
+    let mut bgra = Vec::with_capacity(w * h * 4);
+    for row in (0..h).rev() {
+        let base = row * w * 4;
+        for i in 0..w {
+            let p = base + i * 4;
+            bgra.extend_from_slice(&[
+                frame.pixels[p + 2],
+                frame.pixels[p + 1],
+                frame.pixels[p],
+                frame.pixels[p + 3],
+            ]);
+        }
+    }
+
+    // 编码 PNG（CF_PNG 用；编码失败不致命，仍有其它格式兜底）
+    let mut png_buf = Vec::new();
+    if let Some(img) =
+        image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels.clone())
+    {
+        let mut cursor = std::io::Cursor::new(&mut png_buf);
+        let _ = img.write_to(&mut cursor, image::ImageFormat::Png);
+    }
+
+    // "PNG" 剪贴板格式 ID 由系统按名称运行时分配，不能硬编码：硬编码 0x8017
+    // 在部分系统上与真实 ID 不一致，要找 PNG 的应用（含 arboard 读取路径，它
+    // 优先读 PNG）会按注册返回的 ID 找不到我们的数据，回退读 DIBV5。
+    // RegisterClipboardFormatW 返回 0 表示失败，此时退化为只提供 DIB。
+    let png_format = unsafe {
+        let wide: Vec<u16> = "PNG".encode_utf16().chain(std::iter::once(0)).collect();
+        RegisterClipboardFormatW(wide.as_ptr())
+    };
+
+    unsafe {
+        // 1) CF_DIBV5：BITMAPV5HEADER + 32bit BGRA（掩码在头内，GDI 类应用可读）
+        #[allow(non_upper_case_globals)]
+        const LCS_sRGB: u32 = 0x7352_4742;
+        let header_size = std::mem::size_of::<BITMAPV5HEADER>();
+        let header = BITMAPV5HEADER {
+            bV5Size: header_size as u32,
+            bV5Width: frame.width as i32,
+            bV5Height: frame.height as i32,
+            bV5Planes: 1,
+            bV5BitCount: 32,
+            bV5Compression: BI_BITFIELDS,
+            bV5SizeImage: (4 * w * h) as u32,
+            bV5XPelsPerMeter: 0,
+            bV5YPelsPerMeter: 0,
+            bV5ClrUsed: 0,
+            bV5ClrImportant: 0,
+            bV5RedMask: 0x00ff0000,
+            bV5GreenMask: 0x0000ff00,
+            bV5BlueMask: 0x000000ff,
+            bV5AlphaMask: 0xff000000,
+            bV5CSType: LCS_sRGB,
+            bV5Endpoints: std::mem::zeroed(),
+            bV5GammaRed: 0,
+            bV5GammaGreen: 0,
+            bV5GammaBlue: 0,
+            bV5Intent: LCS_GM_IMAGES as u32,
+            bV5ProfileData: 0,
+            bV5ProfileSize: 0,
+            bV5Reserved: 0,
+        };
+        let mut dibv5_data = Vec::with_capacity(header_size + bgra.len());
+        dibv5_data.extend_from_slice(std::slice::from_raw_parts(
+            (&header as *const BITMAPV5HEADER).cast::<u8>(),
+            header_size,
+        ));
+        dibv5_data.extend_from_slice(&bgra);
+
+        // 2) CF_DIB：BITMAPINFOHEADER + BI_BITFIELDS + 头后 3 个 R/G/B 掩码 + 像素。
+        //    image crate 对 V4/V5 头 + BI_BITFIELDS 有"像素区额外跳过 12 字节"的解析
+        //    怪癖，会把 V5 头内掩码当作像素偏移前的数据；改用 Info 头 + 掩码在头后
+        //    的经典 DIB 布局，GDI 与 image crate 都能正确解析。
+        let bih = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: frame.width as i32,
+            biHeight: frame.height as i32,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_BITFIELDS,
+            biSizeImage: (4 * w * h) as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let mut dib_data = Vec::with_capacity(40 + 12 + bgra.len());
+        dib_data.extend_from_slice(std::slice::from_raw_parts(
+            (&bih as *const BITMAPINFOHEADER).cast::<u8>(),
+            40,
+        ));
+        dib_data.extend_from_slice(&0x00ff0000u32.to_le_bytes()); // RedMask
+        dib_data.extend_from_slice(&0x0000ff00u32.to_le_bytes()); // GreenMask
+        dib_data.extend_from_slice(&0x000000ffu32.to_le_bytes()); // BlueMask
+        dib_data.extend_from_slice(&bgra);
+
+        // 3) CF_BITMAP：GDI HBITMAP（最老的通用图像剪贴板格式，部分旧应用只认它）
+        let bmi = BITMAPINFO {
+            bmiHeader: bih,
+            bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
+        };
+        let hdc = CreateCompatibleDC(std::ptr::null_mut());
+        let hbmp = CreateDIBitmap(
+            hdc,
+            &bih,
+            CBM_INIT as u32,
+            bgra.as_ptr() as *const core::ffi::c_void,
+            &bmi,
+            DIB_RGB_COLORS,
+        );
+        DeleteDC(hdc);
+
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            let code = GetLastError();
+            tracing::error!("OpenClipboard 失败，last_error={code}");
+            return Err(AppError::Window(format!(
+                "OpenClipboard 失败 (error {code})"
+            )));
+        }
+        EmptyClipboard();
+
+        // SetClipboardData 失败时句柄仍归调用方，必须释放（GlobalFree / DeleteObject），
+        // 否则泄漏；成功则所有权移交剪贴板。任一格式成功即算成功。
+        let mut any_set = false;
+
+        let h = global_from_bytes(&dibv5_data);
+        if !h.is_null() {
+            if !SetClipboardData(CF_DIBV5 as u32, h as _).is_null() {
+                any_set = true;
+            } else {
+                GlobalFree(h);
+            }
+        }
+
+        let h = global_from_bytes(&dib_data);
+        if !h.is_null() {
+            if !SetClipboardData(CF_DIB as u32, h as _).is_null() {
+                any_set = true;
+            } else {
+                GlobalFree(h);
+            }
+        }
+
+        if !hbmp.is_null() {
+            if !SetClipboardData(CF_BITMAP as u32, hbmp as _).is_null() {
+                any_set = true;
+            } else {
+                DeleteObject(hbmp as _);
+            }
+        }
+
+        if png_format != 0 && !png_buf.is_empty() {
+            let h = global_from_bytes(&png_buf);
+            if !h.is_null() {
+                if !SetClipboardData(png_format, h as _).is_null() {
+                    any_set = true;
+                } else {
+                    GlobalFree(h);
+                }
+            }
+        }
+
+        CloseClipboard();
+
+        if !any_set {
+            tracing::error!(
+                "剪贴板图像格式写入全部失败：DIBV5/DIB/BITMAP/PNG 均未设置成功"
+            );
+            return Err(AppError::Window("剪贴板图像格式写入全部失败".into()));
+        }
+        tracing::info!(
+            "剪贴板图像写入成功（{}x{}，DIBV5/DIB/BITMAP/PNG 至少一项）",
+            frame.width,
+            frame.height
+        );
+    }
+    Ok(())
 }
 
 /// 进程级剪贴板服务单例。

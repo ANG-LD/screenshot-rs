@@ -2,6 +2,7 @@
 //!
 //! 平台实现见 `windows.rs`、`linux.rs` 和 `macos.rs`。
 
+#[cfg(target_os = "linux")]
 pub mod linux;
 pub mod macos;
 pub mod windows;

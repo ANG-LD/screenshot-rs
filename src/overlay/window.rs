@@ -819,6 +819,13 @@ impl OverlayView {
                 weak.clone(),
                 cx,
             ))
+            .child(render_simple_button(
+                ToolButton::ScrollManual,
+                false,
+                sel.size.x < 20.0 || sel.size.y < 20.0,
+                weak.clone(),
+                cx,
+            ))
             .child(render_tool_button_with_popover(
                 ToolButton::Mosaic,
                 active_tool == Some(ToolButton::Mosaic),
@@ -2182,14 +2189,19 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 let fs = *font_size / scale_factor;
                 // 行盒必须随字号缩放，避免 paint_layer 高度 < asc+descent 时字形被裁剪。
                 let line_height = px(fs * 1.5);
-                // 编辑态 Input 的文字行盒高是 window.line_height()（≈1.5×窗口默认字号 16px，
-                // 与输入字号无关），字形相对行盒顶偏移 (lh_in-asc-desc)/2。paint 的行盒是
-                // fs*1.5，字形偏移 (lh_paint-asc-desc)/2。要让两者字形顶重合，需把 paint
-                // 起点上移 (lh_paint-lh_in)/2，否则提交后文字会整体下移。
-                let input_lh = window.line_height();
+                // 编辑态 Input 的实际文字行盒：实测（range_to_bounds）等于输入字号×1.5，即
+                // 与 paint 的行盒 line_height 相同。字形相对行盒顶偏移 (lh-asc-desc)/2，两者
+                // 行盒一致 → 补偿 (input_lh - line_height)/2 = 0，paint 起点 = 编辑态行盒顶。
+                // 用 window.line_height()（24）或 fs×1.4 都会让补偿非零，提交后文字上下漂移。
+                let input_lh = line_height;
                 let origin_fx = anchor.x + TO_X;
-                // 基准点用 box+7 而非 TO_Y(8)：编辑态文字行盒顶实测在 anchor.y+7
-                // （6px 拖动条 + 1px 内边距），用 8 会让提交后文字整体下移 1px。
+                // 编辑态文字行盒顶相对 box 的偏移：gpui-component 的 Input 用
+                // window.text_style() 排版，默认字体的 asc/desc 各平台不同，导致行盒顶位置
+                // 平台相关。Linux 实测 +7（6px 拖动条 + 1px 内边距）；Windows 默认字体 Segoe
+                // 度量不同，实测行盒顶在 +8，用 +7 会让提交后文字上移 1px。
+                #[cfg(target_os = "windows")]
+                let origin_fy = anchor.y + TO_Y;
+                #[cfg(not(target_os = "windows"))]
                 let origin_fy = anchor.y + TO_Y - 1.0;
                 let origin_x = window.pixel_snap(px(origin_fx));
                 // 先对 box 基准点做像素对齐（与 Input 所在 box 的整块栅格化一致），
@@ -4379,6 +4391,8 @@ enum OverlayCommand {
         /// 手动滚动模式下用户点「完成」置 true（自动模式传哑值，不使用）
         done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
+        /// 引擎每轮更新的「内容是否在动」标志：静止时才显示「完成」按钮
+        moving: Arc<AtomicBool>,
         /// true = 手动滚动模式（进度窗显示「完成」按钮 + 手动提示文案）
         manual: bool,
         /// 选区物理像素（用于把小窗摆到不遮挡选区的位置）
@@ -4446,6 +4460,7 @@ impl OverlayService {
             cancel,
             done: Arc::new(AtomicBool::new(false)),
             progress,
+            moving: Arc::new(AtomicBool::new(false)),
             manual: false,
             region_px,
             screen_px,
@@ -4454,7 +4469,8 @@ impl OverlayService {
 
     /// 打开手动滚动截屏进度小窗（主线程调用，不阻塞）
     ///
-    /// `done` 由用户点「完成」置 true，主线程据此结束拼接。
+    /// `done` 由用户点「完成」置 true，主线程据此结束拼接；
+    /// `moving` 由引擎每轮更新，进度窗只在静止时显示「完成」按钮。
     pub fn open_manual_scroll_progress(
         &self,
         done: Arc<AtomicBool>,
@@ -4462,11 +4478,13 @@ impl OverlayService {
         progress: Arc<AtomicU32>,
         region_px: ub::Bounds,
         screen_px: ub::Bounds,
+        moving: Arc<AtomicBool>,
     ) {
         let _ = self.cmd.send(OverlayCommand::ShowProgress {
             cancel,
             done,
             progress,
+            moving,
             manual: true,
             region_px,
             screen_px,
@@ -4533,13 +4551,13 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         Ok(OverlayCommand::OpenPin(payload)) => {
                             let _ = async_cx.update(|cx| open_pin_in_app(payload, cx));
                         }
-                        Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, manual, region_px, screen_px }) => {
+                        Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, moving, manual, region_px, screen_px }) => {
                             // 先关掉可能残留的旧进度窗
                             if let Some(old) = progress.take() {
                                 let _ = old.update(async_cx, |_, window, _| window.remove_window());
                             }
                             match async_cx.update(|cx| {
-                                open_progress_window(cancel, done, progress_arc, manual, region_px, screen_px, cx)
+                                open_progress_window(cancel, done, progress_arc, moving, manual, region_px, screen_px, cx)
                             }) {
                                 Ok(handle) => progress = Some(handle),
                                 Err(e) => eprintln!("[overlay] open progress window failed: {e}"),
@@ -4572,6 +4590,8 @@ struct ProgressView {
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
+    /// 引擎每轮更新的「内容是否在动」标志：静止时才显示「完成」按钮
+    moving: Arc<AtomicBool>,
     manual: bool,
 }
 
@@ -4598,7 +4618,9 @@ impl Render for ProgressView {
                     .items_center()
                     .child(div().text_sm().child(text)),
             )
-            .when(self.manual, |b| {
+            // 手动模式：内容静止时才显示「完成」按钮（滚动动画中途不可点，
+            // 避免最后一段还没拼进去就结束）
+            .when(self.manual && !self.moving.load(Ordering::Relaxed), |b| {
                 b.child(
                     Button::new("scroll-done")
                         .label("完成")
@@ -4630,6 +4652,7 @@ fn open_progress_window(
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
+    moving: Arc<AtomicBool>,
     manual: bool,
     region_px: ub::Bounds,
     screen_px: ub::Bounds,
@@ -4660,32 +4683,62 @@ fn open_progress_window(
         origin: ub::Point::new(region_px.origin.x * sx, region_px.origin.y * sy),
         size: ub::Point::new(region_px.size.x * sx, region_px.size.y * sy),
     };
-    // 优先把进度窗放到选区旁边（下方→上方→右侧→左侧），指针可及、且不污染截图；
-    // 候选位越界/与选区相交就跳过，最后回退到角落。
+    // 优先把进度窗放到选区旁边，指针可及、且不污染截图；候选位越界/与选区相交
+    // 就跳过，最后回退到角落。手动模式的「完成」按钮在窗内，用户要滚动+点完成，
+    // 窗口优先放选区**右侧**（贴近页面右边，用户停下即可点）；自动模式保持
+    // 下方→上方→右侧→左侧（滚动方向正下方离指针最近）。
     let clamp_x = |x: f32| x.clamp(0.0, (dw - win_w).max(0.0));
     let clamp_y = |y: f32| y.clamp(0.0, (dh - WIN_H).max(0.0));
-    let candidates = [
-        // 下方（滚动方向正下方，指针最近）
-        (
-            clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
-            clamp_y(region_logical.origin.y + region_logical.size.y),
-        ),
-        // 上方
-        (
-            clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
-            clamp_y(region_logical.origin.y - WIN_H),
-        ),
-        // 右侧
-        (
-            clamp_x(region_logical.origin.x + region_logical.size.x),
-            clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
-        ),
-        // 左侧
-        (
-            clamp_x(region_logical.origin.x - win_w),
-            clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
-        ),
-    ];
+    // 进度窗可视内容比请求位置偏出约几像素（GPUI 窗口框偏移），候选位需与选区
+    // 留出边距，否则窗口边缘会压进选区底部，每一帧都带一条白条。
+    const MARGIN: f32 = 12.0;
+    let candidates = if manual {
+        [
+            // 右侧
+            (
+                clamp_x(region_logical.origin.x + region_logical.size.x + MARGIN),
+                clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
+            ),
+            // 下方（滚动方向正下方，指针最近）
+            (
+                clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
+                clamp_y(region_logical.origin.y + region_logical.size.y + MARGIN),
+            ),
+            // 上方
+            (
+                clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
+                clamp_y(region_logical.origin.y - WIN_H - MARGIN),
+            ),
+            // 左侧
+            (
+                clamp_x(region_logical.origin.x - win_w - MARGIN),
+                clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
+            ),
+        ]
+    } else {
+        [
+            // 下方（滚动方向正下方，指针最近）
+            (
+                clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
+                clamp_y(region_logical.origin.y + region_logical.size.y + MARGIN),
+            ),
+            // 上方
+            (
+                clamp_x(region_logical.origin.x + (region_logical.size.x - win_w) / 2.0),
+                clamp_y(region_logical.origin.y - WIN_H - MARGIN),
+            ),
+            // 右侧
+            (
+                clamp_x(region_logical.origin.x + region_logical.size.x + MARGIN),
+                clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
+            ),
+            // 左侧
+            (
+                clamp_x(region_logical.origin.x - win_w - MARGIN),
+                clamp_y(region_logical.origin.y + (region_logical.size.y - WIN_H) / 2.0),
+            ),
+        ]
+    };
     let origin = candidates
         .into_iter()
         .find(|(x, y)| {
@@ -4714,7 +4767,7 @@ fn open_progress_window(
             focus: false,
             ..Default::default()
         },
-        |_, cx| cx.new(|_| ProgressView { cancel, done, progress, manual }),
+        |_, cx| cx.new(|_| ProgressView { cancel, done, progress, moving, manual }),
     )
     .map_err(|e| AppError::Gpui(format!("打开进度窗失败: {e}")))
 }
@@ -4746,7 +4799,11 @@ fn open_overlay_in_app(
         },
         move |window, cx| {
             #[cfg(target_os = "windows")]
-            adjust_window_client_top(window, client_origin.y as i32);
+            schedule_client_top_adjustment(
+                cx,
+                window_hwnd(window),
+                client_origin.y as i32,
+            );
 
             let actual = window.bounds();
             let phys_w = screen_bounds.size.x;
@@ -4825,8 +4882,8 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
     // 但这类窗口实际顶部边框为 0，导致客户端被放高 4px（ClientToScreen 实测）。
     // 因此 Windows 需要补偿：target_y = origin_y - 33 + 4 = origin_y - 29。
     // 图像实际渲染在 client y=33（边框1px + 标题栏32px）。窗口先按
-    // target_y = origin_y - 32 请求，创建后由 `adjust_window_client_top`
-    // 动态校正客户端位置（见下），跨平台无需硬编码偏移量。
+    // target_y = origin_y - 32 请求，创建后由 `schedule_client_top_adjustment`
+    // 延迟到 App 借期外动态校正客户端位置（见下），跨平台无需硬编码偏移量。
     let target_y = origin_y - CUSTOM_TITLEBAR_H;
 
     cx.open_window(
@@ -4848,8 +4905,17 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
         move |window, cx| {
             // 动态校正：图像在 client y=33，把客户端顶移到 origin_y - 33，
             // 使图像与选区对齐。跨平台无需硬编码系统栏高度/边框偏移。
+            //
+            // 不能在这里直接 SetWindowPos：会同步触发 WM_MOVE → gpui 的 on_moved
+            // 回调重新进入 App，而 open_window 期间 App 仍被 update 借出，报
+            // "RefCell already borrowed"（gpui_windows 的 restart 也有同款注释）。
+            // 改为捕获 HWND 后延迟到 App 借期外执行。
             #[cfg(target_os = "windows")]
-            adjust_window_client_top(window, (origin_y - 33.0) as i32);
+            schedule_client_top_adjustment(
+                cx,
+                window_hwnd(window),
+                (origin_y - 33.0) as i32,
+            );
 
             let actual = window.bounds();
             tracing::info!(
@@ -5019,46 +5085,82 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
     .expect("open pin window failed");
 }
 
-/// 把窗口客户端区的屏幕 Y 校正到 `desired_client_top`（Windows）。
+/// 取窗口的 Win32 HWND（仅 Windows；非 Win32 句柄返回 None）。
+#[cfg(target_os = "windows")]
+fn window_hwnd(window: &mut Window) -> Option<*mut core::ffi::c_void> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Win32(win) = handle.as_raw() {
+            return Some(win.hwnd.get() as *mut core::ffi::c_void);
+        }
+    }
+    None
+}
+
+/// 把窗口客户端区的屏幕 Y 校正到 `desired_client_top`，延迟到 App 借期外执行（Windows）。
 ///
 /// GPUI 的 `calculate_window_rect` 假设边框对称（height_offset/2 平分上下），
 /// 但实际窗口顶部边框可能为 0（全部在底部），导致客户端被放高几像素。
-/// 这里在窗口创建后用 `ClientToScreen` 实测客户端原点，再用 `SetWindowPos`
-/// 校正——任何平台/DPI 都自动正确，无需硬编码系统栏高度。
+/// 窗口创建后用 `ClientToScreen` 实测客户端原点，再用 `SetWindowPos` 校正——
+/// 任何平台/DPI 都自动正确，无需硬编码系统栏高度。
+///
+/// 不能直接在 `open_window` 回调里调 `adjust_window_client_top`：`SetWindowPos` 会
+/// 同步触发 `WM_MOVE`，gpui_windows 的 `on_moved` 回调重新进入 App，而回调执行期间
+/// App 仍被 `open_window` 所在的 update 借出，报 "RefCell already borrowed"
+/// （gpui_windows 的 `restart` 处 defer 注释是同一问题）。这里捕获 HWND 后交给
+/// foreground executor，在借期外、窗口真正落地后再位移。
 #[cfg(target_os = "windows")]
-fn adjust_window_client_top(window: &mut Window, desired_client_top: i32) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+fn schedule_client_top_adjustment(
+    cx: &mut App,
+    hwnd: Option<*mut core::ffi::c_void>,
+    desired_client_top: i32,
+) {
+    let Some(hwnd) = hwnd else { return };
+    let hwnd_key = hwnd as usize;
+    let desired = desired_client_top;
+    cx.spawn(async move |async_cx| {
+        // 等约一帧，确保窗口已由系统完成创建与首帧布局
+        async_cx
+            .background_executor()
+            .timer(std::time::Duration::from_millis(16))
+            .await;
+        adjust_window_client_top(hwnd_key as *mut core::ffi::c_void, desired);
+    })
+    .detach();
+}
+
+/// 用 Win32 API 把窗口客户端区顶校正到 `desired_client_top`。
+///
+/// 只操作 HWND，不经过 GPUI：调用方（`schedule_client_top_adjustment`）在 App 借期外
+/// 执行，避免 `SetWindowPos` 触发 `WM_MOVE` 回调重新进入 App 造成 "RefCell already
+/// borrowed"。
+#[cfg(target_os = "windows")]
+fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i32) {
     use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     };
-
-    if let Ok(handle) = window.window_handle() {
-        if let RawWindowHandle::Win32(win) = handle.as_raw() {
-            let hwnd = win.hwnd.get() as *mut core::ffi::c_void;
-            unsafe {
-                let mut pt: POINT = std::mem::zeroed();
-                ClientToScreen(hwnd, &mut pt);
-                let dy = desired_client_top - pt.y;
-                if dy != 0 {
-                    let mut wr: RECT = std::mem::zeroed();
-                    GetWindowRect(hwnd, &mut wr);
-                    tracing::debug!(
-                        "[adjust] client_top actual={} desired={} dy={}",
-                        pt.y, desired_client_top, dy
-                    );
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        wr.left,
-                        wr.top + dy,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
-            }
+    unsafe {
+        let mut pt: POINT = std::mem::zeroed();
+        ClientToScreen(hwnd, &mut pt);
+        let dy = desired_client_top - pt.y;
+        if dy != 0 {
+            let mut wr: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut wr);
+            tracing::debug!(
+                "[adjust] client_top actual={} desired={} dy={}",
+                pt.y, desired_client_top, dy
+            );
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                wr.left,
+                wr.top + dy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 }
