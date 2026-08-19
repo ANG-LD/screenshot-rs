@@ -20,6 +20,19 @@ const MAX_SCROLL: usize = 800;
 const MIN_OVERLAP: usize = 30;
 /// 逐像素验证的容差（每通道）
 const PIXEL_TOLERANCE: u8 = 50;
+/// 重叠带行数低于此值时按「快速滚动」处理：偏移必须精确且唯一。
+///
+/// 快速滚动（一帧滚近半屏）时重叠带很小（如 486 行视口滚 455 行 → 只剩 31 行），
+/// 行签名匹配噪声大，`find_scroll_delta` 报出的 s 容易偏大几行到几十行——s 偏大
+/// 会把已拼接的重叠带再拼一遍（长图出现重复块）。因此小重叠带下要求：
+/// 1. 验证更严格（所有采样行必须通过，而非 ≥80%）；
+/// 2. 邻域歧义检查：s±1/±2 同样达到通过阈值 → 偏移不唯一（周期/自相似内容常见）
+///    → 拒绝拼接，宁可靠 settled 丢段（后续从新基线继续）也不拼错重复。
+const STRICT_OVERLAP: usize = 80;
+/// 快速滚动下，采样行必须全部通过的严格阈值
+const STRICT_PASS_RATIO: f32 = 1.0;
+/// 邻域歧义判定用的通过率阈值（与常规 80% 一致：≥ 此值即视为「同样匹配」）
+const AMBIGUOUS_RATIO: f32 = 0.8;
 
 /// `find_scroll_delta` 的可复用中间缓冲：行签名 / 采样列 / 逐像素验证列。
 ///
@@ -91,7 +104,18 @@ impl StitchScratch {
             if avg == u64::MAX {
                 break;
             }
-            if band_has_energy(&self.sig_a, s, h) && verify_rows(a, b, s, w, &self.vcols) {
+            if !band_has_energy(&self.sig_a, s, h) {
+                continue;
+            }
+            let rate = verify_rows(a, b, s, w, &self.vcols);
+            let small_overlap = h - s < STRICT_OVERLAP;
+            let pass = if small_overlap {
+                // 快速滚动：重叠带小，s 必须精确且唯一
+                rate >= STRICT_PASS_RATIO && !ambiguous_neighbors(a, b, s, w, h, &self.vcols)
+            } else {
+                rate >= AMBIGUOUS_RATIO
+            };
+            if pass {
                 return Some(s);
             }
         }
@@ -165,6 +189,10 @@ fn band_has_energy(sig_a: &[u64], s: usize, h: usize) -> bool {
 
 /// 对候选滚动量 s 做抽样验证：重叠带内取 16 行 × 8 列，比较局部 3×3 平均 RGB。
 ///
+/// 返回通过采样行的比例（0.0..=1.0），由调用方按场景决定阈值：
+/// - 常规重叠带：≥80% 采样行通过即可（见 AMBIGUOUS_RATIO）；
+/// - 小重叠带（快速滚动）：要求 100% 通过（见 STRICT_PASS_RATIO）。
+///
 /// 用局部平均而非逐像素：平滑滚动中间帧有亚像素偏移，抗锯齿让同一行像素在
 /// 两次抓帧间偏差过大，逐像素比较会使**真实**滚动量验证失败，find_scroll_delta
 /// 就退回自相似的更大假偏移 → 拼接段与上一段重叠（下一页头重复上一页尾）。
@@ -174,11 +202,11 @@ fn band_has_energy(sig_a: &[u64], s: usize, h: usize) -> bool {
 /// 采样行从 5 加到 16：平均比较比逐像素宽松，采样点少时自相似内容会在个别点
 /// 巧合匹配（静态帧误判为滚动 → 重复拼接）；多采样行让这种巧合在整个重叠带
 /// 同时成立的概率趋近于零，静态帧仍返回 None。
-fn verify_rows(a: &CapturedFrame, b: &CapturedFrame, s: usize, w: usize, vcols: &[usize]) -> bool {
+fn verify_rows(a: &CapturedFrame, b: &CapturedFrame, s: usize, w: usize, vcols: &[usize]) -> f32 {
     let h = a.height as usize;
     let n = h - s; // 重叠行数
     if n < 8 {
-        return false;
+        return 0.0;
     }
     // 15 等分采样行（n/16..15n/16），避开重叠带两端：顶部 r=0 的 3×3 会混入
     // a 更早的行，底部 r=n-1 的 3×3 会混入 b 新增内容，都会误判为不匹配
@@ -219,9 +247,32 @@ fn verify_rows(a: &CapturedFrame, b: &CapturedFrame, s: usize, w: usize, vcols: 
         }
         total += 1;
     }
-    // 真实滚动整体对齐，个别采样行会因边缘/噪声/亚像素小幅超标而失败；自相似假
-    // 匹配在大多数采样行都不对齐。要求 ≥80% 采样行通过即可，既容忍噪声又排除假匹配。
-    passed * 5 >= total * 4
+    passed as f32 / total as f32
+}
+
+/// 邻域歧义检查（仅快速滚动/小重叠带时调用）：s±1、s±2 也达到通过阈值，
+/// 说明偏移不唯一——内容自相似/周期性（列表、表格线、相似区块）时，真实滚动
+/// 量的整数倍或近似偏移都能通过验证，报出的 s 可能偏大 → 拼接重复。
+/// 返回 true 表示存在歧义（应拒绝该候选）。
+fn ambiguous_neighbors(
+    a: &CapturedFrame,
+    b: &CapturedFrame,
+    s: usize,
+    w: usize,
+    h: usize,
+    vcols: &[usize],
+) -> bool {
+    for ds in [1usize, 2] {
+        if s >= ds && verify_rows(a, b, s - ds, w, vcols) >= AMBIGUOUS_RATIO {
+            return true;
+        }
+        if s + ds <= h.saturating_sub(MIN_OVERLAP)
+            && verify_rows(a, b, s + ds, w, vcols) >= AMBIGUOUS_RATIO
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// (row, col) 处 3×3 邻域的某通道平均值（越界夹取到图像边缘）。
@@ -421,6 +472,85 @@ mod tests {
         eprintln!("sparse identical (band mid) -> delta={r:?}");
         if r.is_some() {
             panic!("sparse identical frames should return None, got {r:?}");
+        }
+    }
+
+    /// 快速滚动（重叠带 < STRICT_OVERLAP）且内容唯一：s 精确唯一（邻域不匹配），
+    /// 严格验证不应误伤——仍返回真实滚动量。
+    #[test]
+    fn large_delta_precise_when_unique() {
+        let w = 200usize;
+        let h = 600usize;
+        let mk = |pixels: &mut Vec<u8>, w: usize, row: usize, src: usize| {
+            let v = row_val(src);
+            for c in 0..w {
+                let p = (row * w + c) * 4;
+                pixels[p] = v;
+                pixels[p + 1] = v.wrapping_add(37);
+                pixels[p + 2] = v.wrapping_mul(3);
+                pixels[p + 3] = 255;
+            }
+        };
+        let mut ap = vec![0u8; w * h * 4];
+        for row in 0..h {
+            mk(&mut ap, w, row, row);
+        }
+        let a = CapturedFrame { width: w as u32, height: h as u32, pixels: ap };
+        // b = 滚动 540：顶部 60 行 = a[540..]，底部 540 行 = 新内容（更大行号）
+        let mut bp = vec![0u8; w * h * 4];
+        for row in 0..h {
+            let src = if row + 540 < h { row + 540 } else { h + row };
+            mk(&mut bp, w, row, src);
+        }
+        let b = CapturedFrame { width: w as u32, height: h as u32, pixels: bp };
+        assert_eq!(find_scroll_delta(&a, &b), Some(540));
+    }
+
+    /// 快速滚动 + 行内容变化平缓（每行差 1，如浅色渐变的空白页）：s=540 与
+    /// s=539/541 同样通过验证（偏移不唯一）→ 必须拒绝（None）。若返回 Some，
+    /// 拼接会把已拼的重叠带重复拼入（长图重复块）。
+    #[test]
+    fn large_delta_ambiguous_rejected() {
+        let w = 200usize;
+        let h = 600usize;
+        let mk = |pixels: &mut Vec<u8>, w: usize, row: usize, src: usize| {
+            let v = (src % 256) as u8; // 相邻行差 1：任何 ±1 偏移都“匹配”
+            for c in 0..w {
+                let p = (row * w + c) * 4;
+                pixels[p] = v;
+                pixels[p + 1] = v.wrapping_add(37);
+                pixels[p + 2] = v.wrapping_mul(3);
+                pixels[p + 3] = 255;
+            }
+        };
+        let mut ap = vec![0u8; w * h * 4];
+        for row in 0..h {
+            mk(&mut ap, w, row, row);
+        }
+        let a = CapturedFrame { width: w as u32, height: h as u32, pixels: ap };
+        let mut bp = vec![0u8; w * h * 4];
+        for row in 0..h {
+            // 顶部 60 行 = a[540..]（平缓渐变，任何 ±1 偏移都“匹配” → 歧义）；
+            // 底部新内容用散列值，避免模 256 与 a 产生同模巧合（如 600≡88 mod 256
+            // 会让 s=88 假匹配底部新内容 → 绕过严格模式）。
+            let v = if row + 540 < h {
+                ((row + 540) % 256) as u8
+            } else {
+                row_val(h + row)
+            };
+            for c in 0..w {
+                let p = (row * w + c) * 4;
+                bp[p] = v;
+                bp[p + 1] = v.wrapping_add(37);
+                bp[p + 2] = v.wrapping_mul(3);
+                bp[p + 3] = 255;
+            }
+        }
+        let b = CapturedFrame { width: w as u32, height: h as u32, pixels: bp };
+        let r = find_scroll_delta(&a, &b);
+        eprintln!("large delta ambiguous -> delta={r:?}");
+        if r.is_some() {
+            panic!("ambiguous large delta should be rejected, got {r:?}");
         }
     }
 
