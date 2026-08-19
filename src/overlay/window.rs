@@ -4726,14 +4726,17 @@ struct OverlayWindowSlot {
 /// 焦点、不挡输入），首个会话由 `reuse_overlay_window` 唤醒。
 fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
     let t0 = std::time::Instant::now();
-    // 占位帧：停靠态不显示任何内容，1×1 足够
-    let placeholder = CapturedFrame { width: 1, height: 1, pixels: vec![0, 0, 0, 255] };
+    // 占位帧：停靠态不显示任何内容；用全透明像素，即使创建后到 unmap 之间
+    // 渲染了一帧也完全不可见（不透明黑会被拉伸成全屏黑屏闪现）。
+    let placeholder = CapturedFrame { width: 1, height: 1, pixels: vec![0, 0, 0, 0] };
     // 停靠态不会有会话，用一个无人接收的 channel 占位；会话开始时被替换
     let (tx, _rx) = std::sync::mpsc::channel::<OverlayResult>();
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
         origin: point(px(0.), px(0.)),
         size: Size::new(px(1.0), px(1.0)),
     });
+    let win_w = f32::from(display_bounds.size.width).max(1.0);
+    let win_h = f32::from(display_bounds.size.height).max(1.0);
     // X11 -2px 修正（见 open_overlay_in_app 注释）：位置在创建时定死，之后
     // 不能移动，所以必须在这里就按主显示原点修正。
     #[cfg(target_os = "linux")]
@@ -4741,11 +4744,14 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
     #[cfg(not(target_os = "linux"))]
     let origin_x = f32::from(display_bounds.origin.x);
 
+    // 窗口直接按全屏尺寸创建（不先建 1×1 再放大）：park 只 unmap、reuse 只
+    // map，窗口尺寸从头到尾不变，gpui 的 bounds 一直正确，避免复用路径里
+    // resize 后 ConfigureNotify 异步到达导致的首帧错位。
     let result = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(origin_x), display_bounds.origin.y),
-                size: Size::new(px(1.0), px(1.0)),
+                size: Size::new(px(win_w), px(win_h)),
             })),
             window_background: WindowBackgroundAppearance::Transparent,
             titlebar: None,
@@ -4760,7 +4766,7 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
                 OverlayView::new(
                     placeholder,
                     None,
-                    ub::Bounds::new(ub::Point::ZERO, ub::Point::new(1.0, 1.0)),
+                    ub::Bounds::new(ub::Point::ZERO, ub::Point::new(win_w, win_h)),
                     ub::Point::ZERO,
                     1.0,
                     tx,
@@ -4772,7 +4778,7 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
     );
     match result {
         Ok(handle) => {
-            // 立即停靠（unmap），避免 1×1 窗口在屏幕上闪现
+            // 立即停靠（unmap）：避免全屏透明窗口在屏幕上闪现/挡点击
             #[cfg(target_os = "linux")]
             let _ = handle.update(cx, |_, window, _| park_overlay_window(window));
             tracing::info!(
@@ -4781,10 +4787,7 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
             );
             Some(OverlayWindowSlot {
                 window: handle,
-                target: (
-                    f32::from(display_bounds.size.width),
-                    f32::from(display_bounds.size.height),
-                ),
+                target: (win_w, win_h),
             })
         }
         Err(e) => {
@@ -4866,7 +4869,10 @@ fn reuse_overlay_window(
                 view_cx,
             );
         });
-        // 2) 放大到全屏（unmap 状态下 resize 安全，map 后即为最终尺寸）
+        // 2) 放大到全屏：X11 平台窗口尺寸从头到尾不变（park 只 unmap），无需
+        //    resize——gpui 的 bounds 一直正确，map 后即为最终尺寸；非 X11
+        //    平台 park 时缩成了 1×1，需要恢复。
+        #[cfg(not(target_os = "linux"))]
         window.resize(Size::new(px(actual_w), px(actual_h)));
         // 3) 唤醒：map + 置顶
         #[cfg(target_os = "linux")]
@@ -4905,10 +4911,17 @@ fn park_overlay_window(window: &mut Window) {
     }
 }
 
-/// 非 X11 平台退化为 1×1 缩窗停靠（无 unmap 原语；窗口保持 1×1 时几乎不可见）
+/// 非 X11 平台退化为 1×1 缩窗停靠（无 unmap 原语；窗口保持 1×1 时几乎不可见）。
+/// Windows 下 1×1 窗口仍持有键盘焦点会吞掉用户后续按键，主动 SetFocus(NULL)
+/// 交还焦点（X11 走 unmap，由 X 服务器自动释放，无需此步）。
 #[cfg(not(target_os = "linux"))]
 fn park_overlay_window(window: &mut Window) {
     window.resize(Size::new(px(1.0), px(1.0)));
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        let _ = unsafe { SetFocus(std::ptr::null_mut()) };
+    }
 }
 
 /// 唤醒覆盖窗口：X11 下 map + 置顶。调用方应在 map 前完成 resize（避免
