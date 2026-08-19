@@ -56,7 +56,8 @@ raw-window-handle = "0.6"
 # x11rb 的 xtest/xcb 特性会链接系统 libxcb（xcb.lib），只存在于 Linux，必须按平台隔离。
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest"] }
+libc = "0.2"
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest", "shm"] }
 
 # Win32 消息泵（Windows 下 global-hotkey / tray-icon 必须在创建线程上跑消息循环才能派发事件）
 # + ReleaseCapture（Pin 窗口标题栏拖拽）+ ClientToScreen（诊断 pin 客户端原点）

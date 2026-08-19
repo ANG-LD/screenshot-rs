@@ -6371,6 +6371,7 @@ dependencies = [
  "gpui_platform",
  "gtk",
  "image",
+ "libc",
  "once_cell",
  "raw-window-handle",
  "screenshots",
