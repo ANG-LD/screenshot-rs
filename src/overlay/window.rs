@@ -339,13 +339,13 @@ impl OverlayView {
         tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) {
-        // 拷贝+转换合并为一次遍历：RGBA 副本转 BGRA 给 RenderImage（gpui 数据
-        // 约定 BGRA），原 RGBA 移动给 frame_pixels（OCR/提交用），避免
-        // "先 clone 再原地转换"的两次 8MB 遍历。
-        let bgra = rgba_to_bgra_copy(&frame.pixels);
-        let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, bgra)
-            .expect("CapturedFrame 像素长度必须与 width*height*4 一致");
-        self.frame_image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
+        // 换帧：clone 一份 RGBA 原地转 BGRA 给 RenderImage（gpui 数据约定
+        // BGRA），原 RGBA 移动给 frame_pixels（OCR/提交用）。
+        // 注意：不要改成"拷贝+转换合并"的一次遍历——基准实测 debug 构建下
+        // 合并版 25.9ms/帧 vs clone+原地转换 12.4ms/帧（debug 下 Vec::clone
+        // 走优化的 memcpy，显式 u32 循环无优化反而慢 2 倍）。
+        self.frame_image =
+            build_render_image_from_pixels(frame.width, frame.height, frame.pixels.clone());
         self.screen_bounds = screen_bounds;
         self.client_origin = client_origin;
         self.selection = SelectionState::new(screen_bounds);
@@ -1519,40 +1519,6 @@ fn rgba_to_bgra(pixels: &mut [u8]) {
             c.swap(0, 2);
         }
     }
-}
-
-/// RGBA → BGRA 的"拷贝+转换"合并版：分配新缓冲区并一次遍历完成转换，
-/// 避免"先 clone 再原地转"的两次 8MB 遍历（每次会话换帧省几 ms，debug
-/// 构建下更明显）。
-fn rgba_to_bgra_copy(src: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(src.len() % 4, 0);
-    let mut dst = Vec::with_capacity(src.len());
-    // 所有字节立即被下面写满，无需先 memset
-    unsafe { dst.set_len(src.len()) };
-    let n = src.len() / 4;
-    if (src.as_ptr() as usize).is_multiple_of(4) && (dst.as_mut_ptr() as usize).is_multiple_of(4) {
-        let sp = src.as_ptr() as *const u32;
-        let dp = dst.as_mut_ptr() as *mut u32;
-        for i in 0..n {
-            let v = unsafe { *sp.add(i) };
-            unsafe {
-                *dp.add(i) = ((v & 0x0000_00FF) << 16)
-                    | (v & 0x0000_FF00)
-                    | ((v & 0x00FF_0000) >> 16)
-                    | (v & 0xFF00_0000);
-            }
-        }
-    } else {
-        // 慢路径：任一缓冲区未对齐时退回避让（罕见）
-        for i in 0..n {
-            let base = i * 4;
-            dst[base] = src[base + 2];
-            dst[base + 1] = src[base + 1];
-            dst[base + 2] = src[base];
-            dst[base + 3] = src[base + 3];
-        }
-    }
-    dst
 }
 
 /// 检测点击是否落在文字输入框的边框（Move）或 resize 手柄上，返回对应的 DragState
