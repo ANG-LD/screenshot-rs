@@ -4897,6 +4897,12 @@ fn reuse_overlay_window(
             );
         });
         let t_session = std::time::Instant::now();
+        // 清除残留的 tooltip 浮层：窗口复用后 TooltipOverlay.content 跨会话
+        // 残留（Esc 关窗时鼠标未离开按钮，无 mouse_exited/on_mouse_down 事件
+        // 触发隐藏），不清除会在下次会话一开始就显示旧浮层。
+        if let Some(tooltip) = gpui_component::Root::tooltip_overlay(window, cx) {
+            tooltip.update(cx, |o, cx| o.hide(cx));
+        }
         // 2) 放大到全屏：X11 平台窗口尺寸从头到尾不变（park 只 unmap），无需
         //    resize——gpui 的 bounds 一直正确，map 后即为最终尺寸；非 X11
         //    平台 park 时缩成了 1×1，需要恢复。

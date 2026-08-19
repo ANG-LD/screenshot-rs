@@ -64,6 +64,13 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest", "shm"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Ole", "Win32_System_Memory"] }
 
+# gpui-component 的本地修补版：把 Root::tooltip_overlay 与 TooltipOverlay::hide
+# 从 pub(crate) 改为 pub，供项目在窗口复用会话开始时清除跨会话残留的 tooltip
+# 浮层（third_party/gpui-component 是 951e3de 的最小副本，仅 ui/macros/assets 三个 crate）。
+[patch."https://github.com/longbridge/gpui-component"]
+gpui-component = { path = "third_party/gpui-component/crates/ui" }
+gpui-component-assets = { path = "third_party/gpui-component/crates/assets" }
+
 [profile.release]
 opt-level = "z"          # 优化目标为大小 (size optimization)
 lto = "fat"              # 完整的链接时优化 (full LTO)
