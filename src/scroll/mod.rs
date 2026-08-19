@@ -125,6 +125,10 @@ pub trait ScrollProgress: Send + Sync {
     /// 打开手动滚动进度小窗：多一个「完成」按钮，用户滚完点它结束。
     /// `moving` 由引擎每轮按「相邻帧是否不同」更新，进度窗据此只在内容静止时
     /// 显示「完成」按钮（避免滚动动画中途误点，导致最后一段没拼进去）。
+    /// `bottom_has_content` 由引擎每轮更新：最近一帧底部是否还有内容。点「完成」
+    /// 时若为 true，进度窗先弹确认（可能还没滚到底），避免提前结束导致拼接缺底。
+    /// `confirming` 为确认态标志：用户继续滚动时由引擎自动复位。
+    #[allow(clippy::too_many_arguments)]
     fn show_manual(
         &self,
         region: &Bounds,
@@ -133,6 +137,8 @@ pub trait ScrollProgress: Send + Sync {
         done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
         moving: Arc<AtomicBool>,
+        bottom_has_content: Arc<AtomicBool>,
+        confirming: Arc<AtomicBool>,
     );
     /// 关闭进度小窗
     fn hide(&self);
@@ -566,6 +572,9 @@ pub fn run_manual_scroll_capture(
     let progress_h = Arc::new(AtomicU32::new(h));
     // 内容是否在动（相邻帧不同）：静止时才让进度窗显示「完成」
     let moving = Arc::new(AtomicBool::new(false));
+    // 最近一帧底部是否含内容 + 确认态标志（见 trait 注释）
+    let bottom_has_content = Arc::new(AtomicBool::new(false));
+    let confirming = Arc::new(AtomicBool::new(false));
     progress.show_manual(
         region,
         screen_bounds,
@@ -573,6 +582,8 @@ pub fn run_manual_scroll_capture(
         done.clone(),
         progress_h.clone(),
         moving.clone(),
+        bottom_has_content.clone(),
+        confirming.clone(),
     );
 
     // 内部闭包包住主循环：任何 `?` 提前退出，外层都统一 hide 进度窗。
@@ -631,18 +642,26 @@ pub fn run_manual_scroll_capture(
             // 首帧前 prev=None → false，初始单页即可点「完成」。
             let is_moving = prev.as_ref().is_some_and(|p| frames_differ(p, &b));
             moving.store(is_moving, Ordering::Relaxed);
+            // 用户重新滚动 → 撤掉「可能没滚到底」的确认态，回到正常进度窗
+            if is_moving {
+                confirming.store(false, Ordering::Relaxed);
+            }
+            // 最近一帧底部是否还有内容：点「完成」时据此决定是否先弹确认
+            bottom_has_content.store(frame_bottom_has_content(&b), Ordering::Relaxed);
 
             // 优先尝试重叠检测：帧足够锐利（未处于平滑滚动动画中）且重叠可靠 → 直接拼接。
             // 处于动画中间（亚像素偏移导致相邻行混合）的帧会被 verify_rows 拒绝返回 None。
             if let Some(s) = stitch::find_scroll_delta(&anchor, &b) {
                 if s >= MIN_SCROLL {
-                    // 可信度门槛：小滚动（≤半屏）直接可信；大滚动必须内容确实显著
-                    // 变化（帧间最大像素差大）才拼。空白自相似会让 find_scroll_delta
-                    // 在「没滚动但画面有轻微变化」时误报最大偏移（如 274），把重叠
-                    // 内容拼进去 → 重复。真实大滚动的 maxdiff 巨大（纹理带移动），
-                    // 启动期/未滚动的轻微变化 maxdiff 小。
-                    let credible = s <= (b.height as usize) / 2
-                        || max_frame_diff(&anchor, &b) > CREDIBLE_DIFF;
+                    // 可信度门槛：真实滚动必然有内容进入视口（maxdiff > 0），
+                    // 且要么是小滚动（≤半屏）要么内容变化确实显著。自相似内容
+                    // 会让 find_scroll_delta 在「没滚动但画面轻微变化」时误报大偏移
+                    // （如 209/274），但帧间 maxdiff=0（8px 网格上完全一致）——这种
+                    // 假偏移会把重叠内容拼进去 → 重复。md>0 是第一道闸：连新内容
+                    // 都没有就谈不上滚动。
+                    let md = max_frame_diff(&anchor, &b);
+                    let credible = md > 0
+                        && (s <= (b.height as usize) / 2 || md > CREDIBLE_DIFF);
                     if credible {
                         let append_off = (b.height as usize - s) * frame_w as usize * 4;
                         if append_off < b.pixels.len() {
@@ -651,7 +670,8 @@ pub fn run_manual_scroll_capture(
                             progress_h.store(stitched_h, Ordering::Relaxed);
                         }
                         tracing::info!(
-                            "[scroll-manual] iter={iter} append delta={s} stitched_h={stitched_h}"
+                            "[scroll-manual] iter={iter} append delta={s} stitched_h={stitched_h} maxdiff={}",
+                            max_frame_diff(&anchor, &b)
                         );
                     } else {
                         tracing::info!(
@@ -659,6 +679,14 @@ pub fn run_manual_scroll_capture(
                             max_frame_diff(&anchor, &b)
                         );
                     }
+                } else {
+                    // s 低于 MIN_SCROLL(4)：本会被静默丢弃。自相似内容可能把真实滚动
+                    // 误报成 1~3px 的小偏移 → 内容悄悄丢段。诊断用，标记出来。
+                    tracing::info!(
+                        "[scroll-manual] iter={iter} delta={s} below_min skip_append maxdiff={} diff_prev={}",
+                        max_frame_diff(&anchor, &b),
+                        prev.as_ref().is_some_and(|p| frames_differ(p, &b)),
+                    );
                 }
                 anchor = b.clone();
                 prev = Some(b);
@@ -691,8 +719,17 @@ pub fn run_manual_scroll_capture(
                     avg_adjacent_diff(&b),
                 );
             } else {
-                // 与 anchor 基本一致（没滚 / 滚回原位）→ 无事发生
+                // 与 anchor 基本一致（没滚 / 滚回原位）→ 无事发生。
+                // maxdiff>0 说明有轻微变化但低于阈值：自相似内容滚动时可能落在这里，
+                // 记录供诊断（纯静止 maxdiff=0 不刷屏）。
                 moving_frames = 0;
+                let md = max_frame_diff(&anchor, &b);
+                if md > 0 {
+                    tracing::info!(
+                        "[scroll-manual] iter={iter} idle maxdiff={md} diff_prev={}",
+                        prev.as_ref().is_some_and(|p| frames_differ(p, &b)),
+                    );
+                }
             }
             prev = Some(b);
         }
@@ -712,8 +749,32 @@ pub fn run_manual_scroll_capture(
 
 /// 粗判两帧内容是否显著不同（区分「动画还在进行/滚动了」与「内容静止」）。
 /// 均匀采样若干行、每行取 3 列，超过一半采样行有像素差异即认为不同。
-fn frames_differ(a: &CapturedFrame, b: &CapturedFrame) -> bool {
-    if a.width != b.width || a.height != b.height {
+/// 帧底部 ~8 行是否含内容（非近白像素）。用于「完成」确认：
+/// 底部还有内容说明视口底可能不是页面底，提示用户可能还没滚到底。
+fn frame_bottom_has_content(f: &CapturedFrame) -> bool {
+    let w = f.width as usize;
+    let h = f.height as usize;
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let rows = 8usize.min(h);
+    let mut hits = 0u32;
+    for y in (h - rows)..h {
+        for x in (0..w).step_by(8) {
+            let p = (y * w + x) * 4;
+            let (r, g, b) = (f.pixels[p], f.pixels[p + 1], f.pixels[p + 2]);
+            if r < 235 || g < 235 || b < 235 {
+                hits += 1;
+                if hits > 12 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn frames_differ(a: &CapturedFrame, b: &CapturedFrame) -> bool {    if a.width != b.width || a.height != b.height {
         return false;
     }
     let w = a.width as usize;
@@ -968,5 +1029,35 @@ mod manual_diag_tests {
         assert!(max_frame_diff(&a, &b) > 24);
         // 局部 patch 非干净滚动 → find_scroll_delta 正确返回 None
         assert_eq!(stitch::find_scroll_delta(&a, &b), None);
+    }
+
+    /// 底部含内容 → true（视口底可能是页面中部，需弹「可能没滚到底」确认）。
+    #[test]
+    fn bottom_content_detected() {
+        let w = 200usize;
+        let h = 100usize;
+        // 全白底 → 无内容
+        let blank = mk_frame(w, h, |_| 255);
+        assert!(!frame_bottom_has_content(&blank));
+        // 底部 8 行画一行深色文字（其他行白）→ 有内容
+        let mut f = mk_frame(w, h, |_| 255);
+        for row in (h - 8)..h {
+            for x in 0..w {
+                let p = (row * w + x) * 4;
+                f.pixels[p] = 30;
+                f.pixels[p + 1] = 30;
+                f.pixels[p + 2] = 30;
+            }
+        }
+        assert!(frame_bottom_has_content(&f));
+        // 底部只有极少量杂色像素（< 阈值）→ 不算内容
+        let mut f2 = mk_frame(w, h, |_| 255);
+        for k in 0..5 {
+            let p = ((h - 1) * w + k * 30) * 4;
+            f2.pixels[p] = 100;
+            f2.pixels[p + 1] = 100;
+            f2.pixels[p + 2] = 100;
+        }
+        assert!(!frame_bottom_has_content(&f2));
     }
 }

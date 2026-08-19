@@ -57,8 +57,11 @@ pub fn rasterize_text(
 
     // 阶段 1：layout。只借用 font_system，产出每个 glyph 的 (gx, gy, cache_key)。
     // 用物理坐标（以 anchor 为原点）；line_y 由 cosmic-text 通过 (0, run.line_y) 传给 physical。
+    // 行距必须与编辑态 Input 一致（1.5×字号，实测 range_to_bounds 的 lh = fs×1.5）：
+    // 若用 1.4×字号，多行文字最终成图的行距比预览小 0.1×字号×行数，行数越多
+    // 文字整体越往上收、与预览偏差越大（单行无差异）。
     let physical_glyphs: Vec<(f32, f32, cosmic_text::CacheKey)> = with_font_system(|font_system| {
-        let metrics = Metrics::new(font_size, font_size * 1.4);
+        let metrics = Metrics::new(font_size, font_size * 1.5);
         let mut buffer = Buffer::new(font_system, metrics);
         let attrs = Attrs::new()
             .family(Family::Name(TEXT_FONT_FAMILY))
@@ -996,6 +999,56 @@ mod tests {
     }
 
     // ====== T5: rasterize_text 真实现测试 ======
+
+    #[test]
+    fn debug_measure_ink_bbox_single_line() {
+        // 临时诊断：对比不同 line_height 下 cosmic-text 的首行基线位置
+        for lh in [33.6_f32, 36.0_f32] {
+            with_font_system(|font_system| {
+                let metrics = Metrics::new(24.0, lh);
+                let mut buffer = Buffer::new(font_system, metrics);
+                let attrs = Attrs::new().family(Family::Name(TEXT_FONT_FAMILY)).weight(Weight::NORMAL);
+                buffer.set_text("文字蚊子", &attrs, Shaping::Advanced, None);
+                buffer.set_size(None, None);
+                buffer.shape_until_scroll(font_system, false);
+                for run in buffer.layout_runs() {
+                    let first = run.glyphs.iter().next().unwrap();
+                    let phys = first.physical((0.0, run.line_y), 1.0);
+                    println!(
+                        "DEBUG_COSMIC lh={:.1} line_y={:.1} baseline_phys.y={:.1}",
+                        lh, run.line_y, phys.y
+                    );
+                    break;
+                }
+            });
+        }
+        // 临时诊断：单行 vs 两行时 rasterize_text 的 ink 包围盒相对 anchor(0,0) 的位置
+        for (label, content) in [("single", "文字蚊子"), ("double", "文字蚊子\n第二行字")] {
+            let mut f = empty_frame(400, 200);
+            rasterize_text(
+                &mut f, (0.0, 0.0), (0.0, 0.0), content, 24.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            )
+            .unwrap();
+            let mut min_x = u32::MAX;
+            let mut min_y = u32::MAX;
+            let mut max_x = 0;
+            let mut max_y = 0;
+            for row in 0..f.height {
+                for col in 0..f.width {
+                    if f.pixels[(row * f.width + col) as usize * 4] != 0 {
+                        min_x = min_x.min(col);
+                        min_y = min_y.min(row);
+                        max_x = max_x.max(col);
+                        max_y = max_y.max(row);
+                    }
+                }
+            }
+            println!(
+                "DEBUG_RASTER {} ink_bbox=({},{})-({},{}) size={}x{}",
+                label, min_x, min_y, max_x, max_y, max_x - min_x + 1, max_y - min_y + 1
+            );
+        }
+    }
 
     #[test]
     fn rasterize_text_empty_content_noop() {

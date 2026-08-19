@@ -170,6 +170,12 @@ impl AppState {
                 )?;
             }
 
+            // 临时诊断：保存最终拼接图，比对文字最终渲染位置
+            if let Some(img) =
+                image::RgbaImage::from_raw(clipped.width, clipped.height, clipped.pixels.clone())
+            {
+                let _ = img.save("/tmp/final_debug.png");
+            }
             self.clipboard.write_frame(&clipped)?;
             tracing::info!("截图已复制到剪贴板（{}x{}）", clipped.width, clipped.height);
         }
@@ -236,9 +242,19 @@ impl ScrollProgress for ScrollProgressAdapter<'_> {
         done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
         moving: Arc<AtomicBool>,
+        bottom_has_content: Arc<AtomicBool>,
+        confirming: Arc<AtomicBool>,
     ) {
-        self.0
-            .open_manual_scroll_progress(done, cancel, progress, *region, *screen_bounds, moving);
+        self.0.open_manual_scroll_progress(
+            done,
+            cancel,
+            progress,
+            *region,
+            *screen_bounds,
+            moving,
+            bottom_has_content,
+            confirming,
+        );
     }
 
     fn hide(&self) {
