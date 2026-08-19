@@ -40,7 +40,8 @@ jobs:
             libgles-dev \
             libgl-dev \
             libpng-dev \
-            libjpeg-dev
+            libjpeg-dev \
+            librsvg2-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
