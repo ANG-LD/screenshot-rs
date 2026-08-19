@@ -1,11 +1,17 @@
 //! 全屏覆盖窗口：把捕获的帧作为背景 + 半透明 dim + 选区矩形边框。
 //!
 //! 用户拖拽选区，松开鼠标后选区 bounds 通过 mpsc 发回主线程；
-//! 主线程据此裁剪原帧并写入剪贴板。Esc / 关闭窗口 → 取消。
+//! 主线程据此裁剪原帧并写入剪贴板。Esc → 取消（发 selection=None 并停靠）。
 //!
 //! GPUI 应用为进程级常驻单例（`OverlayService`）：专用线程跑
 //! `QuitMode::Explicit` 的 `application().run()`，覆盖窗口与 Pin 窗口都在
 //! 同一个应用内创建/销毁，截图完成不退出进程。主线程在 channel 上阻塞等结果。
+//!
+//! 覆盖窗口**常驻复用**：启动时创建一次（同步编译整套 wgpu shader pipeline，
+//! 约 0.5s），之后每次截图不再新建窗口——会话结束只把窗口 unmap 停靠
+//! （不可见、不挡输入、自动释放焦点），下次截图 resize + map 唤醒 + 换帧，
+//! 免去每窗重编译 pipeline 的 ~570ms（见 `park_overlay_window` /
+//! `reuse_overlay_window`）。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -317,7 +323,59 @@ impl OverlayView {
         this
     }
 
-    /// 发送结果并关闭窗口
+    /// 复用常驻窗口开始一次新会话：换帧 + 重置全部交互状态。
+    ///
+    /// 窗口复用路径（`reuse_overlay_window`）不销毁窗口，因此这里必须把
+    /// 上次会话遗留的一切状态清干净，等效于重新 new 一个 OverlayView。
+    /// `focus_handle` 保持不动（窗口/焦点句柄跨会话复用）。
+    #[allow(clippy::too_many_arguments)]
+    fn start_session(
+        &mut self,
+        frame: CapturedFrame,
+        original_frame: Option<CapturedFrame>,
+        screen_bounds: ub::Bounds,
+        client_origin: ub::Point,
+        scale_factor: f32,
+        tx: Sender<OverlayResult>,
+        cx: &mut Context<Self>,
+    ) {
+        self.frame_image =
+            build_render_image_from_pixels(frame.width, frame.height, frame.pixels.clone());
+        self.screen_bounds = screen_bounds;
+        self.client_origin = client_origin;
+        self.selection = SelectionState::new(screen_bounds);
+        self.tx = tx;
+        self.mode = OverlayMode::Selecting;
+        self.toolbar = ToolbarState::default();
+        self.drawing = DrawingState::new();
+        self.in_progress = None;
+        self.shape_layer_cache = None;
+        self.text_input = None;
+        self.text_input_anchor = BoundsPoint::ZERO;
+        self.text_input_rect = ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO);
+        self.text_input_drag = None;
+        self.text_input_finalized = false;
+        self.text_input_cmd_idx = None;
+        self.text_measure = None;
+        self.frame_pixels = frame.pixels;
+        self.frame_width = frame.width;
+        self.frame_height = frame.height;
+        self.original_frame = original_frame;
+        self.ocr_rect = None;
+        self.ocr_result = None;
+        self.ocr_loading = false;
+        self.ocr_drag_start = None;
+        self.toolbar_hovered = false;
+        self.ocr_panel_hovered = false;
+        self.selected_cmd_actual_idx = None;
+        self.cmd_drag = None;
+        self.hover_shape = false;
+        self.scale_factor = scale_factor;
+        self.dim_opacity = 1.0;
+        cx.notify();
+    }
+
+    /// 发送结果并停靠窗口（复用：窗口不销毁，缩到不可见/unmap 供下次使用）
     ///
     /// 内部将 selection 和 commands 的坐标从逻辑像素转为物理像素，
     /// 以匹配 `CapturedFrame` 的物理像素坐标系（app.rs 的 clip_region 和
@@ -378,7 +436,9 @@ impl OverlayView {
             scroll_manual,
             frame: Some(frame),
         });
-        window.remove_window();
+        // 停靠而非关闭：窗口与 WgpuRenderer（含已编译的 shader pipeline）保持
+        // 存活，下次截图直接复用，免去每窗重编译 pipeline 的 ~570ms。
+        park_overlay_window(window);
     }
 
     /// 在 Editing 模式下，按当前 active_tool 启动一个新 DrawCommand
@@ -712,6 +772,16 @@ impl OverlayView {
                 self.text_input_rect.size.x, self.text_input_rect.size.y,
                 self.toolbar.current_size, self.scale_factor
             );
+            // 测量编辑态首行行盒顶相对 box 顶的偏移（校准 paint_command 的 origin_fy）：
+            // range_to_bounds 返回 editor 元素内首行行盒的窗口坐标，box 顶 = anchor.y。
+            if let Some(lh) = state.read(cx).range_to_bounds(&(0..1)) {
+                tracing::info!(
+                    "finalize measure: line1_top={:.2} box_top={:.2} offset={:+.2} lh={:.2}",
+                    lh.origin.y, anchor.y, lh.origin.y - anchor.y.into(), lh.size.height
+                );
+            } else {
+                tracing::info!("finalize measure: range_to_bounds None (not laid out)");
+            }
             // SharedString 没有 Display impl；用 String::from 走 From<SharedString>
             let content: String = String::from(value);
             self.drawing.push(DrawCommand::Text {
@@ -2195,14 +2265,11 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 // 用 window.line_height()（24）或 fs×1.4 都会让补偿非零，提交后文字上下漂移。
                 let input_lh = line_height;
                 let origin_fx = anchor.x + TO_X;
-                // 编辑态文字行盒顶相对 box 的偏移：gpui-component 的 Input 用
-                // window.text_style() 排版，默认字体的 asc/desc 各平台不同，导致行盒顶位置
-                // 平台相关。Linux 实测 +7（6px 拖动条 + 1px 内边距）；Windows 默认字体 Segoe
-                // 度量不同，实测行盒顶在 +8，用 +7 会让提交后文字上移 1px。
-                #[cfg(target_os = "windows")]
+                // 编辑态文字行盒顶相对 box 的偏移：6px 顶部占位 spacer + 2px input_py
+                // 内边距 = +8（已用 range_to_bounds 实测，Linux 与 Windows 一致）。
+                // 旧实现 Linux 用 +7（当时编辑态 Input 带 1px 边框）；去掉边框后行盒顶
+                // 变为 +8，沿用 +7 会让提交后文字上移 1px。
                 let origin_fy = anchor.y + TO_Y;
-                #[cfg(not(target_os = "windows"))]
-                let origin_fy = anchor.y + TO_Y - 1.0;
                 let origin_x = window.pixel_snap(px(origin_fx));
                 // 先对 box 基准点做像素对齐（与 Input 所在 box 的整块栅格化一致），
                 // 再叠加行高偏移，避免偏移非整数时 pixel_snap 单独取整导致错位。
@@ -2667,12 +2734,14 @@ impl Render for OverlayView {
                     };
                     // 高度按 Input 实际行盒计算，避免多行文字向下溢出编辑框：
                     // th_px 是字形包围盒高，对多行会低估行距（字形 < 行盒）。
-                    // Input 编辑器（TextElement）行高 = window.line_height()；
-                    // 大字号下 cosmic-text 行距 ≥ 1.4×字号，取较大值。
+                    // 注意：Input 实际行高是 1.5×字号（.line_height(relative(1.5))，
+                    // 实测 range_to_bounds 的 lh = fs×1.5）。auto-grow 必须用 1.5×字号，
+                    // 否则每行少算 0.1×字号（fs=24 时 2.4px），行数越多框越矮，文字在
+                    // 框内相对下沉、多行越多越明显（单行无累积）。
                     // auto_grow(1,8) → 框高度锁定在 1..8 行，超出 8 行 Input 内部滚动。
                     let rows = value.matches('\n').count() + 1;
                     let effective_rows = rows.clamp(1, 8);
-                    let line_h = window.line_height().as_f32().max(fs / sf * 1.4);
+                    let line_h = window.line_height().as_f32().max(fs / sf * 1.5);
                     let new_h =
                         (effective_rows as f32 * line_h + 6.0 + 2.0 + 2.0 + 4.0).max(MIN_H);
                     let old_w = self.text_input_rect.size.x;
@@ -4393,6 +4462,10 @@ enum OverlayCommand {
         progress: Arc<AtomicU32>,
         /// 引擎每轮更新的「内容是否在动」标志：静止时才显示「完成」按钮
         moving: Arc<AtomicBool>,
+        /// 引擎每轮更新的「最近一帧底部是否含内容」：点「完成」时据此弹确认
+        bottom_has_content: Arc<AtomicBool>,
+        /// 确认态标志（手动模式点「完成」后弹「可能没滚到底」确认时置 true）
+        confirming: Arc<AtomicBool>,
         /// true = 手动滚动模式（进度窗显示「完成」按钮 + 手动提示文案）
         manual: bool,
         /// 选区物理像素（用于把小窗摆到不遮挡选区的位置）
@@ -4428,8 +4501,8 @@ impl OverlayService {
             screen_bounds,
             reply: reply_tx,
         });
-        // 主线程阻塞等结果；OverlayView 被销毁（关闭窗口）时 reply Sender drop
-        // → recv 返回 Err → 视为取消。
+        // 主线程阻塞等结果；取消走显式 OverlayResult（selection=None，见 commit）。
+        // 应用退出时 reply Sender drop → recv 返回 Err → 同样视为取消。
         let result = reply_rx.recv().unwrap_or(OverlayResult {
             selection: None,
             commands: vec![],
@@ -4461,6 +4534,8 @@ impl OverlayService {
             done: Arc::new(AtomicBool::new(false)),
             progress,
             moving: Arc::new(AtomicBool::new(false)),
+            bottom_has_content: Arc::new(AtomicBool::new(false)),
+            confirming: Arc::new(AtomicBool::new(false)),
             manual: false,
             region_px,
             screen_px,
@@ -4470,7 +4545,9 @@ impl OverlayService {
     /// 打开手动滚动截屏进度小窗（主线程调用，不阻塞）
     ///
     /// `done` 由用户点「完成」置 true，主线程据此结束拼接；
-    /// `moving` 由引擎每轮更新，进度窗只在静止时显示「完成」按钮。
+    /// `moving` 由引擎每轮更新，进度窗只在静止时显示「完成」按钮；
+    /// `bottom_has_content` / `confirming` 见 `ScrollProgress::show_manual` 注释。
+    #[allow(clippy::too_many_arguments)]
     pub fn open_manual_scroll_progress(
         &self,
         done: Arc<AtomicBool>,
@@ -4479,12 +4556,16 @@ impl OverlayService {
         region_px: ub::Bounds,
         screen_px: ub::Bounds,
         moving: Arc<AtomicBool>,
+        bottom_has_content: Arc<AtomicBool>,
+        confirming: Arc<AtomicBool>,
     ) {
         let _ = self.cmd.send(OverlayCommand::ShowProgress {
             cancel,
             done,
             progress,
             moving,
+            bottom_has_content,
+            confirming,
             manual: true,
             region_px,
             screen_px,
@@ -4538,26 +4619,71 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
             }
 
             cx.spawn(async move |async_cx: &mut AsyncApp| {
+                // 启动时创建常驻覆盖窗口（停靠态：X11 unmap 不可见、不抢焦点、
+                // 不挡输入）。窗口创建会同步编译整套 wgpu shader pipeline（约
+                // 0.5s）——这正是每次截图「开窗」的成本。窗口常驻后，每次截图
+                // 只是放大 + 换帧 + map 唤醒，不再重新编译 pipeline（见
+                // reuse_overlay_window），后续截图的窗口开销接近 0。
+                let mut overlay: Option<OverlayWindowSlot> = async_cx.update(open_parked_overlay);
+
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
-                            let _ = async_cx.update(|cx| {
+                            async_cx.update(|cx| {
                                 let t0 = std::time::Instant::now();
-                                open_overlay_in_app(frame, screen_bounds, reply, cx);
-                                tracing::info!("[overlay] window open took {:.0}ms", t0.elapsed().as_millis());
+                                // 显示尺寸变化（多显示器/分辨率切换，罕见）时重建窗口
+                                if let Some(slot) = &overlay {
+                                    let target = overlay_target_size(cx, &screen_bounds);
+                                    if slot.target != target {
+                                        tracing::info!(
+                                            "[overlay] 显示尺寸变化（{:?} → {:?}），重建覆盖窗口",
+                                            slot.target,
+                                            target
+                                        );
+                                        let _ = slot.window.update(cx, |_, w, _| w.remove_window());
+                                        overlay = None;
+                                    }
+                                }
+                                if let Some(slot) = &overlay {
+                                    reuse_overlay_window(&slot.window, frame, screen_bounds, reply, cx);
+                                    tracing::info!(
+                                        "[overlay] window reuse took {:.0}ms",
+                                        t0.elapsed().as_millis()
+                                    );
+                                } else {
+                                    overlay = open_parked_overlay(cx);
+                                    if let Some(slot) = &overlay {
+                                        reuse_overlay_window(&slot.window, frame, screen_bounds, reply, cx);
+                                        tracing::info!(
+                                            "[overlay] window open took {:.0}ms",
+                                            t0.elapsed().as_millis()
+                                        );
+                                    } else {
+                                        // 创建失败（极端情况）：回一个取消结果，避免主线程永久阻塞
+                                        let _ = reply.send(OverlayResult {
+                                            selection: None,
+                                            commands: vec![],
+                                            no_clipboard: false,
+                                            pin: None,
+                                            scroll_region_px: None,
+                                            scroll_manual: false,
+                                            frame: Some(frame),
+                                        });
+                                    }
+                                }
                             });
                         }
                         Ok(OverlayCommand::OpenPin(payload)) => {
                             let _ = async_cx.update(|cx| open_pin_in_app(payload, cx));
                         }
-                        Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, moving, manual, region_px, screen_px }) => {
+                        Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, moving, bottom_has_content, confirming, manual, region_px, screen_px }) => {
                             // 先关掉可能残留的旧进度窗
                             if let Some(old) = progress.take() {
                                 let _ = old.update(async_cx, |_, window, _| window.remove_window());
                             }
                             match async_cx.update(|cx| {
-                                open_progress_window(cancel, done, progress_arc, moving, manual, region_px, screen_px, cx)
+                                open_progress_window(cancel, done, progress_arc, moving, bottom_has_content, confirming, manual, region_px, screen_px, cx)
                             }) {
                                 Ok(handle) => progress = Some(handle),
                                 Err(e) => eprintln!("[overlay] open progress window failed: {e}"),
@@ -4585,6 +4711,239 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
         });
 }
 
+/// 常驻覆盖窗口的句柄 + 上次会话的目标窗口尺寸（用于检测显示尺寸变化）
+struct OverlayWindowSlot {
+    window: WindowHandle<gpui_component::Root>,
+    /// 上次会话的目标窗口尺寸（逻辑像素）
+    target: (f32, f32),
+}
+
+/// 启动时创建常驻覆盖窗口（停靠态）。
+///
+/// 窗口创建会同步编译整套 wgpu shader pipeline（约 0.5s）——这正是每次截图
+/// 「开窗」要付的成本。把窗口常驻：创建一次，之后每次截图只是 unmap→map
+/// 放大 + 换帧，不再重新编译 pipeline。创建后立即 unmap 停靠（不可见、不抢
+/// 焦点、不挡输入），首个会话由 `reuse_overlay_window` 唤醒。
+fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
+    let t0 = std::time::Instant::now();
+    // 占位帧：停靠态不显示任何内容，1×1 足够
+    let placeholder = CapturedFrame { width: 1, height: 1, pixels: vec![0, 0, 0, 255] };
+    // 停靠态不会有会话，用一个无人接收的 channel 占位；会话开始时被替换
+    let (tx, _rx) = std::sync::mpsc::channel::<OverlayResult>();
+    let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
+        origin: point(px(0.), px(0.)),
+        size: Size::new(px(1.0), px(1.0)),
+    });
+    // X11 -2px 修正（见 open_overlay_in_app 注释）：位置在创建时定死，之后
+    // 不能移动，所以必须在这里就按主显示原点修正。
+    #[cfg(target_os = "linux")]
+    let origin_x = f32::from(display_bounds.origin.x) - 2.0;
+    #[cfg(not(target_os = "linux"))]
+    let origin_x = f32::from(display_bounds.origin.x);
+
+    let result = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(origin_x), display_bounds.origin.y),
+                size: Size::new(px(1.0), px(1.0)),
+            })),
+            window_background: WindowBackgroundAppearance::Transparent,
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            focus: false,
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| {
+                OverlayView::new(
+                    placeholder,
+                    None,
+                    ub::Bounds::new(ub::Point::ZERO, ub::Point::new(1.0, 1.0)),
+                    ub::Point::ZERO,
+                    1.0,
+                    tx,
+                    cx,
+                )
+            });
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+        },
+    );
+    match result {
+        Ok(handle) => {
+            // 立即停靠（unmap），避免 1×1 窗口在屏幕上闪现
+            #[cfg(target_os = "linux")]
+            let _ = handle.update(cx, |_, window, _| park_overlay_window(window));
+            tracing::info!(
+                "[overlay] 覆盖窗口已创建并停靠（pipeline 编译 {:.0}ms）",
+                t0.elapsed().as_millis()
+            );
+            Some(OverlayWindowSlot {
+                window: handle,
+                target: (
+                    f32::from(display_bounds.size.width),
+                    f32::from(display_bounds.size.height),
+                ),
+            })
+        }
+        Err(e) => {
+            tracing::warn!("[overlay] 覆盖窗口创建失败（将退化为每次新建）：{e}");
+            None
+        }
+    }
+}
+
+/// 覆盖窗口的目标尺寸（逻辑像素）：主显示 bounds。
+fn overlay_target_size(cx: &App, screen_bounds: &ub::Bounds) -> (f32, f32) {
+    let wb = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
+        origin: point(px(0.), px(0.)),
+        size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
+    });
+    (f32::from(wb.size.width), f32::from(wb.size.height))
+}
+
+/// 复用常驻覆盖窗口开始一次截图会话（替代「每次新建窗口」）。
+///
+/// 窗口与 WgpuRenderer 保持存活，pipeline 已在启动时编译好；这里只做四件事：
+/// 1) `start_session` 换帧 + 重置交互状态；
+/// 2) 放大到全屏；
+/// 3) X11 下 map + 置顶唤醒；
+/// 4) 聚焦 + 激活。
+///
+/// 整段耗时远低于重新建窗（~570ms 的 pipeline 编译没了）。
+#[allow(clippy::too_many_arguments)]
+fn reuse_overlay_window(
+    overlay_window: &WindowHandle<gpui_component::Root>,
+    frame: CapturedFrame,
+    screen_bounds: ub::Bounds,
+    reply: Sender<OverlayResult>,
+    cx: &mut App,
+) {
+    // —— 与 open_overlay_in_app 相同的窗口/裁剪参数计算 ——
+    let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
+        origin: point(px(0.), px(0.)),
+        size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
+    });
+    // 窗口客户端原点的屏幕位置：取显示区域原点（与 open_overlay_in_app 一致）
+    let client_origin =
+        ub::Point::new(f32::from(win_bounds.origin.x), f32::from(win_bounds.origin.y));
+    let actual_w = f32::from(win_bounds.size.width).max(1.0);
+    let actual_h = f32::from(win_bounds.size.height).max(1.0);
+    let sx = screen_bounds.size.x / actual_w;
+    let sy = screen_bounds.size.y / actual_h;
+    let src_x = (f32::from(win_bounds.origin.x) * sx) as u32;
+    let src_y = (f32::from(win_bounds.origin.y) * sy) as u32;
+    let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
+    let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
+    let fullscreen = src_x == 0 && src_y == 0 && clip_w == frame.width && clip_h == frame.height;
+    let (display, original) = if fullscreen {
+        (frame, None)
+    } else {
+        match frame.clip_region(src_x, src_y, clip_w, clip_h) {
+            Ok(clipped) => (clipped, Some(frame)),
+            Err(_) => (frame, None),
+        }
+    };
+    let scale = display.width as f32 / actual_w;
+    let logical_bounds = ub::Bounds::new(ub::Point::ZERO, ub::Point::new(actual_w, actual_h));
+
+    let _ = overlay_window.update(cx, |root, window, cx| {
+        let view = root
+            .view()
+            .clone()
+            .downcast::<OverlayView>()
+            .expect("覆盖窗口的根视图应是 OverlayView");
+        // 1) 换帧 + 重置状态（此时窗口仍 unmap，不会闪现旧内容）
+        view.update(cx, |view, view_cx| {
+            view.start_session(
+                display,
+                original,
+                logical_bounds,
+                client_origin,
+                scale,
+                reply,
+                view_cx,
+            );
+        });
+        // 2) 放大到全屏（unmap 状态下 resize 安全，map 后即为最终尺寸）
+        window.resize(Size::new(px(actual_w), px(actual_h)));
+        // 3) 唤醒：map + 置顶
+        #[cfg(target_os = "linux")]
+        unpark_overlay_window(window);
+        // 4) 聚焦 + 激活（raise）
+        let fh = view.read(cx).focus_handle.clone();
+        fh.focus(window, cx);
+        window.activate_window();
+    });
+}
+
+/// 停靠覆盖窗口：X11 下直接 unmap（不可见、不挡输入、X 服务器自动释放键盘
+/// 焦点），窗口与渲染器保持存活，下次截图由 `unpark_overlay_window` 唤醒。
+/// GPUI 后端对 UnmapNotify 只更新内部 is_mapped 标志、不会销毁窗口，因此
+/// 绕过 GPUI 的 unmap 是安全的。
+#[cfg(target_os = "linux")]
+fn park_overlay_window(window: &mut Window) {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+    use x11rb::xcb_ffi::XCBConnection;
+
+    if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
+        if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+            (wh.as_raw(), dh.as_raw())
+        {
+            if let Some(conn_ptr) = xcb_dh.connection {
+                if let Ok(conn) = unsafe {
+                    XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
+                } {
+                    let _ = conn.unmap_window(xcb_wh.window.into());
+                    let _ = conn.flush();
+                }
+            }
+        }
+    }
+}
+
+/// 非 X11 平台退化为 1×1 缩窗停靠（无 unmap 原语；窗口保持 1×1 时几乎不可见）
+#[cfg(not(target_os = "linux"))]
+fn park_overlay_window(window: &mut Window) {
+    window.resize(Size::new(px(1.0), px(1.0)));
+}
+
+/// 唤醒覆盖窗口：X11 下 map + 置顶。调用方应在 map 前完成 resize（避免
+/// 闪现 1×1 过渡帧）；焦点由调用方随后通过 gpui focus/activate 设置。
+#[cfg(target_os = "linux")]
+fn unpark_overlay_window(window: &mut Window) {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, StackMode};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
+        if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+            (wh.as_raw(), dh.as_raw())
+        {
+            if let Some(conn_ptr) = xcb_dh.connection {
+                if let Ok(conn) = unsafe {
+                    XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
+                } {
+                    let _ = conn.map_window(xcb_wh.window.into());
+                    let _ = conn.configure_window(
+                        xcb_wh.window.into(),
+                        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                    );
+                    let _ = conn.flush();
+                }
+            }
+        }
+    }
+}
+
+/// 非 X11 平台：窗口从未 unmap，无需唤醒
+#[cfg(not(target_os = "linux"))]
+fn unpark_overlay_window(_window: &mut Window) {}
+
 /// 滚动截屏进度小窗视图（auto/manual 共用；manual 显示「完成」按钮）
 struct ProgressView {
     cancel: Arc<AtomicBool>,
@@ -4592,15 +4951,21 @@ struct ProgressView {
     progress: Arc<AtomicU32>,
     /// 引擎每轮更新的「内容是否在动」标志：静止时才显示「完成」按钮
     moving: Arc<AtomicBool>,
+    /// 引擎每轮更新的「最近一帧底部是否含内容」：点「完成」时据此弹确认
+    bottom_has_content: Arc<AtomicBool>,
+    /// 确认态标志：点「完成」且底部有内容时置 true，弹「可能没滚到底」确认
+    confirming: Arc<AtomicBool>,
     manual: bool,
 }
 
 impl Render for ProgressView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let cancel = self.cancel.clone();
-        let done = self.done.clone();
         let height = self.progress.load(Ordering::Relaxed);
-        let text = if self.manual {
+        let confirming_now = self.manual && self.confirming.load(Ordering::Relaxed);
+        let text = if confirming_now {
+            // 确认态：提示用户可能还没滚到底
+            "底部可能还有内容？".to_string()
+        } else if self.manual {
             format!("手动滚动截屏中… {height}px")
         } else {
             format!("滚动截屏中… {height}px")
@@ -4618,24 +4983,61 @@ impl Render for ProgressView {
                     .items_center()
                     .child(div().text_sm().child(text)),
             )
-            // 手动模式：内容静止时才显示「完成」按钮（滚动动画中途不可点，
-            // 避免最后一段还没拼进去就结束）
-            .when(self.manual && !self.moving.load(Ordering::Relaxed), |b| {
-                b.child(
-                    Button::new("scroll-done")
-                        .label("完成")
-                        .compact()
-                        .with_size(gpui_component::Size::Small)
-                        .on_click(move |_, _, _| done.store(true, Ordering::Relaxed)),
-                )
+            .when(confirming_now, {
+                let confirming = self.confirming.clone();
+                let done = self.done.clone();
+                // 确认态：继续滚动 / 确定结束
+                move |b| {
+                    b.child(
+                        Button::new("scroll-continue")
+                            .label("继续滚动")
+                            .compact()
+                            .with_size(gpui_component::Size::Small)
+                            .on_click(move |_, _, _| confirming.store(false, Ordering::Relaxed)),
+                    )
+                    .child(
+                        Button::new("scroll-confirm-done")
+                            .label("确定结束")
+                            .compact()
+                            .with_size(gpui_component::Size::Small)
+                            .on_click(move |_, _, _| done.store(true, Ordering::Relaxed)),
+                    )
+                }
             })
-            .child(
+            // 手动模式：内容静止时才显示「完成」按钮（滚动动画中途不可点，
+            // 避免最后一段还没拼进去就结束）。点「完成」时若最近一帧底部还有
+            // 内容，先弹确认——很可能页面还没滚到底，直接结束会拼接缺底。
+            .when(
+                self.manual && !confirming_now && !self.moving.load(Ordering::Relaxed),
+                {
+                    let done = self.done.clone();
+                    let confirming = self.confirming.clone();
+                    let bottom_has_content = self.bottom_has_content.clone();
+                    move |b| {
+                        b.child(
+                            Button::new("scroll-done")
+                                .label("完成")
+                                .compact()
+                                .with_size(gpui_component::Size::Small)
+                                .on_click(move |_, _, _| {
+                                    if bottom_has_content.load(Ordering::Relaxed) {
+                                        confirming.store(true, Ordering::Relaxed);
+                                    } else {
+                                        done.store(true, Ordering::Relaxed);
+                                    }
+                                }),
+                        )
+                    }
+                },
+            )
+            .child({
+                let cancel = self.cancel.clone();
                 Button::new("scroll-cancel")
                     .label("取消")
                     .compact()
                     .with_size(gpui_component::Size::Small)
-                    .on_click(move |_, _, _| cancel.store(true, Ordering::Relaxed)),
-            )
+                    .on_click(move |_, _, _| cancel.store(true, Ordering::Relaxed))
+            })
     }
 }
 
@@ -4648,11 +5050,14 @@ fn bounds_intersect(a: ub::Bounds, b: ub::Bounds) -> bool {
 }
 
 /// 打开滚动截屏进度小窗，摆到不与选区重叠的屏幕角落
+#[allow(clippy::too_many_arguments)]
 fn open_progress_window(
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
     moving: Arc<AtomicBool>,
+    bottom_has_content: Arc<AtomicBool>,
+    confirming: Arc<AtomicBool>,
     manual: bool,
     region_px: ub::Bounds,
     screen_px: ub::Bounds,
@@ -4767,82 +5172,9 @@ fn open_progress_window(
             focus: false,
             ..Default::default()
         },
-        |_, cx| cx.new(|_| ProgressView { cancel, done, progress, moving, manual }),
+        |_, cx| cx.new(|_| ProgressView { cancel, done, progress, moving, bottom_has_content, confirming, manual }),
     )
     .map_err(|e| AppError::Gpui(format!("打开进度窗失败: {e}")))
-}
-
-/// 在常驻应用里打开截图覆盖窗口（原 `run_blocking` 的窗口构建逻辑）。
-fn open_overlay_in_app(
-    frame: CapturedFrame,
-    screen_bounds: ub::Bounds,
-    tx: Sender<OverlayResult>,
-    cx: &mut App,
-) {
-    let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
-        origin: point(px(0.), px(0.)),
-        size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
-    });
-    let client_origin =
-        ub::Point::new(f32::from(win_bounds.origin.x), f32::from(win_bounds.origin.y));
-
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(win_bounds)),
-            window_background: WindowBackgroundAppearance::Transparent,
-            titlebar: None,
-            kind: WindowKind::PopUp,
-            is_movable: false,
-            is_resizable: false,
-            focus: true,
-            ..Default::default()
-        },
-        move |window, cx| {
-            #[cfg(target_os = "windows")]
-            schedule_client_top_adjustment(
-                cx,
-                window_hwnd(window),
-                client_origin.y as i32,
-            );
-
-            let actual = window.bounds();
-            let phys_w = screen_bounds.size.x;
-            let phys_h = screen_bounds.size.y;
-            let actual_w = f32::from(actual.size.width).max(1.0);
-            let actual_h = f32::from(actual.size.height).max(1.0);
-            let sx = phys_w / actual_w;
-            let sy = phys_h / actual_h;
-            let src_x = (f32::from(actual.origin.x) * sx) as u32;
-            let src_y = (f32::from(actual.origin.y) * sy) as u32;
-            let clip_w = ((actual_w * sx) as u32).min(frame.width.saturating_sub(src_x));
-            let clip_h = ((actual_h * sy) as u32).min(frame.height.saturating_sub(src_y));
-            // 全屏窗口直接复用 frame（避免整帧 clone）；窗口被系统压缩时才
-            // 裁剪出显示区域，并保留原帧供会话结束时归还主线程做最终裁剪。
-            let fullscreen =
-                src_x == 0 && src_y == 0 && clip_w == frame.width && clip_h == frame.height;
-            let (display, original) = if fullscreen {
-                (frame, None)
-            } else {
-                match frame.clip_region(src_x, src_y, clip_w, clip_h) {
-                    Ok(clipped) => (clipped, Some(frame)),
-                    Err(_) => (frame, None),
-                }
-            };
-
-            let scale = display.width as f32 / actual_w;
-            let logical_bounds =
-                ub::Bounds::new(ub::Point::ZERO, ub::Point::new(actual_w, actual_h));
-
-            let view = cx.new(|cx| {
-                OverlayView::new(display, original, logical_bounds, client_origin, scale, tx, cx)
-            });
-            let handle = view.read(cx).focus_handle.clone();
-            handle.focus(window, cx);
-            window.activate_window();
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
-        },
-    )
-    .expect("open_window 失败");
 }
 
 /// 在常驻应用里打开 Pin 窗口（原 `spawn_pin_window` 的窗口构建逻辑）。

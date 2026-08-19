@@ -6,6 +6,7 @@
 //! X11 GetImage Z_PIXMAP 在 x86-64 上返回 BGRA 字节序（B 在低字节），
 //! 转换为 RGBA 后存入 CapturedFrame。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use x11rb::connection::Connection;
@@ -52,6 +53,17 @@ impl PlatformScreenCapture {
     }
 }
 
+/// 是否启用首次捕获的原始帧转储（环境变量 SCREENSHOT_RS_DEBUG_DUMP=1）。
+/// 一次性读取环境变量并缓存，避免每次捕获都查环境。
+fn debug_dump_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SCREENSHOT_RS_DEBUG_DUMP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 fn get_image(x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame> {
     let guard = CACHED
         .lock()
@@ -85,13 +97,16 @@ fn get_image(x: i32, y: i32, w: u32, h: u32) -> AppResult<CapturedFrame> {
         );
     }
 
-    // 保存一份原始 BGRA 数据用于诊断（首次捕获时）
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static DEBUG_DUMP: AtomicBool = AtomicBool::new(true);
-    if DEBUG_DUMP.swap(false, Ordering::Relaxed) {
-        if let Some(img) = image::RgbaImage::from_raw(w, h, raw.clone()) {
-            let _ = img.save("/tmp/capture_raw_bgra.png");
-            tracing::info!("[capture] saved /tmp/capture_raw_bgra.png for debug");
+    // 诊断用原始帧转储：默认关闭（1080p PNG 编码约 1s，会拖慢首次截图）。
+    // 需要时设置环境变量 SCREENSHOT_RS_DEBUG_DUMP=1 再启动应用，首次捕获会
+    // 保存 /tmp/capture_raw_bgra.png（BGRA 原始字节，共 1 次）。
+    if debug_dump_enabled() {
+        static DEBUG_DUMP: AtomicBool = AtomicBool::new(true);
+        if DEBUG_DUMP.swap(false, Ordering::Relaxed) {
+            if let Some(img) = image::RgbaImage::from_raw(w, h, raw.clone()) {
+                let _ = img.save("/tmp/capture_raw_bgra.png");
+                tracing::info!("[capture] saved /tmp/capture_raw_bgra.png for debug");
+            }
         }
     }
 
