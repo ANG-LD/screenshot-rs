@@ -442,9 +442,19 @@ impl Root {
     }
 
     /// Get the tooltip overlay entity for this window.
-    pub fn tooltip_overlay(window: &Window, cx: &App) -> Option<Entity<TooltipOverlay>> {
+    pub(crate) fn tooltip_overlay(window: &Window, cx: &App) -> Option<Entity<TooltipOverlay>> {
         let root = window.root::<Root>()??;
         Some(root.read(cx).tooltip_overlay.clone())
+    }
+
+    /// 清除当前显示的 tooltip 浮层（窗口复用时跨会话残留的修复入口）。
+    ///
+    /// 不能在 `WindowHandle<Root>::update` 闭包内通过 `Root::tooltip_overlay`
+    /// 清除：那时 root 实体正处于 updating 状态，再 `window.root()` 读取会
+    /// panic "cannot read Root while it is already being updated"。这里直接用
+    /// `self.tooltip_overlay` 更新 TooltipOverlay 实体，不触碰 root 自身。
+    pub fn hide_tooltip(&self, _window: &mut Window, cx: &mut App) {
+        self.tooltip_overlay.update(cx, |o, cx| o.hide(cx));
     }
 
     /// Get the fallback native-menu overlay entity for this window.
