@@ -339,8 +339,13 @@ impl OverlayView {
         tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) {
-        self.frame_image =
-            build_render_image_from_pixels(frame.width, frame.height, frame.pixels.clone());
+        // 拷贝+转换合并为一次遍历：RGBA 副本转 BGRA 给 RenderImage（gpui 数据
+        // 约定 BGRA），原 RGBA 移动给 frame_pixels（OCR/提交用），避免
+        // "先 clone 再原地转换"的两次 8MB 遍历。
+        let bgra = rgba_to_bgra_copy(&frame.pixels);
+        let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(frame.width, frame.height, bgra)
+            .expect("CapturedFrame 像素长度必须与 width*height*4 一致");
+        self.frame_image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
         self.screen_bounds = screen_bounds;
         self.client_origin = client_origin;
         self.selection = SelectionState::new(screen_bounds);
@@ -1489,10 +1494,65 @@ fn render_color_swatch_row(cur_color: RGBA, weak: gpui::WeakEntity<OverlayView>)
 
 
 /// RGBA → BGRA 通道 swap（GPUI RenderImage 用 BGRA）
+/// RGBA → BGRA（RenderImage 数据约定是 BGRA，见 gpui_wgpu swizzle_upload_data）。
+///
+/// 按 u32 批量位运算，一次处理 4 字节：迭代次数是逐字节 swap 的 1/4，debug
+/// 未优化构建下也快得多（release 下约 2-3ms / 1920×1080 帧，debug 下原先
+/// chunks_exact_mut(4)+swap 的 207 万次迭代要 ~100ms+，是复用路径的主要开销）。
 fn rgba_to_bgra(pixels: &mut [u8]) {
-    for c in pixels.chunks_exact_mut(4) {
-        c.swap(0, 2);
+    debug_assert_eq!(pixels.len() % 4, 0);
+    if (pixels.as_ptr() as usize).is_multiple_of(4) {
+        // 快路径：u32 批量位运算，一次处理 4 字节（迭代数是逐字节 swap 的 1/4）
+        let words: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u32, pixels.len() / 4)
+        };
+        for w in words {
+            // 输入 RGBA(LE u32): R | G<<8 | B<<16 | A<<24 → 输出 BGRA: B | G<<8 | R<<16 | A<<24
+            *w = ((*w & 0x0000_00FF) << 16)
+                | (*w & 0x0000_FF00)
+                | ((*w & 0x00FF_0000) >> 16)
+                | (*w & 0xFF00_0000);
+        }
+    } else {
+        // 慢路径：缓冲区未 4 字节对齐时退回避让（罕见）
+        for c in pixels.chunks_exact_mut(4) {
+            c.swap(0, 2);
+        }
     }
+}
+
+/// RGBA → BGRA 的"拷贝+转换"合并版：分配新缓冲区并一次遍历完成转换，
+/// 避免"先 clone 再原地转"的两次 8MB 遍历（每次会话换帧省几 ms，debug
+/// 构建下更明显）。
+fn rgba_to_bgra_copy(src: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(src.len() % 4, 0);
+    let mut dst = Vec::with_capacity(src.len());
+    // 所有字节立即被下面写满，无需先 memset
+    unsafe { dst.set_len(src.len()) };
+    let n = src.len() / 4;
+    if (src.as_ptr() as usize).is_multiple_of(4) && (dst.as_mut_ptr() as usize).is_multiple_of(4) {
+        let sp = src.as_ptr() as *const u32;
+        let dp = dst.as_mut_ptr() as *mut u32;
+        for i in 0..n {
+            let v = unsafe { *sp.add(i) };
+            unsafe {
+                *dp.add(i) = ((v & 0x0000_00FF) << 16)
+                    | (v & 0x0000_FF00)
+                    | ((v & 0x00FF_0000) >> 16)
+                    | (v & 0xFF00_0000);
+            }
+        }
+    } else {
+        // 慢路径：任一缓冲区未对齐时退回避让（罕见）
+        for i in 0..n {
+            let base = i * 4;
+            dst[base] = src[base + 2];
+            dst[base + 1] = src[base + 1];
+            dst[base + 2] = src[base];
+            dst[base + 3] = src[base + 3];
+        }
+    }
+    dst
 }
 
 /// 检测点击是否落在文字输入框的边框（Move）或 resize 手柄上，返回对应的 DragState
@@ -4852,6 +4912,7 @@ fn reuse_overlay_window(
     let logical_bounds = ub::Bounds::new(ub::Point::ZERO, ub::Point::new(actual_w, actual_h));
 
     let _ = overlay_window.update(cx, |root, window, cx| {
+        let t_upd = std::time::Instant::now();
         let view = root
             .view()
             .clone()
@@ -4869,6 +4930,7 @@ fn reuse_overlay_window(
                 view_cx,
             );
         });
+        let t_session = std::time::Instant::now();
         // 2) 放大到全屏：X11 平台窗口尺寸从头到尾不变（park 只 unmap），无需
         //    resize——gpui 的 bounds 一直正确，map 后即为最终尺寸；非 X11
         //    平台 park 时缩成了 1×1，需要恢复。
@@ -4877,10 +4939,18 @@ fn reuse_overlay_window(
         // 3) 唤醒：map + 置顶
         #[cfg(target_os = "linux")]
         unpark_overlay_window(window);
+        let t_unpark = std::time::Instant::now();
         // 4) 聚焦 + 激活（raise）
         let fh = view.read(cx).focus_handle.clone();
         fh.focus(window, cx);
         window.activate_window();
+        let t_activate = std::time::Instant::now();
+        tracing::info!(
+            "[overlay] reuse 分段: downcast+start_session={:.0}ms unpark={:.0}ms focus+activate={:.0}ms",
+            t_session.duration_since(t_upd).as_millis(),
+            t_unpark.duration_since(t_session).as_millis(),
+            t_activate.duration_since(t_unpark).as_millis()
+        );
     });
 }
 
@@ -5604,5 +5674,26 @@ mod tests {
         );
         assert_eq!(clamp.size.y, 40.0);
         assert_eq!(clamp.origin.y, 158.0, "MIN_H 时顶边 = origin + (size - MIN_H)");
+    }
+
+    #[test]
+    fn rgba_to_bgra_swaps_channels_correctly() {
+        // RGBA(LE u32) = R | G<<8 | B<<16 | A<<24 → BGRA = B | G<<8 | R<<16 | A<<24
+        let mut px: Vec<u8> = vec![
+            0x11, 0x22, 0x33, 0xFF, // 像素 0: R=0x11 G=0x22 B=0x33 A=0xFF
+            0xAA, 0xBB, 0xCC, 0x00, // 像素 1: 半透明/全透明通道也要保留
+            0x00, 0x00, 0x00, 0x00, // 像素 2: 全零
+            0xFF, 0x80, 0x40, 0x80, // 像素 3: 混合值
+        ];
+        rgba_to_bgra(&mut px);
+        assert_eq!(
+            px,
+            vec![
+                0x33, 0x22, 0x11, 0xFF, // BGRA
+                0xCC, 0xBB, 0xAA, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x40, 0x80, 0xFF, 0x80,
+            ]
+        );
     }
 }
