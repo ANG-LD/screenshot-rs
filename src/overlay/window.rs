@@ -26,7 +26,7 @@ use gpui::{
     TitlebarOptions, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
 use gpui_component::button::Button;
-use gpui_component::button::ButtonVariants;
+use gpui_component::button::{ButtonVariant, ButtonVariants};
 use gpui_component::Disableable;
 use gpui_component::IconName;
 use gpui_component::Selectable;
@@ -5267,26 +5267,16 @@ impl Render for OcrModelsView {
                 } else {
                     gpui::rgba(0x2E2E2EFF)
                 })
-                // 档位头：切换 + 名称 + 说明 + 重新下载
+                // 档位头：名称 + 说明在前，激活 / 重新下载按钮都在行尾
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(8.0))
                         .child(
-                            Button::new(format!("switch-{tier}"))
-                                .label(if selected { "✓ 使用中" } else { "切换" })
-                                .compact()
-                                .on_click({
-                                    let tier = tier.clone();
-                                    move |_, _, _| {
-                                        crate::ocr::paddle::set_tier(&tier);
-                                    }
-                                }),
-                        )
-                        .child(
                             div()
                                 .text_sm()
+                                .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(if selected {
                                     gpui::rgba(0x42A5F5FF)
                                 } else {
@@ -5301,10 +5291,36 @@ impl Render for OcrModelsView {
                                 .text_xs()
                                 .child(gpui::SharedString::from(note)),
                         )
+                        // 激活 / 已激活（绿色；当前档位灰色静态）
+                        .child({
+                            let tier = tier.clone();
+                            if selected {
+                                Button::new(format!("active-{tier}"))
+                                    .label("✓ 已激活")
+                                    .with_variant(ButtonVariant::Ghost)
+                                    .with_size(gpui_component::Size::XSmall)
+                                    .disabled(true)
+                            } else {
+                                Button::new(format!("active-{tier}"))
+                                    .label("激活")
+                                    .with_variant(ButtonVariant::Success)
+                                    .with_size(gpui_component::Size::XSmall)
+                                    .on_click(move |_, _, _| {
+                                        crate::ocr::paddle::set_tier(&tier);
+                                    })
+                            }
+                        })
+                        // 重新下载（蓝色；下载中禁用变灰）
                         .child(
                             Button::new(format!("dl-{tier}"))
                                 .label(if busy { "下载中…" } else { "重新下载" })
-                                .compact()
+                                .with_variant(if busy {
+                                    ButtonVariant::Default
+                                } else {
+                                    ButtonVariant::Info
+                                })
+                                .with_size(gpui_component::Size::XSmall)
+                                .disabled(busy)
                                 .on_click(move |_, _, _| {
                                     match crate::ocr::paddle::start_download(&tier) {
                                         Ok(()) => tracing::info!("OCR: 开始重新下载模型（{tier}）"),
