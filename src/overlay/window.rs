@@ -3439,6 +3439,8 @@ impl Render for OverlayView {
                                 let fw = this.frame_width;
                                 let fh = this.frame_height;
                                 let wb = window.bounds();
+                                let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+                                let sy = this.frame_height as f32 / f32::from(wb.size.height).max(1.0);
                                 // 克隆帧像素给后台线程（8MB 一次性拷贝，换取 UI 不阻塞：
                                 // 同步识别会在 GPUI 线程上卡住整个遮罩窗口——medium 档
                                 // 或模型首次下载时可能阻塞数分钟，遮罩无法响应 ESC/点击，
@@ -3462,15 +3464,45 @@ impl Render for OverlayView {
                                         tracing::info!("OCR: 未识别到文字，剪贴板保留区域图像");
                                     }
                                 });
-                                // 立即提交：遮罩关闭，用户可继续操作其他窗口。
-                                // 选区 = OCR 区域，主线程先复制该区域图像到剪贴板；
-                                // OCR 后台完成后用文字覆盖（识别一般 <1s，small 档）。
+                                // 生成固定窗口（pin）：把选区图像固定在屏幕原位，
+                                // 方便用户和 OCR 结果窗口对比。
+                                let mut pin: Option<PinPayload> = None;
+                                let sel_px = ub::Bounds {
+                                    origin: ub::Point::new(rect.origin.x * sx, rect.origin.y * sy),
+                                    size: ub::Point::new(rect.size.x * sx, rect.size.y * sy),
+                                };
+                                if let Ok(clipped) = CapturedFrame::clip_pixels(
+                                    fw,
+                                    fh,
+                                    &this.frame_pixels,
+                                    sel_px.origin.x as u32,
+                                    sel_px.origin.y as u32,
+                                    sel_px.size.x as u32,
+                                    sel_px.size.y as u32,
+                                ) {
+                                    let pin_x = this.client_origin.x + rect.origin.x;
+                                    let pin_y = this.client_origin.y + rect.origin.y;
+                                    tracing::info!(
+                                        "[OCR-Pin] position=({:.0},{:.0}) frame={}x{}",
+                                        pin_x, pin_y, clipped.width, clipped.height
+                                    );
+                                    pin = Some(PinPayload {
+                                        frame: clipped,
+                                        origin_x: pin_x,
+                                        origin_y: pin_y,
+                                        sx,
+                                        sy,
+                                    });
+                                }
+                                // 立即提交：遮罩关闭，主线程开 pin 窗口（固定截图）+
+                                // 复制选区图像到剪贴板；OCR 后台完成弹出结果窗口
+                                // 并用文字覆盖剪贴板。
                                 this.commit(
                                     OverlayResult {
                                         selection: Some(rect),
                                         commands: vec![],
-                                        no_clipboard: false,
-                                        pin: None,
+                                        no_clipboard: true,
+                                        pin,
                                         scroll_region_px: None,
                                         scroll_manual: false,
                                         frame: None,
