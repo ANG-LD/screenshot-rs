@@ -5468,8 +5468,8 @@ fn open_ocr_models_in_app(cx: &mut App) {
             size: Size::new(px(1280.0), px(800.0)),
         }
     });
-    let win_w = 600.0_f32;
-    let win_h = 620.0_f32;
+    let win_w = 760.0_f32;
+    let win_h = 660.0_f32;
     let origin = point(
         px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
         px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
