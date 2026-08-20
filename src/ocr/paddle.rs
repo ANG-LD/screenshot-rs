@@ -190,6 +190,19 @@ pub fn effective_tier() -> String {
 /// 模型档位 → 模型文件名（oar-ocr v0.7.0 release 资产）。
 /// small ≈30MB（det 9.4MB + rec 21MB + dict 75KB，CPU 快）；
 /// medium ≈132MB（det 62MB + rec 76MB，准确率更高但 CPU 慢）。
+/// 已知模型文件大小（v0.7.0 release 实测字节），用于整批下载进度预估。
+/// 实际下载时仍以服务端 Content-Length 为准（缺失则用此预估值）。
+fn known_file_size(name: &str) -> Option<u64> {
+    match name {
+        "pp-ocrv6_small_det.onnx" => Some(9_880_512),
+        "pp-ocrv6_small_rec.onnx" => Some(21_159_378),
+        "pp-ocrv6_medium_det.onnx" => Some(62_119_454),
+        "pp-ocrv6_medium_rec.onnx" => Some(76_629_984),
+        "ppocrv6_dict.txt" => Some(74_947),
+        _ => None,
+    }
+}
+
 fn model_names_for_tier(tier: &str) -> [&'static str; 3] {
     match tier {
         "medium" => [
@@ -331,7 +344,13 @@ fn cancel_background_download() {
 
 /// 下载单个模型文件到缓存目录（带进度上报与取消检查）。
 /// `cancel` 为 None 时不可取消（engine 自身下载）。
-fn download_one(name: &str, cache_dir: &Path, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+fn download_one(
+    name: &str,
+    cache_dir: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    batch_offset: u64,
+    batch_total: Option<u64>,
+) -> Result<(), String> {
     let dest = cache_dir.join(name);
     let url = format!("{MODEL_BASE_URL}/{name}");
     tracing::info!("OCR: 下载模型 {name} ← {url}");
@@ -341,7 +360,8 @@ fn download_one(name: &str, cache_dir: &Path, cancel: Option<&std::sync::atomic:
         .map_err(|e| format!("下载模型 {name} 失败: {e}"))?;
     let total = resp
         .header("Content-Length")
-        .and_then(|s| s.parse::<u64>().ok());
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| known_file_size(name));
     let mut reader = resp.into_reader();
     let tmp = cache_dir.join(format!("{name}.part"));
     let mut file = std::fs::File::create(&tmp)
@@ -358,7 +378,7 @@ fn download_one(name: &str, cache_dir: &Path, cancel: Option<&std::sync::atomic:
         if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
             drop(file);
             let _ = std::fs::remove_file(&tmp);
-            update_progress(name, downloaded, total);
+            update_progress(name, batch_offset + downloaded, batch_total);
             return Err(format!("下载 {name} 已取消（engine 接管）"));
         }
         file.write_all(&buf[..n])
@@ -369,7 +389,7 @@ fn download_one(name: &str, cache_dir: &Path, cancel: Option<&std::sync::atomic:
     std::fs::rename(&tmp, &dest)
         .map_err(|e| format!("移动模型 {name} 失败: {e}"))?;
     tracing::info!("OCR: 模型 {name} 下载完成（{} 字节）", downloaded);
-    update_progress(name, downloaded, total);
+    update_progress(name, batch_offset + downloaded, batch_total);
     Ok(())
 }
 
@@ -427,6 +447,15 @@ fn download_tier_force(
     let names = model_names_for_tier(tier);
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
+    // 整批进度：预估需下载文件的总大小，进度条跨文件单调递增到 100%
+    let batch_total: Option<u64> = names.iter().try_fold(0u64, |acc, name| {
+        if !force && cache_dir.join(name).exists() {
+            Some(acc) // 跳过的不计入总量
+        } else {
+            known_file_size(name).map(|sz| acc + sz)
+        }
+    });
+    let mut batch_offset: u64 = 0;
     for name in names {
         // 已被取消则不再继续下载后续文件
         if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
@@ -437,7 +466,12 @@ fn download_tier_force(
             tracing::info!("OCR: {name} 已存在，跳过");
             continue;
         }
-        download_one(name, cache_dir, cancel)?;
+        download_one(name, cache_dir, cancel, batch_offset, batch_total)?;
+        batch_offset += known_file_size(name).unwrap_or(0);
+    }
+    // 全部完成：进度置满
+    if let Some(t) = batch_total {
+        update_progress(names.last().unwrap_or(&""), t, Some(t));
     }
     Ok(())
 }
@@ -467,8 +501,10 @@ pub fn start_download_file(tier: &str, name: &str) -> Result<(), String> {
     std::thread::spawn(move || {
         let result = (|| {
             let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
-            // 总是下载该文件（已存在则覆盖，即「重新下载」语义）
-            download_one(&name, &cache_dir, Some(&cancel_for_task))
+            // 总是下载该文件（已存在则覆盖，即「重新下载」语义）；
+            // 单文件 batch_total = 该文件大小
+            let batch_total = known_file_size(&name);
+            download_one(&name, &cache_dir, Some(&cancel_for_task), 0, batch_total)
         })();
         if let Ok(mut cell) = download_task_cell().lock() {
             if cell.as_ref().map(|t| std::sync::Arc::ptr_eq(&t.cancel, &cancel_for_task)).unwrap_or(false) {
@@ -527,13 +563,29 @@ fn ensure_models_impl(
         // engine 调用时 cancel=None（不可被取消）；后台确保时 cancel=Some。
         cancel_background_download();
         let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
+        // 整批进度：预估需下载文件的总大小
+        let all_names = [det, rec, dict];
+        let batch_total: Option<u64> = all_names.iter().try_fold(0u64, |acc, name| {
+            if cache_dir.join(name).exists() {
+                Some(acc)
+            } else {
+                known_file_size(name).map(|sz| acc + sz)
+            }
+        });
+        let mut batch_offset: u64 = 0;
         for (path, name) in out.iter_mut().zip([det, rec, dict]) {
             if !path.exists() {
                 if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
                     return Err("下载已取消（engine 接管）".into());
                 }
-                download_one(name, cache_dir, cancel)?;
+                download_one(name, cache_dir, cancel, batch_offset, batch_total)?;
+                batch_offset += known_file_size(name).unwrap_or(0);
+            } else {
+                batch_offset += known_file_size(name).unwrap_or(0);
             }
+        }
+        if let Some(t) = batch_total {
+            update_progress(dict, t, Some(t));
         }
     }
     Ok(out)
