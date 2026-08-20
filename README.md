@@ -11,6 +11,8 @@
 - 全局热键 `alt+s` 启动，esc 取消
 - 系统托盘驻留
 - 截图完成自动复制到系统剪贴板
+- OCR 文字识别（PaddleOCR PP-OCRv6 medium，中英混排）
+- 滚动截长图（自动拼接）
 - 支持 Windows 10/11 和 Linux X11
 
 ## 安装
@@ -19,6 +21,25 @@
 cargo build --release
 ./target/release/screenshot-rs
 ```
+
+## OCR 模型
+
+识别引擎为 **PaddleOCR PP-OCRv6 medium**（ONNX 格式，检测 62 MB + 识别 76 MB），
+首次使用 OCR 时自动下载到缓存目录（`~/.cache/screenshot-rs/paddle`）；
+也支持本地放置模型（免下载、离线可用）：
+
+```bash
+mkdir -p models/PP-OCRv6
+# 放入三个文件（可从 https://github.com/GreatV/oar-ocr/releases 或 ModelScope
+# https://modelscope.cn/models/RapidAI/RapidOCR 下载）：
+#   pp-ocrv6_medium_det.onnx   检测模型
+#   pp-ocrv6_medium_rec.onnx   识别模型
+#   ppocrv6_dict.txt           词典（18708 字符）
+```
+
+模型查找顺序：`OCR_MODEL_DIR` 环境变量 / 配置 `ocr.model_dir` →
+项目内 `models/PP-OCRv6` → 缓存目录（不存在则自动下载）。
+运行时二进制已静态链接 ONNX Runtime，**发行包无需附带任何运行库**。
 
 ## 使用
 
@@ -38,18 +59,23 @@ cargo build --release
 ## 路线图
 
 - **v0.1（MVP）**：当前版本
-- **v0.2**：OCR 文字识别、纯 Wayland 支持
-- **v0.3**：滚动截长图
+- **v0.2**：OCR 文字识别（已完成，PaddleOCR PP-OCRv6）、纯 Wayland 支持
+- **v0.3**：滚动截长图（已完成）
 - **v0.4**：截图历史记录
 - **v0.5**：自定义快捷键 + 配置文件
 
 ## 开发
 
 ```bash
-cargo test            # 单元测试（20 个测试）
+cargo test            # 单元测试（42 个 + 1 个 OCR 端到端，需模型文件）
 cargo build           # 编译
 cargo run             # 运行（开发模式）
 cargo clippy          # Lint
+```
+
+OCR 端到端测试（需要本地模型）：
+```bash
+cargo test --test ocr_paddle -- --ignored --nocapture
 ```
 
 ## 手测 checklist（MVP Done 标准）

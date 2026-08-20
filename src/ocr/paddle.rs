@@ -20,9 +20,9 @@ pub const MODEL_DET: &str = "pp-ocrv6_medium_det.onnx";
 pub const MODEL_REC: &str = "pp-ocrv6_medium_rec.onnx";
 pub const MODEL_DICT: &str = "ppocrv6_dict.txt";
 
-/// 模型下载基址（GitHub Releases，latest 指向 v0.7.0 起的所有模型资产）。
-const MODEL_BASE_URL: &str =
-    "https://github.com/GreatV/oar-ocr/releases/latest/download";
+/// 模型下载基址。注意：必须固定 v0.7.0 —— `latest` 指向 v0.9.2，但该
+/// release 不带模型资产（404）；v0.7.0 起所有模型资产齐全（已逐一验证 HTTP 200）。
+const MODEL_BASE_URL: &str = "https://github.com/GreatV/oar-ocr/releases/download/v0.7.0";
 
 /// 返回模型三件套路径。
 ///
