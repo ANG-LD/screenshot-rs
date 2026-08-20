@@ -3448,6 +3448,7 @@ impl Render for OverlayView {
                                     let text =
                                         run_ocr_sync(rect, &pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
                                     if !text.is_empty() {
+                                        // 写剪贴板 + 弹出结果预览窗口（独立窗口，遮罩已关闭）
                                         if let Err(e) = crate::clipboard::global().write_text(&text) {
                                             tracing::error!("OCR: 结果写入剪贴板失败: {e}");
                                         } else {
@@ -3456,6 +3457,7 @@ impl Render for OverlayView {
                                                 text.len()
                                             );
                                         }
+                                        let _ = ensure_started().send(OverlayCommand::OpenOcrResult(text));
                                     } else {
                                         tracing::info!("OCR: 未识别到文字，剪贴板保留区域图像");
                                     }
@@ -4175,6 +4177,8 @@ enum OverlayCommand {
     OpenPin(PinPayload),
     /// 打开 OCR 模型管理窗口（查看模型状态 / 重新下载 / 进度）
     OpenOcrModels,
+    /// 打开 OCR 识别结果预览窗口（后台识别完成后弹出）
+    OpenOcrResult(String),
     /// 打开滚动截屏进度小窗（cancel/progress 由主线程与 GPUI 线程共享原子）
     ShowProgress {
         cancel: Arc<AtomicBool>,
@@ -4405,6 +4409,9 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         }
                         Ok(OverlayCommand::OpenOcrModels) => {
                             let _ = async_cx.update(open_ocr_models_in_app);
+                        }
+                        Ok(OverlayCommand::OpenOcrResult(text)) => {
+                            async_cx.update(|cx| open_ocr_result_in_app(text, cx));
                         }
                         Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, moving, bottom_has_content, confirming, manual, region_px, screen_px }) => {
                             // 先关掉可能残留的旧进度窗
@@ -5620,6 +5627,119 @@ fn open_ocr_models_in_app(cx: &mut App) {
         },
     )
     .expect("open ocr models window failed");
+}
+
+/// OCR 识别结果预览窗口：显示识别文字 + 复制 + 系统关闭。
+/// 后台异步识别完成后通过 `OpenOcrResult` 命令弹出（遮罩已关闭，故用独立窗口）。
+struct OcrResultView {
+    focus_handle: FocusHandle,
+    text: String,
+}
+
+impl OcrResultView {
+    fn new(text: String, cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            text,
+        }
+    }
+}
+
+impl Render for OcrResultView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let text_for_copy = self.text.clone();
+        let md = format!("```text\n{}\n```", self.text);
+        div()
+            .id("ocr-result")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(gpui::rgba(0x181818FF))
+            .text_color(gpui::rgba(0xE6E6E6FF))
+            .track_focus(&self.focus_handle)
+            .child(
+                // 标题栏：标题 + 复制按钮
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(gpui::rgba(0x333333FF))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(gpui::SharedString::from("OCR 识别结果")),
+                    )
+                    .child(
+                        Button::new("ocr-result-copy")
+                            .label("复制")
+                            .with_variant(ButtonVariant::Info)
+                            .with_size(gpui_component::Size::XSmall)
+                            .on_click(move |_, _, _| {
+                                if let Err(e) = crate::clipboard::global().write_text(&text_for_copy)
+                                {
+                                    tracing::error!("OCR 结果复制失败: {e}");
+                                } else {
+                                    tracing::info!("OCR 结果已从预览窗口复制");
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .p(px(12.0))
+                    .child(
+                        gpui_component::text::TextView::markdown("ocr-result-text", md)
+                            .selectable(true),
+                    ),
+            )
+    }
+}
+
+/// 在常驻应用里打开 OCR 识别结果预览窗口。
+fn open_ocr_result_in_app(text: String, cx: &mut App) {
+    let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
+        Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: Size::new(px(1280.0), px(800.0)),
+        }
+    });
+    let win_w = 480.0_f32;
+    let win_h = 360.0_f32;
+    let origin = point(
+        px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
+        px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
+    );
+    let _ = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin,
+                size: Size::new(px(win_w), px(win_h)),
+            })),
+            window_background: WindowBackgroundAppearance::Opaque,
+            titlebar: Some(TitlebarOptions {
+                title: Some("OCR 识别结果".into()),
+                appears_transparent: false,
+                ..Default::default()
+            }),
+            kind: WindowKind::Normal,
+            is_movable: true,
+            is_resizable: true,
+            is_minimizable: false,
+            focus: true,
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| OcrResultView::new(text, cx));
+            let handle = view.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+            view
+        },
+    );
 }
 
 /// 取窗口的 Win32 HWND（仅 Windows；非 Win32 句柄返回 None）。
