@@ -3441,32 +3441,7 @@ impl Render for OverlayView {
                                 let wb = window.bounds();
                                 let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
                                 let sy = this.frame_height as f32 / f32::from(wb.size.height).max(1.0);
-                                // 克隆帧像素给后台线程（8MB 一次性拷贝，换取 UI 不阻塞：
-                                // 同步识别会在 GPUI 线程上卡住整个遮罩窗口——medium 档
-                                // 或模型首次下载时可能阻塞数分钟，遮罩无法响应 ESC/点击，
-                                // 用户只能重启电脑）。
-                                let pixels = this.frame_pixels.clone();
-                                std::thread::spawn(move || {
-                                    let text =
-                                        run_ocr_sync(rect, &pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
-                                    if !text.is_empty() {
-                                        // 写剪贴板 + 弹出结果预览窗口（独立窗口，遮罩已关闭）
-                                        if let Err(e) = crate::clipboard::global().write_text(&text) {
-                                            tracing::error!("OCR: 结果写入剪贴板失败: {e}");
-                                        } else {
-                                            tracing::info!(
-                                                "OCR: 结果已复制到剪贴板 ({} bytes)",
-                                                text.len()
-                                            );
-                                        }
-                                        let _ = ensure_started().send(OverlayCommand::OpenOcrResult(text));
-                                    } else {
-                                        tracing::info!("OCR: 未识别到文字，剪贴板保留区域图像");
-                                    }
-                                });
-                                // 生成固定窗口（pin）：把选区图像固定在屏幕原位，
-                                // 方便用户和 OCR 结果窗口对比。
-                                let mut pin: Option<PinPayload> = None;
+                                // 裁剪选区像素构造 PinPayload（供 OcrPin 窗口左侧显示）
                                 let sel_px = ub::Bounds {
                                     origin: ub::Point::new(rect.origin.x * sx, rect.origin.y * sy),
                                     size: ub::Point::new(rect.size.x * sx, rect.size.y * sy),
@@ -3482,27 +3457,44 @@ impl Render for OverlayView {
                                 ) {
                                     let pin_x = this.client_origin.x + rect.origin.x;
                                     let pin_y = this.client_origin.y + rect.origin.y;
-                                    tracing::info!(
-                                        "[OCR-Pin] position=({:.0},{:.0}) frame={}x{}",
-                                        pin_x, pin_y, clipped.width, clipped.height
-                                    );
-                                    pin = Some(PinPayload {
+                                    let payload = PinPayload {
                                         frame: clipped,
                                         origin_x: pin_x,
                                         origin_y: pin_y,
                                         sx,
                                         sy,
+                                    };
+                                    // 克隆帧像素给后台线程（同步识别会卡住遮罩窗口）
+                                    let pixels = this.frame_pixels.clone();
+                                    // 立即打开左图右文 OcrPin 窗口（右侧显示"识别中…"）
+                                    let _ = ensure_started().send(OverlayCommand::OpenOcrPin(payload));
+                                    std::thread::spawn(move || {
+                                        let text = run_ocr_sync(
+                                            rect, &pixels, fw, fh,
+                                            f32::from(wb.size.width), f32::from(wb.size.height),
+                                        );
+                                        if !text.is_empty() {
+                                            if let Err(e) = crate::clipboard::global().write_text(&text) {
+                                                tracing::error!("OCR: 结果写入剪贴板失败: {e}");
+                                            } else {
+                                                tracing::info!(
+                                                    "OCR: 结果已复制到剪贴板 ({} bytes)",
+                                                    text.len()
+                                                );
+                                            }
+                                        } else {
+                                            tracing::info!("OCR: 未识别到文字");
+                                        }
+                                        let _ = ensure_started().send(OverlayCommand::UpdateOcrPin(text));
                                     });
                                 }
-                                // 立即提交：遮罩关闭，主线程开 pin 窗口（固定截图）+
-                                // 复制选区图像到剪贴板；OCR 后台完成弹出结果窗口
-                                // 并用文字覆盖剪贴板。
+                                // 立即提交关闭遮罩（不再单独开 pin；图像由 OcrPin 窗口左侧展示）
                                 this.commit(
                                     OverlayResult {
                                         selection: Some(rect),
                                         commands: vec![],
                                         no_clipboard: true,
-                                        pin,
+                                        pin: None,
                                         scroll_region_px: None,
                                         scroll_manual: false,
                                         frame: None,
@@ -4209,8 +4201,10 @@ enum OverlayCommand {
     OpenPin(PinPayload),
     /// 打开 OCR 模型管理窗口（查看模型状态 / 重新下载 / 进度）
     OpenOcrModels,
-    /// 打开 OCR 识别结果预览窗口（后台识别完成后弹出）
-    OpenOcrResult(String),
+    /// 打开/重用 OCR 识别窗口（左图右文，类似微信文字识别）：左侧选区图 + 右侧结果区
+    OpenOcrPin(PinPayload),
+    /// 更新当前 OCR 窗口的右侧文字（后台识别完成后调用）
+    UpdateOcrPin(String),
     /// 打开滚动截屏进度小窗（cancel/progress 由主线程与 GPUI 线程共享原子）
     ShowProgress {
         cancel: Arc<AtomicBool>,
@@ -4389,6 +4383,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 let mut overlay: Option<OverlayWindowSlot> = async_cx.update(open_parked_overlay);
 
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
+                let mut ocr_pin: Option<WindowHandle<OcrPinView>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -4442,8 +4437,23 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         Ok(OverlayCommand::OpenOcrModels) => {
                             let _ = async_cx.update(open_ocr_models_in_app);
                         }
-                        Ok(OverlayCommand::OpenOcrResult(text)) => {
-                            async_cx.update(|cx| open_ocr_result_in_app(text, cx));
+                        Ok(OverlayCommand::OpenOcrPin(payload)) => {
+                            // 多次 OCR 只保留一个窗口：关掉旧的，开新的（左图右文）
+                            if let Some(old) = ocr_pin.take() {
+                                let _ = old.update(async_cx, |_, window, _| window.remove_window());
+                            }
+                            match async_cx.update(|cx| open_ocr_pin_in_app(payload, cx)) {
+                                Ok(handle) => ocr_pin = Some(handle),
+                                Err(e) => tracing::error!("[overlay] open ocr pin window failed: {e}"),
+                            }
+                        }
+                        Ok(OverlayCommand::UpdateOcrPin(text)) => {
+                            if let Some(handle) = &ocr_pin {
+                                let _ = handle.update(async_cx, |view, _, cx| {
+                                    view.text = if text.is_empty() { None } else { Some(text) };
+                                    cx.notify();
+                                });
+                            }
                         }
                         Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, moving, bottom_has_content, confirming, manual, region_px, screen_px }) => {
                             // 先关掉可能残留的旧进度窗
@@ -5661,92 +5671,148 @@ fn open_ocr_models_in_app(cx: &mut App) {
     .expect("open ocr models window failed");
 }
 
-/// OCR 识别结果预览窗口：显示识别文字 + 复制 + 系统关闭。
-/// 后台异步识别完成后通过 `OpenOcrResult` 命令弹出（遮罩已关闭，故用独立窗口）。
-struct OcrResultView {
+/// OCR 识别窗口：左侧选区图 + 右侧识别结果（类似微信文字识别）。
+/// 多次 OCR 复用同一个窗口（OpenOcrPin 关旧开新）；后台识别完成后
+/// UpdateOcrPin 把文字填入右侧。
+struct OcrPinView {
     focus_handle: FocusHandle,
-    text: String,
+    image: Arc<RenderImage>,
+    /// 图片逻辑显示尺寸
+    img_w: f32,
+    img_h: f32,
+    /// None=识别中;Some(text)=显示文字
+    text: Option<String>,
 }
 
-impl OcrResultView {
-    fn new(text: String, cx: &mut Context<Self>) -> Self {
+impl OcrPinView {
+    fn new(frame: CapturedFrame, text: Option<String>, cx: &mut Context<Self>) -> Self {
+        let (w, h, pixels) = (frame.width, frame.height, frame.pixels);
+        let img = build_render_image_from_pixels(w, h, pixels);
         Self {
             focus_handle: cx.focus_handle(),
+            image: img,
+            img_w: w as f32,
+            img_h: h as f32,
             text,
         }
     }
 }
 
-impl Render for OcrResultView {
+impl Render for OcrPinView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let text_for_copy = self.text.clone();
-        let md = format!("```text\n{}\n```", self.text);
+        let image = self.image.clone();
+        let img_w = self.img_w;
+        let img_h = self.img_h;
+        // 右侧结果区
+        let right = match &self.text {
+            None => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_color(gpui::rgba(0x9E9E9EFF))
+                        .text_sm()
+                        .child(gpui::SharedString::from("OCR 识别中…")),
+                ),
+            Some(text) => {
+                let md = format!("```text\n{}\n```", text);
+                let text_for_copy = text.clone();
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .border_b_1()
+                            .border_color(gpui::rgba(0x333333FF))
+                            .child(
+                                Button::new("ocr-pin-copy")
+                                    .label("复制")
+                                    .with_variant(ButtonVariant::Info)
+                                    .with_size(gpui_component::Size::XSmall)
+                                    .on_click(move |_, _, _| {
+                                        if let Err(e) =
+                                            crate::clipboard::global().write_text(&text_for_copy)
+                                        {
+                                            tracing::error!("OCR 结果复制失败: {e}");
+                                        } else {
+                                            tracing::info!("OCR 结果已从识别窗口复制");
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .p(px(10.0))
+                            .overflow_y_scrollbar()
+                            .child(
+                                gpui_component::text::TextView::markdown("ocr-pin-text", md)
+                                    .selectable(true),
+                            ),
+                    )
+            }
+        };
+        // canvas 占满父容器，按 bounds 把图片绘制进去
+        let paint = canvas(
+            move |_, _, _| image.clone(),
+            move |bounds, img, window, _cx| {
+                let _ = window.paint_image(bounds, Default::default(), img.clone(), 0, false);
+            },
+        );
         div()
-            .id("ocr-result")
+            .id("ocr-pin")
             .size_full()
             .flex()
-            .flex_col()
             .bg(gpui::rgba(0x181818FF))
             .text_color(gpui::rgba(0xE6E6E6FF))
             .track_focus(&self.focus_handle)
-            .child(
-                // 标题栏：标题 + 复制按钮
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .border_b_1()
-                    .border_color(gpui::rgba(0x333333FF))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(gpui::SharedString::from("OCR 识别结果")),
-                    )
-                    .child(
-                        Button::new("ocr-result-copy")
-                            .label("复制")
-                            .with_variant(ButtonVariant::Info)
-                            .with_size(gpui_component::Size::XSmall)
-                            .on_click(move |_, _, _| {
-                                if let Err(e) = crate::clipboard::global().write_text(&text_for_copy)
-                                {
-                                    tracing::error!("OCR 结果复制失败: {e}");
-                                } else {
-                                    tracing::info!("OCR 结果已从预览窗口复制");
-                                }
-                            }),
-                    ),
-            )
+            // 左侧图片区：固定显示尺寸（按比例缩放后的宽度/高度）
             .child(
                 div()
-                    .flex_1()
-                    .p(px(12.0))
-                    .child(
-                        gpui_component::text::TextView::markdown("ocr-result-text", md)
-                            .selectable(true),
-                    ),
+                    .w(px(img_w))
+                    .h(px(img_h))
+                    .bg(gpui::rgba(0x000000FF))
+                    .child(paint),
             )
+            // 右侧结果区（固定宽度 360）
+            .child(div().w(px(360.0)).h_full().child(right))
     }
 }
 
-/// 在常驻应用里打开 OCR 识别结果预览窗口。
-fn open_ocr_result_in_app(text: String, cx: &mut App) {
+/// 打开 OCR 识别窗口（左图右文）。窗口大小 = 图片显示宽 + 360，高度按比例。
+fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHandle<OcrPinView>> {
+    let PinPayload { frame, sx, sy, .. } = payload;
+    let img_w = frame.width as f32 / sx;
+    let img_h = frame.height as f32 / sy;
+    // 限制显示尺寸
+    let max_w = 900.0_f32;
+    let max_h = 700.0_f32;
+    let scale = (max_w / img_w).min(max_h / img_h).min(1.0).max(150.0 / img_w);
+    let disp_w = img_w * scale;
+    let disp_h = img_h * scale;
+    const RIGHT_W: f32 = 360.0;
+    let win_w = disp_w + RIGHT_W;
+    let win_h = disp_h;
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
             size: Size::new(px(1280.0), px(800.0)),
         }
     });
-    let win_w = 480.0_f32;
-    let win_h = 360.0_f32;
     let origin = point(
         px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
         px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
     );
-    let _ = cx.open_window(
+    cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin,
@@ -5754,7 +5820,7 @@ fn open_ocr_result_in_app(text: String, cx: &mut App) {
             })),
             window_background: WindowBackgroundAppearance::Opaque,
             titlebar: Some(TitlebarOptions {
-                title: Some("OCR 识别结果".into()),
+                title: Some("OCR 识别".into()),
                 appears_transparent: false,
                 ..Default::default()
             }),
@@ -5766,12 +5832,13 @@ fn open_ocr_result_in_app(text: String, cx: &mut App) {
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| OcrResultView::new(text, cx));
-            let handle = view.read(cx).focus_handle.clone();
-            handle.focus(window, cx);
+            let view = cx.new(|cx| OcrPinView::new(frame, None, cx));
+            let h = view.read(cx).focus_handle.clone();
+            h.focus(window, cx);
             view
         },
-    );
+    )
+    .map_err(|e| AppError::Gpui(format!("打开 OCR 识别窗口失败: {e}")))
 }
 
 /// 取窗口的 Win32 HWND（仅 Windows；非 Win32 句柄返回 None）。
