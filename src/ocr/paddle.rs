@@ -172,6 +172,16 @@ pub fn set_tier(tier: &str) -> Result<(), String> {
     if let Err(e) = crate::config::persist_model_tier(&t) {
         tracing::warn!("OCR: 写入 config.toml 档位失败: {e}（本次运行仍生效）");
     }
+    // 后台预热新档位引擎：避免下次 OCR 时同步重建卡顿
+    // （引擎重建 ~0.1–1s，放后台线程则 OCR 调用时直接命中缓存）
+    let tier_for_preload = t.clone();
+    std::thread::spawn(move || {
+        let cache_dir = crate::config::ocr_cache_dir();
+        match engine(&cache_dir) {
+            Ok(_) => tracing::info!("OCR: 档位 {tier_for_preload} 引擎已后台预热完成"),
+            Err(e) => tracing::warn!("OCR: 档位 {tier_for_preload} 引擎预热失败: {e}"),
+        }
+    });
     Ok(())
 }
 
