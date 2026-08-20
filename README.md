@@ -11,7 +11,8 @@
 - 全局热键 `alt+s` 启动，esc 取消
 - 系统托盘驻留
 - 截图完成自动复制到系统剪贴板
-- OCR 文字识别（PaddleOCR PP-OCRv6 medium，中英混排）
+- OCR 文字识别（PaddleOCR PP-OCRv6，中英混排；框选后立即关闭遮罩、
+  后台识别并把文字复制到剪贴板）
 - 滚动截长图（自动拼接）
 - 支持 Windows 10/11 和 Linux X11
 

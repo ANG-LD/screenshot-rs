@@ -149,9 +149,7 @@ pub struct OverlayView {
     /// OCR 工具：选中的识别区域（None 表示尚未框选）
     ocr_rect: Option<ub::Bounds>,
     /// OCR 工具：识别结果文字
-    ocr_result: Option<String>,
     /// OCR 工具：是否正在识别中
-    ocr_loading: bool,
     /// OCR 工具：框选拖拽起点（None 表示未在拖拽）
     ocr_drag_start: Option<BoundsPoint>,
 
@@ -161,7 +159,6 @@ pub struct OverlayView {
     /// 在工具栏根 div 上的真实事件来挂标志。
     toolbar_hovered: bool,
     /// OCR 结果面板是否被鼠标按下（用于 root.on_mouse_down 判断，避免 prevent_default 阻断按钮 click 事件）
-    ocr_panel_hovered: bool,
 
     /// 当前选中的已绘制命令索引（DrawingState.commands 中的实际索引）
     selected_cmd_actual_idx: Option<usize>,
@@ -308,11 +305,8 @@ impl OverlayView {
             frame_height: frame.height,
             original_frame,
             ocr_rect: None,
-            ocr_result: None,
-            ocr_loading: false,
             ocr_drag_start: None,
             toolbar_hovered: false,
-            ocr_panel_hovered: false,
             selected_cmd_actual_idx: None,
             cmd_drag: None,
             hover_shape: false,
@@ -367,11 +361,8 @@ impl OverlayView {
         self.frame_height = frame.height;
         self.original_frame = original_frame;
         self.ocr_rect = None;
-        self.ocr_result = None;
-        self.ocr_loading = false;
         self.ocr_drag_start = None;
         self.toolbar_hovered = false;
-        self.ocr_panel_hovered = false;
         self.selected_cmd_actual_idx = None;
         self.cmd_drag = None;
         self.hover_shape = false;
@@ -1237,11 +1228,9 @@ fn render_simple_button(
                         if this.toolbar.active_tool == Some(ToolButton::Ocr) {
                             this.toolbar.active_tool = None;
                             this.ocr_rect = None;
-                            this.ocr_result = None;
                         } else {
                             this.toolbar.active_tool = Some(ToolButton::Ocr);
                             this.ocr_rect = None;
-                            this.ocr_result = None;
                         }
                         cx.notify();
                     }
@@ -3148,125 +3137,6 @@ impl Render for OverlayView {
             }
         }
 
-        // OCR 结果面板（右侧）
-        if let Some(ref text) = self.ocr_result {
-            let panel_w = 320.0;
-            let panel_x = screen_bounds.origin.x + screen_bounds.size.x - panel_w;
-            let panel_y = screen_bounds.origin.y;
-            let panel_h = screen_bounds.size.y;
-            let weak = cx.weak_entity();
-            let text_for_ui = text.as_str();
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(panel_y))
-                    .left(px(panel_x))
-                    .w(px(panel_w))
-                    .h(px(panel_h))
-                    .bg(gpui::rgba(0x1A1A1AF0))
-                    .rounded_l_lg()
-                    .border_1()
-                    .border_color(gpui::rgba(0x444444CC))
-                    .flex()
-                    .flex_col()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, _cx| {
-                        this.ocr_panel_hovered = true;
-                    }))
-                    // 标题栏 + 关闭按钮 + 复制按钮
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .p(px(8.0))
-                            .border_b_1()
-                            .border_color(gpui::rgba(0x44444488))
-                            .child(
-                                div()
-                                    .text_color(gpui::rgba(0xCCCCCCFF))
-                                    .text_sm()
-                                    .child(gpui::SharedString::from("OCR 识别结果")),
-                            )
-                            .child(
-                                div().flex().gap(px(4.0))
-                                    .child({
-                                        let t = text_for_ui.to_owned();
-                                        Button::new("ocr-copy")
-                                            .icon(IconName::Copy)
-                                            .compact()
-                                            .on_click(move |_, _window, _cx| {
-                                                // 走进程级长存 arboard 剪贴板单例：X11 上
-                                                // Clipboard drop 即释放所有权、粘贴拿到空，
-                                                // 所以必须复用长存实例（而非 GPUI 的
-                                                // write_to_clipboard，其底层错误被吞掉、
-                                                // Wayland 下还要求窗口持有焦点才写）。
-                                                if let Err(e) =
-                                                    crate::clipboard::global().write_text(&t)
-                                                {
-                                                    tracing::error!("[OCR] 复制失败: {e}");
-                                                }
-                                            })
-                                    })
-                                    .child({
-                                        let w = weak.clone();
-                                        Button::new("ocr-close")
-                                            .icon(IconName::Close)
-                                            .compact()
-                                            .on_click(move |_, _, cx| {
-                                                if let Err(e) = w.update(cx, |this, cx| {
-                                                    this.ocr_result = None;
-                                                    this.ocr_rect = None;
-                                                    cx.notify();
-                                                }) {
-                                                    tracing::error!(
-                                                        "[OCR] close: 实体更新失败：{e}"
-                                                    );
-                                                }
-                                            })
-                                    }),
-                            ),
-                    )
-                    // 文字内容（可选中的富文本，用 TextView 支持鼠标拖选和 Ctrl+C）
-                    .child(
-                        div()
-                            .flex_1()
-                            .p(px(10.0))
-                            .child({
-                                let md = format!("```text\n{}\n```", text_for_ui);
-                                gpui_component::text::TextView::markdown("ocr-text", md)
-                                    .selectable(true)
-                            }),
-                    ),
-            );
-        } else if self.ocr_loading {
-            // 加载指示器
-            let panel_w = 200.0;
-            let panel_x = screen_bounds.origin.x + screen_bounds.size.x - panel_w - 16.0;
-            let panel_y = screen_bounds.origin.y + 16.0;
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(panel_y))
-                    .left(px(panel_x))
-                    .w(px(panel_w))
-                    .h(px(48.0))
-                    .bg(gpui::rgba(0x1A1A1AF0))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(gpui::rgba(0x444444CC))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                    .child(
-                        div()
-                            .text_color(gpui::rgba(0xCCCCCCFF))
-                            .text_sm()
-                            .child(gpui::SharedString::from("OCR 识别中…")),
-                    ),
-            );
-        }
-
         root
             .on_mouse_down(
                 MouseButton::Left,
@@ -3296,23 +3166,6 @@ impl Render for OverlayView {
                             }
                         }
                         return;
-                    }
-
-                    // OCR 结果面板：由面板 div 的 on_mouse_down 设 ocr_panel_hovered=true，
-                    // root 据此早返回，避免把按钮点击当成"新建选区/移动选区"。
-                    if this.ocr_panel_hovered {
-                        return;
-                    }
-                    // OCR 加载中面板（无按钮，保留几何判断）
-                    if this.ocr_loading {
-                        let pw = 200.0;
-                        let px = this.screen_bounds.origin.x + this.screen_bounds.size.x - pw;
-                        let py = this.screen_bounds.origin.y;
-                        let ph = 48.0;
-                        if p.x >= px && p.x <= px + pw && p.y >= py && p.y <= py + ph {
-                            window.prevent_default();
-                            return;
-                        }
                     }
 
                     // 文字输入框存在时，优先检测是否点击了拖动条或 resize 手柄
@@ -3463,7 +3316,6 @@ impl Render for OverlayView {
                                 && sel.contains(p)
                             {
                                 this.finalize_text_input_if_active(cx);
-                                this.ocr_result = None;
                                 this.ocr_rect = Some(ub::Bounds::new(p, BoundsPoint::ZERO));
                                 this.ocr_drag_start = Some(p);
                                 tracing::info!(
@@ -3562,7 +3414,6 @@ impl Render for OverlayView {
                     // 工具栏按钮 on_click 在 mouse_up 阶段触发，到这里 toolbar_hovered
                     // 已完成它的使命；清回 false 避免下次非工具栏点击误判。
                     this.toolbar_hovered = false;
-                    this.ocr_panel_hovered = false;
                     // 文字框拖动 / resize 结束
                     if this.text_input_drag.is_some() {
                         this.text_input_drag = None;
@@ -3573,7 +3424,7 @@ impl Render for OverlayView {
                         this.cmd_drag = None;
                         return;
                     }
-                    // OCR 框选结束 → 提取像素、启动识别
+                    // OCR 框选结束 → 提取像素、后台异步识别，并立即提交关闭遮罩
                     if this.ocr_drag_start.is_some() {
                         tracing::info!(
                             "OCR mouse_up: drag_start=({:.1},{:.1}) ocr_rect={:?}",
@@ -3586,20 +3437,43 @@ impl Render for OverlayView {
                             if rect.size.x > 5.0 && rect.size.y > 5.0 {
                                 let fw = this.frame_width;
                                 let fh = this.frame_height;
-                                this.ocr_loading = true;
-                                cx.notify();
                                 let wb = window.bounds();
-                                // 同步调用，只读切片即可，无需克隆整帧
-                                let text = run_ocr_sync(rect, &this.frame_pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
-                                tracing::info!("OCR result len={}, content={:?}", text.len(), text);
-                                this.ocr_result = if text.is_empty() { None } else { Some(text) };
-                                this.ocr_loading = false;
-                                // 识别成功后退出 OCR 工具：否则点击截图区域会开始新框选，
-                                // 把 ocr_result 清空导致右侧面板消失。面板保持到点关闭按钮。
-                                if this.ocr_result.is_some() {
-                                    this.toolbar.active_tool = None;
-                                }
-                                cx.notify();
+                                // 克隆帧像素给后台线程（8MB 一次性拷贝，换取 UI 不阻塞：
+                                // 同步识别会在 GPUI 线程上卡住整个遮罩窗口——medium 档
+                                // 或模型首次下载时可能阻塞数分钟，遮罩无法响应 ESC/点击，
+                                // 用户只能重启电脑）。
+                                let pixels = this.frame_pixels.clone();
+                                std::thread::spawn(move || {
+                                    let text =
+                                        run_ocr_sync(rect, &pixels, fw, fh, f32::from(wb.size.width), f32::from(wb.size.height));
+                                    if !text.is_empty() {
+                                        if let Err(e) = crate::clipboard::global().write_text(&text) {
+                                            tracing::error!("OCR: 结果写入剪贴板失败: {e}");
+                                        } else {
+                                            tracing::info!(
+                                                "OCR: 结果已复制到剪贴板 ({} bytes)",
+                                                text.len()
+                                            );
+                                        }
+                                    } else {
+                                        tracing::info!("OCR: 未识别到文字，剪贴板保留区域图像");
+                                    }
+                                });
+                                // 立即提交：遮罩关闭，用户可继续操作其他窗口。
+                                // 选区 = OCR 区域，主线程先复制该区域图像到剪贴板；
+                                // OCR 后台完成后用文字覆盖（识别一般 <1s，small 档）。
+                                this.commit(
+                                    OverlayResult {
+                                        selection: Some(rect),
+                                        commands: vec![],
+                                        no_clipboard: false,
+                                        pin: None,
+                                        scroll_region_px: None,
+                                        scroll_manual: false,
+                                        frame: None,
+                                    },
+                                    window,
+                                );
                             } else {
                                 tracing::info!("OCR rect too small, cleared");
                                 this.ocr_rect = None;
@@ -3685,14 +3559,6 @@ impl Render for OverlayView {
                     }
                     this.check_selected_visible();
                     cx.notify();
-                } else if ev.keystroke.key == "c" && ev.keystroke.modifiers.control {
-                    // Ctrl+C：若 OCR 结果面板可见，复制全部识别文字
-                    // 与复制按钮一样走长存 arboard 剪贴板单例。
-                    if let Some(ref text) = this.ocr_result {
-                        if let Err(e) = crate::clipboard::global().write_text(text) {
-                            tracing::error!("[OCR] 复制失败: {e}");
-                        }
-                    }
                 }
             }))
     }
