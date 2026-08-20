@@ -306,6 +306,15 @@ fn update_progress(name: &str, downloaded: u64, total: Option<u64>) {
     }
 }
 
+/// 模型文件是否在任意查找目录存在（OCR_MODEL_DIR / 项目 models/PP-OCRv6 / 缓存）。
+fn file_located(name: &str, cache_dir: &Path) -> bool {
+    crate::config::ocr_model_dir()
+        .into_iter()
+        .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
+        .chain(std::iter::once(cache_dir.to_path_buf()))
+        .any(|d| d.join(name).exists())
+}
+
 /// HTTP 客户端：30s 读空闲超时——下载中断时（取消/网络卡住）能及时返回，
 /// 避免线程永久阻塞在 `read` 上（取消后 engine 最多等 30s 即可接管下载）。
 fn http_agent() -> &'static ureq::Agent {
@@ -448,21 +457,26 @@ fn download_tier_force(
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
     // 整批进度：预估需下载文件的总大小，进度条跨文件单调递增到 100%
-    let batch_total: Option<u64> = names.iter().try_fold(0u64, |acc, name| {
-        if !force && cache_dir.join(name).exists() {
-            Some(acc) // 跳过的不计入总量
-        } else {
-            known_file_size(name).map(|sz| acc + sz)
-        }
-    });
+    // 批量下载(force=false)：只下载三处目录都没有的文件，total 只累加这些
+    let need = |name: &str| force || !file_located(name, cache_dir);
+    let batch_total: Option<u64> = names
+        .iter()
+        .copied()
+        .try_fold(0u64, |acc, name| {
+            if need(name) {
+                known_file_size(name).map(|sz| acc + sz)
+            } else {
+                Some(acc) // 已存在的不计入总量
+            }
+        });
     let mut batch_offset: u64 = 0;
     for name in names {
         // 已被取消则不再继续下载后续文件
         if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
             return Err("下载已取消".into());
         }
-        // 非强制模式：已存在的文件跳过，只补缺失/失败的
-        if !force && cache_dir.join(name).exists() {
+        // 非强制模式：任意目录已存在的文件跳过，不重复下载到缓存
+        if !need(name) {
             tracing::info!("OCR: {name} 已存在，跳过");
             continue;
         }
@@ -563,20 +577,29 @@ fn ensure_models_impl(
         // engine 调用时 cancel=None（不可被取消）；后台确保时 cancel=Some。
         cancel_background_download();
         let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
-        // 整批进度：预估需下载文件的总大小
+        // 整批进度：只累加三处目录都没有的文件大小
         let all_names = [det, rec, dict];
-        let batch_total: Option<u64> = all_names.iter().try_fold(0u64, |acc, name| {
-            if cache_dir.join(name).exists() {
-                Some(acc)
-            } else {
-                known_file_size(name).map(|sz| acc + sz)
-            }
-        });
+        let need = |name: &str| !file_located(name, cache_dir);
+        let batch_total: Option<u64> = all_names
+            .iter()
+            .copied()
+            .try_fold(0u64, |acc, name| {
+                if need(name) {
+                    known_file_size(name).map(|sz| acc + sz)
+                } else {
+                    Some(acc)
+                }
+            });
         let mut batch_offset: u64 = 0;
         for (path, name) in out.iter_mut().zip([det, rec, dict]) {
             if !path.exists() {
                 if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
                     return Err("下载已取消（engine 接管）".into());
+                }
+                if file_located(name, cache_dir) {
+                    // 别处目录已有，无需下载到缓存
+                    batch_offset += known_file_size(name).unwrap_or(0);
+                    continue;
                 }
                 download_one(name, cache_dir, cancel, batch_offset, batch_total)?;
                 batch_offset += known_file_size(name).unwrap_or(0);
