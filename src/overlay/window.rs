@@ -5195,7 +5195,7 @@ impl OcrModelsView {
 }
 
 impl Render for OcrModelsView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::ocr::paddle::{FileStatus, ModelSnapshot};
         let snap: ModelSnapshot = crate::ocr::paddle::model_snapshot();
         let downloading = snap.downloading;
@@ -5305,9 +5305,10 @@ impl Render for OcrModelsView {
                                     .label("激活")
                                     .with_variant(ButtonVariant::Success)
                                     .with_size(gpui_component::Size::XSmall)
-                                    .on_click(move |_, _, _| {
+                                    .on_click(cx.listener(move |_, _, _, cx| {
                                         crate::ocr::paddle::set_tier(&tier);
-                                    })
+                                        cx.notify();
+                                    }))
                             }
                         })
                         // 重新下载（蓝色；下载中禁用变灰）
@@ -5321,12 +5322,12 @@ impl Render for OcrModelsView {
                                 })
                                 .with_size(gpui_component::Size::XSmall)
                                 .disabled(busy)
-                                .on_click(move |_, _, _| {
+                                .on_click(cx.listener(move |_, _, _, _| {
                                     match crate::ocr::paddle::start_download(&tier) {
                                         Ok(()) => tracing::info!("OCR: 开始重新下载模型（{tier}）"),
                                         Err(e) => tracing::error!("OCR: 启动下载失败: {e}"),
                                     }
-                                }),
+                                })),
                         ),
                 )
                 .child(div().flex_col().gap(px(4.0)).children(file_rows))
