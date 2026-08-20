@@ -46,19 +46,26 @@ pub struct ModelFileInfo {
     pub status: FileStatus,
 }
 
+/// 一个档位的状态（small / medium 各一份，供窗口并列展示）
+#[derive(Debug, Clone)]
+pub struct TierStatus {
+    pub tier: String,
+    pub note: String,
+    /// 是否为当前生效档位（内存切换 > config）
+    pub selected: bool,
+    /// 三件套文件状态（检测 / 识别 / 词典）
+    pub files: Vec<ModelFileInfo>,
+}
+
 /// 模型下载/管理的整体状态快照（窗口每次刷新重新计算）
 #[derive(Debug, Clone)]
 pub struct ModelSnapshot {
-    /// 当前档位（config 解析结果）
-    pub tier: String,
-    /// 档位说明
-    pub tier_note: String,
     /// 模型下载基址
     pub base_url: String,
     /// 缓存目录
     pub cache_dir: PathBuf,
-    /// 三件套文件状态（检测 / 识别 / 词典）
-    pub files: Vec<ModelFileInfo>,
+    /// 两个档位的完整状态
+    pub tiers: Vec<TierStatus>,
     /// 是否有下载任务进行中
     pub downloading: bool,
     /// 当前文件下载进度（已下载字节, 总字节）
@@ -91,6 +98,49 @@ fn manager() -> &'static Mutex<ModelManagerState> {
     })
 }
 
+/// 内存档位覆盖（模型管理窗口手动切换时写入，优先级高于 config）。
+static TIER_OVERRIDE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// 模型下载互斥锁：防止并发下载（set_tier 后台确保 + 首次 OCR 自动下载 +
+/// 手动重新下载）竞争同一 `.part` 临时文件导致 rename 失败。
+static DOWNLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn download_lock() -> &'static Mutex<()> {
+    DOWNLOAD_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// 手动切换档位：写入内存覆盖并复位引擎，下次 OCR 用新档位。
+/// 模型文件缺失时由 `ensure_models` 在后台自动下载（进度可见）。
+pub fn set_tier(tier: &str) {
+    let t = tier.to_ascii_lowercase();
+    let t = if t == "medium" { "medium".to_string() } else { "small".to_string() };
+    let cell = TIER_OVERRIDE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = cell.lock() {
+        *g = Some(t.clone());
+    }
+    reset_engine();
+    tracing::info!("OCR: 手动切换模型档位 → {t}");
+    // 后台确保该档位模型就绪（缺啥自动下载，进度上报管理窗口）
+    let cache_dir = crate::config::ocr_cache_dir();
+    std::thread::spawn(move || {
+        if let Err(e) = ensure_models(&cache_dir) {
+            tracing::warn!("OCR: 档位 {t} 模型就绪检查失败: {e}");
+        }
+    });
+}
+
+/// 当前生效档位：内存覆盖 > config（env OCR_MODEL_TIER > ocr.model_tier > small）。
+pub fn effective_tier() -> String {
+    if let Some(cell) = TIER_OVERRIDE.get() {
+        if let Ok(g) = cell.lock() {
+            if let Some(t) = g.as_ref() {
+                return t.clone();
+            }
+        }
+    }
+    crate::config::ocr_model_tier()
+}
+
 /// 模型档位 → 模型文件名（oar-ocr v0.7.0 release 资产）。
 /// small ≈30MB（det 9.4MB + rec 21MB + dict 75KB，CPU 快）；
 /// medium ≈132MB（det 62MB + rec 76MB，准确率更高但 CPU 慢）。
@@ -112,70 +162,78 @@ fn model_names_for_tier(tier: &str) -> [&'static str; 3] {
 /// 档位说明（供窗口展示）
 fn tier_note(tier: &str) -> String {
     match tier {
-        "medium" => "medium ≈132MB：准确率更高，但 CPU 上多行场景慢（~14s）".into(),
-        _ => "small ≈30MB：CPU 快（代码区 ~0.8s），准确率 ~95%".into(),
+        "medium" => "≈132MB：准确率更高，但 CPU 上多行场景慢（~14s）".into(),
+        _ => "≈30MB：CPU 快（代码区 ~0.8s），准确率 ~95%".into(),
     }
 }
 
-/// 当前档位（config 解析）
+/// 当前生效档位（供引擎加载使用）
 fn model_names() -> [&'static str; 3] {
-    model_names_for_tier(&crate::config::ocr_model_tier())
+    model_names_for_tier(&effective_tier())
 }
 
 /// 模型下载基址。注意：必须固定 v0.7.0 —— `latest` 指向 v0.9.2，但该
 /// release 不带模型资产（404）；v0.7.0 起所有模型资产齐全（已逐一验证 HTTP 200）。
 const MODEL_BASE_URL: &str = "https://github.com/GreatV/oar-ocr/releases/download/v0.7.0";
 
-/// 收集模型管理快照：按档位扫描本地查找位置，报告每个文件的状态。
+/// 给定档位三个文件的本地查找结果
+fn locate_tier_files(tier: &str, cache_dir: &Path) -> Vec<ModelFileInfo> {
+    let names = model_names_for_tier(tier);
+    names
+        .iter()
+        .map(|name| {
+            // 查找顺序：显式目录 → 项目 models/PP-OCRv6 → 缓存
+            let mut local = None;
+            for dir in crate::config::ocr_model_dir()
+                .into_iter()
+                .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
+                .chain(std::iter::once(cache_dir.to_path_buf()))
+            {
+                let p = dir.join(name);
+                if p.exists() {
+                    local = Some(p);
+                    break;
+                }
+            }
+            let (status, size) = match &local {
+                Some(p) => match p.metadata() {
+                    Ok(md) => (FileStatus::Ready, Some(md.len())),
+                    Err(_) => (FileStatus::Error("无法读取文件信息".into()), None),
+                },
+                None => (FileStatus::Missing, None),
+            };
+            ModelFileInfo {
+                name,
+                url: format!("{MODEL_BASE_URL}/{name}"),
+                local_path: local,
+                size,
+                status,
+            }
+        })
+        .collect()
+}
+
+/// 收集模型管理快照：small / medium 两档并列，报告每个文件的状态。
 pub fn model_snapshot() -> ModelSnapshot {
-    let tier = crate::config::ocr_model_tier();
-    let names = model_names_for_tier(&tier);
+    let current = effective_tier();
     let cache_dir = crate::config::ocr_cache_dir();
-    let state = manager()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let snapshot = ModelSnapshot {
-        tier: tier.clone(),
-        tier_note: tier_note(&tier),
+    let state = manager().lock().unwrap_or_else(|e| e.into_inner());
+    ModelSnapshot {
         base_url: MODEL_BASE_URL.to_string(),
         cache_dir: cache_dir.clone(),
-        files: names
+        tiers: ["small", "medium"]
             .iter()
-            .map(|name| {
-                // 查找顺序：显式目录 → 项目 models/PP-OCRv6 → 缓存
-                let mut local = None;
-                for dir in crate::config::ocr_model_dir()
-                    .into_iter()
-                    .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
-                    .chain(std::iter::once(cache_dir.clone()))
-                {
-                    let p = dir.join(name);
-                    if p.exists() {
-                        local = Some(p);
-                        break;
-                    }
-                }
-                let (status, size) = match &local {
-                    Some(p) => match p.metadata() {
-                        Ok(md) => (FileStatus::Ready, Some(md.len())),
-                        Err(_) => (FileStatus::Error("无法读取文件信息".into()), None),
-                    },
-                    None => (FileStatus::Missing, None),
-                };
-                ModelFileInfo {
-                    name,
-                    url: format!("{MODEL_BASE_URL}/{name}"),
-                    local_path: local,
-                    size,
-                    status,
-                }
+            .map(|tier| TierStatus {
+                tier: (*tier).to_string(),
+                note: tier_note(tier),
+                selected: *tier == current,
+                files: locate_tier_files(tier, &cache_dir),
             })
             .collect(),
         downloading: state.downloading,
         progress: state.progress,
         last_download: state.last_download.clone(),
-    };
-    snapshot
+    }
 }
 
 /// 更新下载进度（下载循环每块调用；UI 线程读取）
@@ -213,6 +271,7 @@ pub fn start_download(tier: &str) -> Result<(), String> {
 
 /// 强制下载指定档位三件套到缓存目录（带逐块进度上报）。
 fn download_tier_force(tier: &str, cache_dir: &Path) -> Result<(), String> {
+    let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
     let names = model_names_for_tier(tier);
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
@@ -260,7 +319,7 @@ fn download_tier_force(tier: &str, cache_dir: &Path) -> Result<(), String> {
 /// 3. 缓存目录：文件存在则用，否则从 GitHub 自动下载。
 pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
     let [det, rec, dict] = model_names();
-    let tier = crate::config::ocr_model_tier();
+    let tier = effective_tier();
     for dir in crate::config::ocr_model_dir()
         .into_iter()
         .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
@@ -281,6 +340,13 @@ pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
     let mut out = [cache_dir.join(det), cache_dir.join(rec), cache_dir.join(dict)];
+    // 需要下载时持有全局下载锁（检查与下载之间可能被并发线程抢先，持锁后复查）；
+    // `_guard` 仅用于在函数结束时释放锁。
+    let _guard = if out.iter().any(|p| !p.exists()) {
+        Some(download_lock().lock().map_err(|_| "下载锁失效".to_string())?)
+    } else {
+        None
+    };
     for (path, name) in out.iter_mut().zip([det, rec, dict]) {
         if !path.exists() {
             // 下载（带进度上报，模型管理窗口可见）

@@ -23,7 +23,7 @@ use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Render, RenderImage, Size,
     Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
-    WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
+    TitlebarOptions, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
 use gpui_component::button::Button;
 use gpui_component::button::ButtonVariants;
@@ -33,6 +33,7 @@ use gpui_component::Selectable;
 use gpui_component::Sizable;
 use gpui_component::Icon;
 use gpui_component::popover::Popover;
+use gpui_component::scroll::ScrollableElement;
 use gpui_platform::application;
 use image::{Frame, ImageBuffer, Rgba};
 #[cfg(target_os = "linux")]
@@ -5202,70 +5203,117 @@ impl Render for OcrModelsView {
         let pct = total
             .filter(|t| *t > 0)
             .map(|t| (done as f64 / t as f64 * 100.0).min(100.0));
-        let tier = snap.tier.clone();
-        let tier_note = snap.tier_note.clone();
         let cache_dir = snap.cache_dir.display().to_string();
         let last_download = snap.last_download.clone();
 
-        // 文件行：状态标记 + 文件名 + 大小 + 本地路径
-        let file_rows = snap.files.iter().map(|f| {
-            let (mark, mark_color) = match &f.status {
-                FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
-                FileStatus::Missing => ("未下载", gpui::rgba(0x9E9E9EFF)),
-                FileStatus::Downloading => ("下载中…", gpui::rgba(0x42A5F5FF)),
-                FileStatus::Error(_) => ("失败", gpui::rgba(0xEF5350FF)),
-            };
-            let size_text = f.size.map(|s| format!("{:.1} MB", s as f64 / 1048576.0))
-                .unwrap_or_else(|| "-".into());
-            let path_text = f
-                .local_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "（本地无此文件）".into());
-            let url = f.url.clone();
+        // 每个档位一个区块：档位头（radio 切换 + 名称 + 说明 + 重新下载按钮）+ 三文件行
+        let tier_blocks = snap.tiers.iter().map(|t| {
+            let tier = t.tier.clone();
+            let selected = t.selected;
+            let note = t.note.clone();
+            let busy = downloading;
+            let file_rows = t.files.iter().map(|f| {
+                let (mark, mark_color) = match &f.status {
+                    FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
+                    FileStatus::Missing => ("未下载", gpui::rgba(0x9E9E9EFF)),
+                    FileStatus::Downloading => ("下载中…", gpui::rgba(0x42A5F5FF)),
+                    FileStatus::Error(_) => ("失败", gpui::rgba(0xEF5350FF)),
+                };
+                let size_text = f
+                    .size
+                    .map(|s| format!("{:.1} MB", s as f64 / 1048576.0))
+                    .unwrap_or_else(|| "-".into());
+                let path_text = f
+                    .local_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "（本地无此文件）".into());
+                let url = f.url.clone();
+                div()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().text_color(mark_color).text_sm().child(gpui::SharedString::from(mark)))
+                            .child(div().flex_1().text_sm().child(gpui::SharedString::from(f.name)))
+                            .child(div().text_color(gpui::rgba(0x9E9E9EFF)).text_xs().child(gpui::SharedString::from(size_text))),
+                    )
+                    .child(
+                        div()
+                            .text_color(gpui::rgba(0x808080FF))
+                            .text_xs()
+                            .child(gpui::SharedString::from(path_text)),
+                    )
+                    .child(
+                        div()
+                            .text_color(gpui::rgba(0x5C6BC0FF))
+                            .text_xs()
+                            .child(gpui::SharedString::from(url)),
+                    )
+            });
             div()
-                .flex()
                 .flex_col()
-                .gap(px(2.0))
-                .p(px(8.0))
+                .gap(px(6.0))
+                .p(px(10.0))
                 .rounded_md()
-                .bg(gpui::rgba(0x222222FF))
+                .border_1()
+                .border_color(if selected {
+                    gpui::rgba(0x42A5F5FF)
+                } else {
+                    gpui::rgba(0x2E2E2EFF)
+                })
+                // 档位头：切换 + 名称 + 说明 + 重新下载
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(8.0))
                         .child(
+                            Button::new(format!("switch-{tier}"))
+                                .label(if selected { "✓ 使用中" } else { "切换" })
+                                .compact()
+                                .on_click({
+                                    let tier = tier.clone();
+                                    move |_, _, _| {
+                                        crate::ocr::paddle::set_tier(&tier);
+                                    }
+                                }),
+                        )
+                        .child(
                             div()
-                                .text_color(mark_color)
                                 .text_sm()
-                                .child(gpui::SharedString::from(mark)),
+                                .text_color(if selected {
+                                    gpui::rgba(0x42A5F5FF)
+                                } else {
+                                    gpui::rgba(0xE6E6E6FF)
+                                })
+                                .child(gpui::SharedString::from(tier.clone())),
                         )
                         .child(
                             div()
                                 .flex_1()
-                                .text_sm()
-                                .child(gpui::SharedString::from(f.name)),
-                        )
-                        .child(
-                            div()
                                 .text_color(gpui::rgba(0x9E9E9EFF))
                                 .text_xs()
-                                .child(gpui::SharedString::from(size_text)),
+                                .child(gpui::SharedString::from(note)),
+                        )
+                        .child(
+                            Button::new(format!("dl-{tier}"))
+                                .label(if busy { "下载中…" } else { "重新下载" })
+                                .compact()
+                                .on_click(move |_, _, _| {
+                                    match crate::ocr::paddle::start_download(&tier) {
+                                        Ok(()) => tracing::info!("OCR: 开始重新下载模型（{tier}）"),
+                                        Err(e) => tracing::error!("OCR: 启动下载失败: {e}"),
+                                    }
+                                }),
                         ),
                 )
-                .child(
-                    div()
-                        .text_color(gpui::rgba(0x808080FF))
-                        .text_xs()
-                        .child(gpui::SharedString::from(path_text)),
-                )
-                .child(
-                    div()
-                        .text_color(gpui::rgba(0x5C6BC0FF))
-                        .text_xs()
-                        .child(gpui::SharedString::from(url)),
-                )
+                .child(div().flex_col().gap(px(4.0)).children(file_rows))
         });
 
         div()
@@ -5276,66 +5324,33 @@ impl Render for OcrModelsView {
             .bg(gpui::rgba(0x181818FF))
             .text_color(gpui::rgba(0xE6E6E6FF))
             .track_focus(&self.focus_handle)
-            // 标题栏
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(10.0))
-                    .h(px(36.0))
-                    .border_b_1()
-                    .border_color(gpui::rgba(0x3A3A3AFF))
-                    .child(div().text_sm().child("OCR 模型管理"))
-                    .child(
-                        Button::new("ocr-models-close")
-                            .icon(IconName::Close)
-                            .compact()
-                            .on_click(|_, window, _| window.remove_window()),
-                    ),
-            )
             .child(
                 div()
                     .flex_1()
+                    .overflow_y_scrollbar()
                     .flex()
                     .flex_col()
-                    .gap(px(8.0))
+                    .gap(px(10.0))
                     .p(px(12.0))
-                    // 档位信息
+                    // 缓存目录说明
                     .child(
                         div()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(gpui::SharedString::from(format!(
-                                        "当前档位：{tier}"
-                                    ))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(gpui::rgba(0x9E9E9EFF))
-                                    .text_xs()
-                                    .child(gpui::SharedString::from(tier_note)),
-                            )
-                            .child(
-                                div()
-                                    .text_color(gpui::rgba(0x808080FF))
-                                    .text_xs()
-                                    .child(gpui::SharedString::from(format!(
-                                        "缓存目录：{cache_dir}"
-                                    ))),
-                            ),
+                            .text_color(gpui::rgba(0x808080FF))
+                            .text_xs()
+                            .child(gpui::SharedString::from(format!(
+                                "缓存目录：{cache_dir}（模型查找顺序：OCR_MODEL_DIR / 项目 models/PP-OCRv6 / 缓存）"
+                            ))),
                     )
-                    // 文件列表
-                    .child(div().flex_col().gap(px(6.0)).children(file_rows))
+                    .children(tier_blocks)
                     // 下载进度 / 最近结果
                     .child(if downloading {
                         let pct_text = match (done, total) {
-                            (d, Some(t)) if t > 0 => {
-                                format!("{:.0}%  {:.1}/{:.1} MB", pct.unwrap_or(0.0), d as f64 / 1048576.0, t as f64 / 1048576.0)
-                            }
+                            (d, Some(t)) if t > 0 => format!(
+                                "{:.0}%  {:.1}/{:.1} MB",
+                                pct.unwrap_or(0.0),
+                                d as f64 / 1048576.0,
+                                t as f64 / 1048576.0
+                            ),
                             (d, _) => format!("{:.1} MB", d as f64 / 1048576.0),
                         };
                         div()
@@ -5359,60 +5374,28 @@ impl Render for OcrModelsView {
                                         div()
                                             .h_full()
                                             .rounded_full()
-                                            .w(px(300.0 * pct.unwrap_or(0.0) as f32 / 100.0))
+                                            .w(px(480.0 * pct.unwrap_or(0.0) as f32 / 100.0))
                                             .bg(gpui::rgba(0x42A5F5FF)),
                                     ),
                             )
                     } else {
-                        div().child(
-                            match &last_download {
-                                Some(Ok(())) => div()
-                                    .text_color(gpui::rgba(0x4CAF50FF))
-                                    .text_sm()
-                                    .child("✓ 最近一次下载完成"),
-                                Some(Err(e)) => div()
-                                    .text_color(gpui::rgba(0xEF5350FF))
-                                    .text_sm()
-                                    .child(gpui::SharedString::from(format!(
-                                        "最近一次下载失败：{e}"
-                                    ))),
-                                None => div()
-                                    .text_color(gpui::rgba(0x808080FF))
-                                    .text_xs()
-                                    .child("未执行过下载（首次使用 OCR 时会自动下载缺失模型）"),
-                            },
-                        )
-                    })
-                    // 按钮行
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.0))
-                            .child(
-                                Button::new("ocr-models-redownload")
-                                    .label(if downloading {
-                                        "下载中…"
-                                    } else {
-                                        "重新下载（当前档位）"
-                                    })
-                                    .on_click(move |_, _, _| {
-                                        let tier = tier.clone();
-                                        match crate::ocr::paddle::start_download(&tier) {
-                                            Ok(()) => {
-                                                tracing::info!("OCR: 开始重新下载模型（{tier}）")
-                                            }
-                                            Err(e) => {
-                                                tracing::error!("OCR: 启动下载失败: {e}")
-                                            }
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new("ocr-models-close2")
-                                    .label("关闭")
-                                    .on_click(|_, window, _| window.remove_window()),
-                            ),
-                    ),
+                        div().child(match &last_download {
+                            Some(Ok(())) => div()
+                                .text_color(gpui::rgba(0x4CAF50FF))
+                                .text_sm()
+                                .child("✓ 最近一次下载完成"),
+                            Some(Err(e)) => div()
+                                .text_color(gpui::rgba(0xEF5350FF))
+                                .text_sm()
+                                .child(gpui::SharedString::from(format!(
+                                    "最近一次下载失败：{e}"
+                                ))),
+                            None => div()
+                                .text_color(gpui::rgba(0x808080FF))
+                                .text_xs()
+                                .child("未执行过下载（切换档位或首次 OCR 时会自动下载缺失模型）"),
+                        })
+                    }),
             )
     }
 }
@@ -5425,8 +5408,8 @@ fn open_ocr_models_in_app(cx: &mut App) {
             size: Size::new(px(1280.0), px(800.0)),
         }
     });
-    let win_w = 560.0_f32;
-    let win_h = 430.0_f32;
+    let win_w = 600.0_f32;
+    let win_h = 620.0_f32;
     let origin = point(
         px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
         px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
@@ -5438,7 +5421,12 @@ fn open_ocr_models_in_app(cx: &mut App) {
                 size: Size::new(px(win_w), px(win_h)),
             })),
             window_background: WindowBackgroundAppearance::Opaque,
-            titlebar: None,
+            // 系统标题栏 + 系统关闭按钮（用户要求）
+            titlebar: Some(TitlebarOptions {
+                title: Some("OCR 模型".into()),
+                appears_transparent: false,
+                ..Default::default()
+            }),
             kind: WindowKind::Normal,
             is_movable: true,
             is_resizable: false,

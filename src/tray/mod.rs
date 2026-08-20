@@ -97,7 +97,7 @@ impl TrayService {
         // `MenuItem::new` 的第三个参数是 `Option<Accelerator>`（快捷键文本），
         // 我们不需要全局快捷键（已有 alt+s），传 `None` 即可。
         let screenshot_item = MenuItem::new("截图", true, None);
-        let ocr_models_item = MenuItem::new("OCR 模型管理…", true, None);
+        let ocr_models_item = MenuItem::new("OCR 模型", true, None);
         let quit_item = MenuItem::new("退出", true, None);
 
         // 将菜单项追加到菜单。`append` 在 Linux GTK 初始化失败时返回错误。
