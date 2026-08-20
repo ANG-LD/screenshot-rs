@@ -15,3 +15,6 @@ tesseract.zip
 
 # PP-OCRv6 medium 原始 Paddle 格式模型（用户手动下载；推理用 ONNX 版，此目录不随应用分发）
 PP-OCRv6_medium/
+
+# PP-OCRv6 medium ONNX 模型（用户本地放置；推理直接使用，不随应用分发——其他机器首次自动下载）
+models/PP-OCRv6/
