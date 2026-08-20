@@ -120,13 +120,12 @@ pub fn set_tier(tier: &str) {
     }
     reset_engine();
     tracing::info!("OCR: 手动切换模型档位 → {t}");
-    // 后台确保该档位模型就绪（缺啥自动下载，进度上报管理窗口）
-    let cache_dir = crate::config::ocr_cache_dir();
-    std::thread::spawn(move || {
-        if let Err(e) = ensure_models(&cache_dir) {
-            tracing::warn!("OCR: 档位 {t} 模型就绪检查失败: {e}");
-        }
-    });
+    // 持久化到 config.toml：重启后档位保持一致
+    if let Err(e) = crate::config::persist_model_tier(&t) {
+        tracing::warn!("OCR: 写入 config.toml 档位失败: {e}（本次运行仍生效）");
+    }
+    // 后台确保该档位模型就绪（缺啥自动下载，可被 engine 取消，进度上报）
+    background_ensure(&t);
 }
 
 /// 当前生效档位：内存覆盖 > config（env OCR_MODEL_TIER > ocr.model_tier > small）。
@@ -244,9 +243,88 @@ fn update_progress(name: &str, downloaded: u64, total: Option<u64>) {
     }
 }
 
+/// HTTP 客户端：30s 读空闲超时——下载中断时（取消/网络卡住）能及时返回，
+/// 避免线程永久阻塞在 `read` 上（取消后 engine 最多等 30s 即可接管下载）。
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_read(std::time::Duration::from_secs(30))
+            .build()
+    })
+}
+
+/// 后台下载任务（手动「重新下载」/ 切换档位后台确保）。可被 OCR 引擎
+/// 的下载需求取消（engine 优先，见 `cancel_background_download`）。
+struct DownloadTask {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 当前后台下载任务（None=无后台下载）。engine 需要下载时置 cancel 让位。
+static DOWNLOAD_TASK: OnceLock<Mutex<Option<DownloadTask>>> = OnceLock::new();
+
+fn download_task_cell() -> &'static Mutex<Option<DownloadTask>> {
+    DOWNLOAD_TASK.get_or_init(|| Mutex::new(None))
+}
+
+/// 取消进行中的后台下载：置取消标志并清空任务注册。
+/// 后台线程在下一块 `read` 返回（30s 空闲超时内）检查标志、删除 .part、
+/// 释放下载锁；engine 随后持锁接管下载。不 join（阻塞等待由下载锁完成）。
+fn cancel_background_download() {
+    if let Ok(mut g) = download_task_cell().lock() {
+        if let Some(task) = g.take() {
+            task.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("OCR: 取消后台模型下载（engine 接管）");
+        }
+    }
+}
+
+/// 下载单个模型文件到缓存目录（带进度上报与取消检查）。
+/// `cancel` 为 None 时不可取消（engine 自身下载）。
+fn download_one(name: &str, cache_dir: &Path, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<(), String> {
+    let dest = cache_dir.join(name);
+    let url = format!("{MODEL_BASE_URL}/{name}");
+    tracing::info!("OCR: 下载模型 {name} ← {url}");
+    let resp = http_agent()
+        .get(&url)
+        .call()
+        .map_err(|e| format!("下载模型 {name} 失败: {e}"))?;
+    let total = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse::<u64>().ok());
+    let mut reader = resp.into_reader();
+    let tmp = cache_dir.join(format!("{name}.part"));
+    let mut file = std::fs::File::create(&tmp)
+        .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
+    let mut buf = vec![0u8; 128 * 1024];
+    let mut downloaded: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("读取模型 {name} 失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            update_progress(name, downloaded, total);
+            return Err(format!("下载 {name} 已取消（engine 接管）"));
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
+        downloaded += n as u64;
+        update_progress(name, downloaded, total);
+    }
+    std::fs::rename(&tmp, &dest)
+        .map_err(|e| format!("移动模型 {name} 失败: {e}"))?;
+    tracing::info!("OCR: 模型 {name} 下载完成（{} 字节）", downloaded);
+    update_progress(name, downloaded, total);
+    Ok(())
+}
+
 /// 后台强制重新下载指定档位模型到缓存目录（已存在也覆盖，供「重新下载」）。
-/// 进度写入全局状态，UI 轮询 `model_snapshot()` 展示。返回后 `last_download`
-/// 记录结果。
+/// 进度写入全局状态，UI 轮询 `model_snapshot()` 展示；可被 engine 下载取消。
 pub fn start_download(tier: &str) -> Result<(), String> {
     let mut g = manager().lock().map_err(|_| "模型管理锁失效".to_string())?;
     if g.downloading {
@@ -257,10 +335,21 @@ pub fn start_download(tier: &str) -> Result<(), String> {
     g.last_download = None;
     drop(g);
 
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut cell) = download_task_cell().lock() {
+        *cell = Some(DownloadTask { cancel: cancel.clone() });
+    }
     let cache_dir = crate::config::ocr_cache_dir();
     let tier = tier.to_string();
+    let cancel_for_task = cancel.clone();
     std::thread::spawn(move || {
-        let result = download_tier_force(&tier, &cache_dir);
+        let result = download_tier_force(&tier, &cache_dir, Some(&cancel_for_task));
+        // 任务结束：若仍是自己的注册则清空（engine 取消时已 take，这里不再覆盖）
+        if let Ok(mut cell) = download_task_cell().lock() {
+            if cell.as_ref().map(|t| std::sync::Arc::ptr_eq(&t.cancel, &cancel_for_task)).unwrap_or(false) {
+                *cell = None;
+            }
+        }
         if let Ok(mut g) = manager().lock() {
             g.downloading = false;
             g.last_download = Some(result);
@@ -269,44 +358,22 @@ pub fn start_download(tier: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 强制下载指定档位三件套到缓存目录（带逐块进度上报）。
-fn download_tier_force(tier: &str, cache_dir: &Path) -> Result<(), String> {
+/// 强制下载指定档位三件套到缓存目录（带逐块进度上报与取消检查）。
+fn download_tier_force(
+    tier: &str,
+    cache_dir: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
     let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
     let names = model_names_for_tier(tier);
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
     for name in names {
-        let dest = cache_dir.join(name);
-        let url = format!("{MODEL_BASE_URL}/{name}");
-        tracing::info!("OCR: 下载模型 {name} ← {url}");
-        let resp = ureq::get(&url)
-            .call()
-            .map_err(|e| format!("下载模型 {name} 失败: {e}"))?;
-        let total = resp
-            .header("Content-Length")
-            .and_then(|s| s.parse::<u64>().ok());
-        let mut reader = resp.into_reader();
-        let tmp = cache_dir.join(format!("{name}.part"));
-        let mut file = std::fs::File::create(&tmp)
-            .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
-        let mut buf = vec![0u8; 128 * 1024];
-        let mut downloaded: u64 = 0;
-        loop {
-            let n = reader
-                .read(&mut buf)
-                .map_err(|e| format!("读取模型 {name} 失败: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buf[..n])
-                .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
-            downloaded += n as u64;
-            update_progress(name, downloaded, total);
+        // 已被取消则不再继续下载后续文件
+        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+            return Err("下载已取消".into());
         }
-        std::fs::rename(&tmp, &dest)
-            .map_err(|e| format!("移动模型 {name} 失败: {e}"))?;
-        tracing::info!("OCR: 模型 {name} 下载完成（{} 字节）", downloaded);
-        update_progress(name, downloaded, total);
+        download_one(name, cache_dir, cancel)?;
     }
     Ok(())
 }
@@ -316,8 +383,17 @@ fn download_tier_force(tier: &str, cache_dir: &Path) -> Result<(), String> {
 /// 查找顺序：
 /// 1. 用户显式指定目录（`OCR_MODEL_DIR` 环境变量或配置 `ocr.model_dir`）；
 /// 2. 项目内 `models/PP-OCRv6`（开发者放置，相对当前工作目录）；
-/// 3. 缓存目录：文件存在则用，否则从 GitHub 自动下载。
+/// 3. 缓存目录：文件存在则用，否则从 GitHub 自动下载（engine 优先：
+///    先取消后台下载任务，再持锁下载缺失文件）。
 pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
+    ensure_models_impl(cache_dir, None)
+}
+
+/// ensure_models 实现：`cancel` 为 Some 时可被 engine 的下载需求取消。
+fn ensure_models_impl(
+    cache_dir: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<[PathBuf; 3], String> {
     let [det, rec, dict] = model_names();
     let tier = effective_tier();
     for dir in crate::config::ocr_model_dir()
@@ -340,49 +416,47 @@ pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
     let mut out = [cache_dir.join(det), cache_dir.join(rec), cache_dir.join(dict)];
-    // 需要下载时持有全局下载锁（检查与下载之间可能被并发线程抢先，持锁后复查）；
-    // `_guard` 仅用于在函数结束时释放锁。
-    let _guard = if out.iter().any(|p| !p.exists()) {
-        Some(download_lock().lock().map_err(|_| "下载锁失效".to_string())?)
-    } else {
-        None
-    };
-    for (path, name) in out.iter_mut().zip([det, rec, dict]) {
-        if !path.exists() {
-            // 下载（带进度上报，模型管理窗口可见）
-            let url = format!("{MODEL_BASE_URL}/{name}");
-            tracing::info!("OCR: 下载模型 {name} ← {url}");
-            let resp = ureq::get(&url)
-                .call()
-                .map_err(|e| format!("下载模型 {name} 失败: {e}"))?;
-            let total = resp
-                .header("Content-Length")
-                .and_then(|s| s.parse::<u64>().ok());
-            let mut reader = resp.into_reader();
-            let tmp = cache_dir.join(format!("{name}.part"));
-            let mut file = std::fs::File::create(&tmp)
-                .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
-            let mut buf = vec![0u8; 128 * 1024];
-            let mut downloaded: u64 = 0;
-            loop {
-                let n = reader
-                    .read(&mut buf)
-                    .map_err(|e| format!("读取模型 {name} 失败: {e}"))?;
-                if n == 0 {
-                    break;
+    if out.iter().any(|p| !p.exists()) {
+        // 优先：取消其他后台下载任务（让其释放下载锁），再持锁接管下载。
+        // engine 调用时 cancel=None（不可被取消）；后台确保时 cancel=Some。
+        cancel_background_download();
+        let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
+        for (path, name) in out.iter_mut().zip([det, rec, dict]) {
+            if !path.exists() {
+                if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+                    return Err("下载已取消（engine 接管）".into());
                 }
-                file.write_all(&buf[..n])
-                    .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
-                downloaded += n as u64;
-                update_progress(name, downloaded, total);
+                download_one(name, cache_dir, cancel)?;
             }
-            std::fs::rename(&tmp, path)
-                .map_err(|e| format!("移动模型 {name} 失败: {e}"))?;
-            tracing::info!("OCR: 模型 {name} 下载完成");
         }
     }
     Ok(out)
 }
+
+/// 切换档位后的后台模型确保：缺啥自动下载，可被 engine 取消。
+/// 与手动「重新下载」走同一套下载实现（download_one + 下载锁 + 进度上报）。
+fn background_ensure(tier: &str) {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut cell) = download_task_cell().lock() {
+        *cell = Some(DownloadTask { cancel: cancel.clone() });
+    }
+    let cache_dir = crate::config::ocr_cache_dir();
+    let tier = tier.to_string();
+    let cancel_for_task = cancel.clone();
+    std::thread::spawn(move || {
+        let result = ensure_models_impl(&cache_dir, Some(&cancel_for_task));
+        if let Ok(mut cell) = download_task_cell().lock() {
+            if cell.as_ref().map(|t| std::sync::Arc::ptr_eq(&t.cancel, &cancel_for_task)).unwrap_or(false) {
+                *cell = None;
+            }
+        }
+        match result {
+            Ok(_) => tracing::info!("OCR: 档位 {tier} 模型就绪"),
+            Err(e) => tracing::warn!("OCR: 档位 {tier} 模型就绪检查失败: {e}"),
+        }
+    });
+}
+
 
 /// 获取（或懒初始化）识别引擎。模型路径来自缓存目录。
 pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {

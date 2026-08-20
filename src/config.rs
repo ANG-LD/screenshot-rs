@@ -113,6 +113,50 @@ pub fn ocr_model_tier() -> String {
         .to_ascii_lowercase()
 }
 
+/// 把 `ocr.model_tier` 持久化写入配置文件（文本级修改，保留注释与排版），
+/// 供模型管理窗口切换档位时调用——重启后档位保持一致。
+pub fn persist_model_tier(tier: &str) -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Err("找不到配置文件路径".into());
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取配置文件失败: {e}"))?;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    // 删除已有的 model_tier 行（含模板里的注释行），再重新插入
+    lines.retain(|l| !l.trim_start().starts_with("model_tier"));
+
+    // 找插入点：`[ocr]` 段内最后一条非注释配置行的下一行；
+    // 若无（段内只有注释/空行），插到 `[ocr]` 行之后。
+    let mut in_ocr = false;
+    let mut last_key_line: Option<usize> = None;
+    let mut ocr_header: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with('[') && t.ends_with(']') {
+            in_ocr = t == "[ocr]";
+            if in_ocr && ocr_header.is_none() {
+                ocr_header = Some(i);
+            }
+        } else if in_ocr && !t.is_empty() && !t.starts_with('#') {
+            last_key_line = Some(i);
+        }
+    }
+    let insert_at = last_key_line
+        .map(|i| i + 1)
+        .or(ocr_header.map(|i| i + 1))
+        .unwrap_or(lines.len());
+    lines.insert(insert_at, format!("model_tier = \"{tier}\""));
+
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| format!("写入配置文件失败: {e}"))?;
+    tracing::info!("OCR: 已持久化模型档位 {tier} → {}", path.display());
+    Ok(())
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
