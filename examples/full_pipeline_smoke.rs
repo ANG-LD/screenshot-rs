@@ -16,7 +16,9 @@ fn main() {
     };
     println!(
         "捕获到 {}x{}，前 4 字节 = {:02X?}",
-        frame.width, frame.height, &frame.pixels[..4.min(frame.pixels.len())]
+        frame.width,
+        frame.height,
+        &frame.pixels[..4.min(frame.pixels.len())]
     );
 
     // 模拟一次"中段选区"：屏幕中心 100×100
@@ -33,7 +35,9 @@ fn main() {
     };
     println!(
         "裁剪后 {}x{}，前 4 字节 = {:02X?}",
-        clipped.width, clipped.height, &clipped.pixels[..4.min(clipped.pixels.len())]
+        clipped.width,
+        clipped.height,
+        &clipped.pixels[..4.min(clipped.pixels.len())]
     );
 
     // 走生产路径：ClipboardService::write_frame
@@ -54,7 +58,9 @@ fn main() {
             assert_eq!(&img.bytes[..16], &clipped.pixels[..16]);
             println!(
                 "回读校验通过：{}x{} 字节内容匹配，前 16 字节 = {:02X?}",
-                img.width, img.height, &img.bytes[..16]
+                img.width,
+                img.height,
+                &img.bytes[..16]
             );
         }
         Err(e) => eprintln!("get_image 失败：{e}"),

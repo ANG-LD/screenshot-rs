@@ -70,6 +70,8 @@ pub struct ModelSnapshot {
     pub downloading: bool,
     /// 正在下载的档位（None=无；供 UI 只把对应档位按钮置为「下载中」）
     pub downloading_tier: Option<String>,
+    /// 正在下载的文件名（供 UI 把对应文件行状态置为「下载中」）
+    pub current_file: Option<String>,
     /// 当前文件下载进度（已下载字节, 总字节）
     pub progress: (u64, Option<u64>),
     /// 最近一次下载结果（None=尚无下载动作）
@@ -271,6 +273,7 @@ pub fn model_snapshot() -> ModelSnapshot {
             .collect(),
         downloading: state.downloading,
         downloading_tier: state.current_tier.clone(),
+        current_file: if state.downloading { Some(state.current_file.clone()) } else { None },
         progress: state.progress,
         last_download: state.last_download.clone(),
     }
@@ -416,8 +419,56 @@ fn download_tier_force(
         if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
             return Err("下载已取消".into());
         }
+        // 已存在的文件跳过：只补缺失/失败的，避免每次重下全部三件套
+        if cache_dir.join(name).exists() {
+            tracing::info!("OCR: {name} 已存在，跳过");
+            continue;
+        }
         download_one(name, cache_dir, cancel)?;
     }
+    Ok(())
+}
+
+/// 后台下载单个模型文件（供文件行「下载」按钮；已存在则跳过）。
+/// 与整档下载共用下载锁/进度/取消机制。
+pub fn start_download_file(tier: &str, name: &str) -> Result<(), String> {
+    let mut g = manager().lock().map_err(|_| "模型管理锁失效".to_string())?;
+    if g.downloading {
+        return Err("已有下载任务进行中".into());
+    }
+    g.downloading = true;
+    g.current_tier = Some(tier.to_string());
+    g.current_file = name.to_string();
+    g.progress = (0, None);
+    g.last_download = None;
+    drop(g);
+
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut cell) = download_task_cell().lock() {
+        *cell = Some(DownloadTask { cancel: cancel.clone() });
+    }
+    let cache_dir = crate::config::ocr_cache_dir();
+    let name = name.to_string();
+    let cancel_for_task = cancel.clone();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
+            if cache_dir.join(&name).exists() {
+                return Ok(());
+            }
+            download_one(&name, &cache_dir, Some(&cancel_for_task))
+        })();
+        if let Ok(mut cell) = download_task_cell().lock() {
+            if cell.as_ref().map(|t| std::sync::Arc::ptr_eq(&t.cancel, &cancel_for_task)).unwrap_or(false) {
+                *cell = None;
+            }
+        }
+        if let Ok(mut g) = manager().lock() {
+            g.downloading = false;
+            g.current_tier = None;
+            g.last_download = Some(result);
+        }
+    });
     Ok(())
 }
 

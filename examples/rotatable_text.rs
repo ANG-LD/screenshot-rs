@@ -362,8 +362,9 @@ impl Render for RotatableTextDemo {
                                                     if let Some(buf) = image::ImageBuffer::<
                                                         image::Rgba<u8>,
                                                         _,
-                                                    >::from_raw(w, h, pixels)
-                                                    {
+                                                    >::from_raw(
+                                                        w, h, pixels
+                                                    ) {
                                                         let img = Arc::new(RenderImage::new(
                                                             SmallVec::from_elem(
                                                                 image::Frame::new(buf),
@@ -427,15 +428,12 @@ impl Render for RotatableTextDemo {
                                 gpui::MouseButton::Left,
                                 cx.listener({
                                     let thumb_x = thumb_x;
-                                    move |this,
-                                          event: &gpui::MouseDownEvent,
-                                          _window,
-                                          cx| {
+                                    move |this, event: &gpui::MouseDownEvent, _window, cx| {
                                         this.slider_dragging = true;
                                         let pos_x: f32 = event.position.x.into();
                                         let track_start = pos_x - thumb_x;
-                                        this.rotation = this
-                                            .slider_to_angle(pos_x - track_start, slider_w);
+                                        this.rotation =
+                                            this.slider_to_angle(pos_x - track_start, slider_w);
                                         cx.notify();
                                     }
                                 }),
@@ -444,8 +442,8 @@ impl Render for RotatableTextDemo {
                                 move |this, event: &gpui::MouseMoveEvent, _window, cx| {
                                     if this.slider_dragging {
                                         let pos_x: f32 = event.position.x.into();
-                                        let track_x = pos_x
-                                            - this.angle_to_slider(this.rotation, slider_w);
+                                        let track_x =
+                                            pos_x - this.angle_to_slider(this.rotation, slider_w);
                                         this.rotation =
                                             this.slider_to_angle(pos_x - track_x, slider_w);
                                         cx.notify();
@@ -539,13 +537,7 @@ fn make_angle_btn(angle: f32, current: f32, cx: &mut Context<RotatableTextDemo>)
         })
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| {
-            if !active {
-                d.bg(rgba(0x585B70FF))
-            } else {
-                d
-            }
-        })
+        .hover(|d| if !active { d.bg(rgba(0x585B70FF)) } else { d })
         .child(format!("{}°", angle as i32))
         .on_mouse_down(
             gpui::MouseButton::Left,
@@ -574,13 +566,7 @@ fn make_size_btn(size: f32, current: f32, cx: &mut Context<RotatableTextDemo>) -
         })
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| {
-            if !active {
-                d.bg(rgba(0x585B70FF))
-            } else {
-                d
-            }
-        })
+        .hover(|d| if !active { d.bg(rgba(0x585B70FF)) } else { d })
         .child(format!("{}px", size as i32))
         .on_mouse_down(
             gpui::MouseButton::Left,

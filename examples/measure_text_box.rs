@@ -23,38 +23,33 @@ struct BoxMeasure {
 
 impl Render for BoxMeasure {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(
-                div()
-                    .absolute()
-                    .top(px(100.0))
-                    .left(px(50.0))
-                    .w(px(124.0))
-                    .h(px(47.6))
-                    .bg(gpui::rgba(0x008000FF)) // 绿色背景便于定位 box 区域
-                    .flex()
-                    .flex_col()
-                    .child(div().w_full().h(px(6.0)))
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .child(
-                                Input::new(&self.input)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .text_color(gpui::rgba(0x000000FF))
-                                    .with_size(gpui_component::Size::Size(px(24.0 / 0.875)))
-                                    .font_weight(match FontWeight::Normal {
-                                        FontWeight::Bold => gpui::FontWeight::BOLD,
-                                        FontWeight::Normal => gpui::FontWeight::NORMAL,
-                                    })
-                                    .font_family(SharedString::from(TEXT_FONT_FAMILY))
-                                    .line_height(gpui::relative(1.5)),
-                            ),
+        div().size_full().child(
+            div()
+                .absolute()
+                .top(px(100.0))
+                .left(px(50.0))
+                .w(px(124.0))
+                .h(px(47.6))
+                .bg(gpui::rgba(0x008000FF)) // 绿色背景便于定位 box 区域
+                .flex()
+                .flex_col()
+                .child(div().w_full().h(px(6.0)))
+                .child(
+                    div().relative().flex_1().child(
+                        Input::new(&self.input)
+                            .appearance(false)
+                            .bordered(false)
+                            .text_color(gpui::rgba(0x000000FF))
+                            .with_size(gpui_component::Size::Size(px(24.0 / 0.875)))
+                            .font_weight(match FontWeight::Normal {
+                                FontWeight::Bold => gpui::FontWeight::BOLD,
+                                FontWeight::Normal => gpui::FontWeight::NORMAL,
+                            })
+                            .font_family(SharedString::from(TEXT_FONT_FAMILY))
+                            .line_height(gpui::relative(1.5)),
                     ),
-            )
+                ),
+        )
     }
 }
 

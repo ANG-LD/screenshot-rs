@@ -22,7 +22,7 @@ use crate::error::{AppError, AppResult};
 use gpui::{
     App, AsyncApp, Bounds, Context, Entity, FocusHandle, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Point, QuitMode, Render, RenderImage, Size,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
+    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
     TitlebarOptions, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
 use gpui_component::button::Button;
@@ -5184,7 +5184,9 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
 /// 下载期间由打开处的定时器驱动重绘。
 pub struct OcrModelsView {
     focus_handle: FocusHandle,
-    /// 最近一次激活失败的提示（档位, 原因）；None=无错误
+    /// 自身弱引用：按钮回调（只拿 &mut App）用它更新视图并触发重绘
+    weak: WeakEntity<Self>,
+    /// 最近一次操作失败的提示（档位, 原因）；None=无错误
     activation_error: Option<(String, String)>,
 }
 
@@ -5192,17 +5194,19 @@ impl OcrModelsView {
     fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            weak: cx.entity().downgrade(),
             activation_error: None,
         }
     }
 }
 
 impl Render for OcrModelsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         use crate::ocr::paddle::{FileStatus, ModelSnapshot};
         let snap: ModelSnapshot = crate::ocr::paddle::model_snapshot();
         let downloading = snap.downloading;
         let downloading_tier = snap.downloading_tier.clone();
+        let current_file = snap.current_file.clone();
         let (done, total) = snap.progress;
         let pct = total
             .filter(|t| *t > 0)
@@ -5217,12 +5221,23 @@ impl Render for OcrModelsView {
             let note = t.note.clone();
             // 只有「正在下载的档位」显示下载中；其他档位按钮保持可点
             let busy = downloading && downloading_tier.as_deref() == Some(tier.as_str());
-            let file_rows = t.files.iter().map(|f| {
-                let (mark, mark_color) = match &f.status {
-                    FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
-                    FileStatus::Missing => ("未下载", gpui::rgba(0x9E9E9EFF)),
-                    FileStatus::Downloading => ("下载中…", gpui::rgba(0x42A5F5FF)),
-                    FileStatus::Error(_) => ("失败", gpui::rgba(0xEF5350FF)),
+            // file_rows 闭包持有档位名/弱引用/下载状态的独立副本，避免与外层借用冲突
+            let file_rows_tier = tier.clone();
+            let file_rows_weak = self.weak.clone();
+            let file_rows_current_file = current_file.clone();
+            let file_rows = t.files.iter().map(move |f| {
+                // 正在下载的文件行状态置为「下载中…」
+                let (mark, mark_color) = if downloading
+                    && file_rows_current_file.as_deref() == Some(f.name)
+                {
+                    ("下载中…", gpui::rgba(0x42A5F5FF))
+                } else {
+                    match &f.status {
+                        FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
+                        FileStatus::Missing => ("未下载", gpui::rgba(0x9E9E9EFF)),
+                        FileStatus::Downloading => ("下载中…", gpui::rgba(0x42A5F5FF)),
+                        FileStatus::Error(_) => ("失败", gpui::rgba(0xEF5350FF)),
+                    }
                 };
                 let size_text = f
                     .size
@@ -5234,6 +5249,8 @@ impl Render for OcrModelsView {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "（本地无此文件）".into());
                 let url = f.url.clone();
+                let tier_for_btn = file_rows_tier.clone();
+                let name_for_btn = f.name.to_string();
                 div()
                     .flex_col()
                     .gap(px(1.0))
@@ -5246,8 +5263,43 @@ impl Render for OcrModelsView {
                             .gap(px(6.0))
                             .child(div().text_color(mark_color).text_sm().child(gpui::SharedString::from(mark)))
                             .child(div().flex_1().text_sm().child(gpui::SharedString::from(f.name)))
-                            .child(div().text_color(gpui::rgba(0x9E9E9EFF)).text_xs().child(gpui::SharedString::from(size_text))),
-                    )
+                            .child(div().text_color(gpui::rgba(0x9E9E9EFF)).text_xs().child(gpui::SharedString::from(size_text)))
+                            // 单文件下载按钮：只补这一个文件（已存在则跳过），
+                            // 避免整档重下时已成功的文件被重新下载
+                            .child(
+                                Button::new(format!("dl-file-{file_rows_tier}-{name_for_btn}"))
+                                    .label("下载")
+                                    .with_variant(ButtonVariant::Info)
+                                    .with_size(gpui_component::Size::XSmall)
+                                    .disabled(downloading)
+                                    .on_click({
+                                        let weak = file_rows_weak.clone();
+                                        move |_, _, app| {
+                                            let Some(entity) = weak.upgrade() else { return };
+                                            entity.update(app, |this, cx| {
+                                                match crate::ocr::paddle::start_download_file(
+                                                    &tier_for_btn,
+                                                    &name_for_btn,
+                                                ) {
+                                                    Ok(()) => {
+                                                        this.activation_error = None;
+                                                        tracing::info!(
+                                                            "OCR: 开始下载文件 {name_for_btn}（{tier_for_btn}）"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            "OCR: 启动下载失败: {e}"
+                                                        );
+                                                        this.activation_error =
+                                                            Some((tier_for_btn.clone(), e));
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }
+                                    }))
+                            )
                     .child(
                         div()
                             .text_color(gpui::rgba(0x808080FF))
@@ -5310,19 +5362,29 @@ impl Render for OcrModelsView {
                                     .label("激活")
                                     .with_variant(ButtonVariant::Success)
                                     .with_size(gpui_component::Size::XSmall)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        match crate::ocr::paddle::set_tier(&tier) {
-                                            Ok(()) => {
-                                                this.activation_error = None;
-                                                tracing::info!("OCR: 已激活档位 {tier}");
+                                    .on_click({
+                                    let weak = self.weak.clone();
+                                    let tier = tier.clone();
+                                    move |_, _, app| {
+                                        let Some(entity) = weak.upgrade() else { return };
+                                        entity.update(app, |this, cx| {
+                                            match crate::ocr::paddle::set_tier(&tier) {
+                                                Ok(()) => {
+                                                    this.activation_error = None;
+                                                    tracing::info!("OCR: 已激活档位 {tier}");
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "OCR: 激活 {tier} 失败: {e}"
+                                                    );
+                                                    this.activation_error =
+                                                        Some((tier.clone(), e));
+                                                }
                                             }
-                                            Err(e) => {
-                                                tracing::error!("OCR: 激活 {tier} 失败: {e}");
-                                                this.activation_error = Some((tier.clone(), e));
-                                            }
-                                        }
-                                        cx.notify();
-                                    }))
+                                            cx.notify();
+                                        });
+                                    }
+                                })
                             }
                         })
                         // 重新下载（蓝色；下载中禁用变灰）
@@ -5336,20 +5398,31 @@ impl Render for OcrModelsView {
                                 })
                                 .with_size(gpui_component::Size::XSmall)
                                 .disabled(busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    match crate::ocr::paddle::start_download(&tier) {
-                                        Ok(()) => {
-                                            this.activation_error = None;
-                                            tracing::info!("OCR: 开始重新下载模型（{tier}）");
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("OCR: 启动下载失败: {e}");
-                                            this.activation_error =
-                                                Some((tier.clone(), e));
-                                        }
+                                .on_click({
+                                    let weak = self.weak.clone();
+                                    let tier = tier.clone();
+                                    move |_, _, app| {
+                                        let Some(entity) = weak.upgrade() else { return };
+                                        entity.update(app, |this, cx| {
+                                            match crate::ocr::paddle::start_download(&tier) {
+                                                Ok(()) => {
+                                                    this.activation_error = None;
+                                                    tracing::info!(
+                                                        "OCR: 开始重新下载模型（{tier}）"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "OCR: 启动下载失败: {e}"
+                                                    );
+                                                    this.activation_error =
+                                                        Some((tier.clone(), e));
+                                                }
+                                            }
+                                            cx.notify();
+                                        });
                                     }
-                                    cx.notify();
-                                })),
+                                }),
                         ),
                 )
                 .child(div().flex_col().gap(px(4.0)).children(file_rows))
