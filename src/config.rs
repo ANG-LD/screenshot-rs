@@ -1,4 +1,4 @@
-//! 运行时配置文件：OCR（tesseract）插件路径与下载路径。
+//! 运行时配置文件：OCR（PaddleOCR）模型路径与下载缓存。
 //!
 //! 配置文件位于跨平台配置目录下的 `screenshot-rs/config.toml`，可通过
 //! `SCREENSHOT_RS_CONFIG` 环境变量覆盖位置。所有字段可选，缺失即回落默认。
@@ -7,12 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
-
-/// tesseract 下载包默认 URL（占位符）：把 `tesseract-{platform}.zip` 上传到你的
-/// GitHub Releases（分别命名为 tesseract-windows.zip / tesseract-linux.zip /
-/// tesseract-macos.zip），然后替换为实际的 `https://github.com/<user>/<repo>/...`。
-const DEFAULT_DOWNLOAD_URL: &str =
-    "https://github.com/YOUR_USER/YOUR_REPO/releases/latest/download/tesseract-{platform}.zip";
 
 /// 默认配置模板（带注释），首次运行时写入配置目录，用户可直接编辑。
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../config.toml");
@@ -26,14 +20,10 @@ pub struct Config {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct OcrConfig {
-    /// tesseract 可执行文件绝对路径
-    pub engine_path: Option<PathBuf>,
-    /// tessdata 目录
-    pub tessdata_dir: Option<PathBuf>,
-    /// 下载 URL
-    pub download_url: Option<String>,
-    /// 下载缓存目录
+    /// 下载缓存目录（模型自动下载时存放于此）
     pub cache_dir: Option<PathBuf>,
+    /// PaddleOCR 模型目录（显式指定后不自动下载，直接使用目录下的模型文件）
+    pub model_dir: Option<PathBuf>,
 }
 
 static CONFIG: Lazy<Config> = Lazy::new(load_quiet);
@@ -88,74 +78,39 @@ pub fn config() -> &'static Config {
     &CONFIG
 }
 
-/// tesseract 可执行文件路径：env > 配置 > 自动定位（返回 None 走原有查找链）。
-pub fn engine_path() -> Option<PathBuf> {
-    env_path("TESSERACT_ENGINE_PATH")
-        .or_else(|| config().ocr.engine_path.clone())
-        .map(expand_home)
-}
-
-/// tessdata 目录：env > 配置 > None（使用 tesseract 自带目录）。
-pub fn tessdata_dir() -> Option<PathBuf> {
-    env_path("TESSERACT_TESSDATA_DIR")
-        .or_else(|| config().ocr.tessdata_dir.clone())
-        .map(expand_home)
-}
-
-/// 下载 URL：env > 配置 > 默认常量。空字符串视为未设置。
-/// 支持 `{platform}` 占位符，按当前平台替换为 windows / macos / linux。
-pub fn download_url() -> String {
-    let url = resolve_download_url(
-        std::env::var("TESSERACT_DOWNLOAD_URL").ok().as_deref(),
-        config().ocr.download_url.as_deref(),
-        DEFAULT_DOWNLOAD_URL,
-    );
-    replace_platform_placeholder(&url)
-}
-
-/// 替换 URL 中的 `{platform}` 占位符为当前平台名；无占位符则原样返回。
-fn replace_platform_placeholder(url: &str) -> String {
-    url.replace("{platform}", platform_name())
-}
-
-/// 当前平台名（用于下载 URL 占位符）。
-fn platform_name() -> &'static str {
-    #[cfg(target_os = "windows")]
-    { "windows" }
-    #[cfg(target_os = "macos")]
-    { "macos" }
-    #[cfg(target_os = "linux")]
-    { "linux" }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    { "unknown" }
-}
-
-/// 下载缓存目录：env > 配置 > `LOCALAPPDATA|temp_dir` + `/screenshot-rs`。
+/// 下载缓存目录：env > 配置 > `LOCALAPPDATA|系统缓存目录` + `/screenshot-rs`。
 pub fn cache_dir() -> PathBuf {
-    env_path("TESSERACT_CACHE_DIR")
+    env_path("OCR_CACHE_DIR")
         .or_else(|| config().ocr.cache_dir.clone())
         .map(expand_home)
         .unwrap_or_else(default_cache_dir)
+}
+
+/// PaddleOCR 模型缓存目录：复用下载缓存目录下的 `paddle` 子目录。
+pub fn ocr_cache_dir() -> PathBuf {
+    cache_dir().join("paddle")
+}
+
+/// 用户显式指定的 PaddleOCR 模型目录：env `OCR_MODEL_DIR` > 配置 `ocr.model_dir`。
+/// 指定后直接使用该目录下的模型文件（不再自动下载）；未指定则用缓存目录（自动下载）。
+pub fn ocr_model_dir() -> Option<PathBuf> {
+    env_path("OCR_MODEL_DIR")
+        .or_else(|| config().ocr.model_dir.clone())
+        .map(expand_home)
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
-/// 默认下载缓存目录：`%LOCALAPPDATA%/screenshot-rs`（其他平台回退系统临时目录）。
+/// 默认下载缓存目录：优先 `%LOCALAPPDATA%/screenshot-rs`；其他平台用系统缓存目录
+/// （Linux/macOS 的 `~/.cache/screenshot-rs`，避免模型落在临时目录重启即丢）。
 fn default_cache_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
+        .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir)
         .join("screenshot-rs")
-}
-
-/// 合并下载 URL：env > config > default；空字符串视为未设置。
-fn resolve_download_url(env: Option<&str>, config: Option<&str>, default: &str) -> String {
-    env.filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| config.filter(|s| !s.is_empty()).map(str::to_string))
-        .unwrap_or_else(|| default.to_string())
 }
 
 /// 展开路径开头的 `~`（或 `~\`）为用户主目录。
@@ -187,66 +142,23 @@ mod tests {
         let c = parse_config(
             r#"
             [ocr]
-            engine_path  = "/usr/bin/tesseract"
-            tessdata_dir = "/usr/share/tesseract-ocr/4.00/tessdata"
-            download_url = "https://example.com/tesseract.zip"
-            cache_dir    = "/data/ocr-cache"
+            cache_dir = "/data/ocr-cache"
+            model_dir = "/data/paddle-models"
             "#,
         )
         .unwrap();
-        assert_eq!(c.ocr.engine_path, Some("/usr/bin/tesseract".into()));
-        assert_eq!(
-            c.ocr.tessdata_dir,
-            Some("/usr/share/tesseract-ocr/4.00/tessdata".into())
-        );
-        assert_eq!(c.ocr.download_url.as_deref(), Some("https://example.com/tesseract.zip"));
         assert_eq!(c.ocr.cache_dir, Some("/data/ocr-cache".into()));
+        assert_eq!(c.ocr.model_dir, Some("/data/paddle-models".into()));
     }
 
     #[test]
     fn invalid_or_empty_toml_falls_back() {
         assert!(parse_config("not [valid toml").is_none());
-        assert!(parse_config("").unwrap_or_default().ocr.engine_path.is_none());
+        assert!(parse_config("").unwrap_or_default().ocr.cache_dir.is_none());
         // 无 [ocr] 表也能反序列化为默认
         let c = parse_config("other = 1").unwrap();
-        assert!(c.ocr.engine_path.is_none());
-        assert!(c.ocr.download_url.is_none());
-    }
-
-    #[test]
-    fn download_url_priority() {
-        assert_eq!(
-            resolve_download_url(Some("env-url"), Some("cfg-url"), "default"),
-            "env-url"
-        );
-        assert_eq!(
-            resolve_download_url(None, Some("cfg-url"), "default"),
-            "cfg-url"
-        );
-        assert_eq!(resolve_download_url(None, None, "default"), "default");
-        // 空字符串视为未设置
-        assert_eq!(
-            resolve_download_url(Some(""), Some("cfg-url"), "default"),
-            "cfg-url"
-        );
-        assert_eq!(
-            resolve_download_url(Some("env"), Some(""), "default"),
-            "env"
-        );
-    }
-
-    #[test]
-    fn platform_placeholder_replaced() {
-        assert_eq!(
-            replace_platform_placeholder("https://x/tesseract-{platform}.zip"),
-            format!("https://x/tesseract-{}.zip", platform_name())
-        );
-        // 无占位符原样返回
-        assert_eq!(
-            replace_platform_placeholder("https://x/tesseract.zip"),
-            "https://x/tesseract.zip"
-        );
-        assert_eq!(replace_platform_placeholder("no placeholder"), "no placeholder");
+        assert!(c.ocr.cache_dir.is_none());
+        assert!(c.ocr.model_dir.is_none());
     }
 
     #[test]
@@ -270,7 +182,7 @@ mod tests {
         assert!(ensure_config_file_at(&path));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[ocr]"));
-        assert!(content.contains("engine_path"));
+        assert!(content.contains("model_dir"));
         // 已存在则不覆盖
         assert!(!ensure_config_file_at(&path));
 

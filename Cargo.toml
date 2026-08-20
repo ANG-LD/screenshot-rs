@@ -26,6 +26,10 @@ image = "0.25"
 # 用户配置目录（跨平台 config_dir / home_dir）
 dirs = "6"
 
+# PaddleOCR（PP-OCRv6）本地推理：替换 tesseract CLI，中文准确率更高。
+# 依赖 oar-ocr 包装（内部为 ONNX Runtime，默认 features 构建时下载 CPU 版运行时）。
+oar-ocr = "0.9"
+
 # OCR 依赖按需下载（首次使用 OCR 时从 GitHub 拉取 tesseract，不打包进应用）
 ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }

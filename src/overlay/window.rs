@@ -2391,7 +2391,8 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
     }
 }
 
-/// 同步执行 OCR：从 frame_pixels 中裁切 rect 区域，保存为 PNG，调用 tesseract CLI。
+/// 同步执行 OCR：从 frame_pixels 中裁切 rect 区域，放大后交给 PaddleOCR
+/// （PP-OCRv6，本地 ONNX 推理）识别。
 ///
 /// `window_w` / `window_h` 是 GPUI 窗口的实际尺寸（逻辑像素），必须从
 /// `window.bounds()` 获取。它与 frame 物理尺寸可能有差异（如任务栏挤压），
@@ -2404,8 +2405,6 @@ fn run_ocr_sync(
     window_w: f32,
     window_h: f32,
 ) -> String {
-    use std::process::Command;
-
     // canvas 坐标 → 物理像素：需要考虑 paint_image 的缩放比
     let x_ratio = frame_width as f32 / window_w.max(1.0);
     let y_ratio = frame_height as f32 / window_h.max(1.0);
@@ -2442,9 +2441,8 @@ fn run_ocr_sync(
         }
     }
 
-    // tesseract 按 ~300dpi 训练，屏幕截图 1x 文本偏小，中英混排/小字号极易误识
-    // （如「整帧 clone → 零拷贝借用」被读成乱码）。放大到长边 ≤4096px（最多 3 倍）
-    // 再转灰度，消除亚像素彩边，能显著提升识别率。
+    // PP-OCR 检测器按 ~32px 高的文本行训练，屏幕截图 1x 文本偏小，中英混排/
+    // 小字号极易漏检。放大到长边 ≤4096px（最多 3 倍）能显著提升识别率。
     let upscale = (4096u32 / w.max(h).max(1)).clamp(1, 3);
     let src =
         image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| image::RgbImage::new(w, h));
@@ -2458,12 +2456,10 @@ fn run_ocr_sync(
     } else {
         src
     };
-    let gray = image::DynamicImage::ImageRgb8(up).into_luma8();
 
-    // 写入预处理后的调试 PNG（作为 tesseract 输入；用系统临时目录，Linux 的
-    // /tmp 在 Windows/macOS 上不存在）
+    // 写入预处理后的调试 PNG（用系统临时目录，Linux 的 /tmp 在 Windows/macOS 上不存在）
     let debug_path = std::env::temp_dir().join("screenshot_ocr_debug.png");
-    if let Err(e) = gray.save(&debug_path) {
+    if let Err(e) = up.save(&debug_path) {
         tracing::error!("OCR: 保存调试 PNG 失败: {}", e);
     } else {
         tracing::info!(
@@ -2471,180 +2467,24 @@ fn run_ocr_sync(
             debug_path.display(),
             w,
             h,
-            gray.width(),
-            gray.height(),
+            up.width(),
+            up.height(),
             upscale,
         );
     }
 
-    // 调用 tesseract：优先 exe 旁的打包版 → 缓存（已下载）→ 系统 PATH；
-    // 都没有则自动从 GitHub 下载到缓存目录（%LOCALAPPDATA%/screenshot-rs）。
-    let (tesseract_bin, tessdata_dir) = find_or_download_tesseract();
-
-    let mut cmd = Command::new(&tesseract_bin);
-    cmd.arg(&debug_path).arg("stdout").arg("-l").arg("chi_sim+eng").arg("--psm").arg("6");
-    if let Some(td) = tessdata_dir.as_ref().filter(|p| p.exists()) {
-        cmd.arg("--tessdata-dir").arg(td);
-    }
-    let output = cmd.output();
-
-    match output {
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.is_empty() {
-                tracing::info!("OCR: tesseract stderr: {}", stderr.trim());
-            }
+    // PaddleOCR（PP-OCRv6 medium）识别：首次使用自动下载模型（约 132 MB）
+    // 到缓存目录；推理在本地 ONNX Runtime 完成。
+    match crate::ocr::paddle::recognize_rgb(up.as_raw(), up.width(), up.height()) {
+        Ok(text) => {
             tracing::info!("OCR: 识别结果 ({} bytes): {:?}", text.len(), text);
-            text.trim_end().to_string()
+            text
         }
         Err(e) => {
-            tracing::error!("tesseract OCR 失败: {}", e);
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "⚠ 未找到 tesseract，自动下载失败。\n\n请手动安装并加入 PATH：\nWindows: winget install UB-Mannheim.TesseractOCR\nmacOS: brew install tesseract\nLinux: apt install tesseract-ocr tesseract-ocr-chi-sim\n\n或检查下载地址：{}",
-                    crate::config::download_url()
-                )
-            } else {
-                format!("⚠ OCR 执行失败: {e}")
-            }
+            tracing::error!("OCR 识别失败: {e}");
+            format!("⚠ OCR 失败: {e}")
         }
     }
-}
-
-/// 当前平台 tesseract 可执行文件名：Windows 带 `.exe` 后缀，其余平台无扩展名。
-fn tesseract_exe_name() -> &'static str {
-    #[cfg(target_os = "windows")]
-    { "tesseract.exe" }
-    #[cfg(not(target_os = "windows"))]
-    { "tesseract" }
-}
-
-/// 在系统 PATH 中查找可执行文件（如 apt/brew 装的 `/usr/bin/tesseract`）。
-fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    search_path(&path_var, name)
-}
-
-/// 在给定的 PATH 字符串中查找可执行文件；纯函数便于测试。
-fn search_path(path_var: &std::ffi::OsStr, name: &str) -> Option<std::path::PathBuf> {
-    std::env::split_paths(path_var)
-        .map(|dir| dir.join(name))
-        .find(|c| c.is_file())
-}
-
-/// 找到可用的 tesseract 可执行文件；找不到则自动从 GitHub 下载并解压到缓存。
-///
-/// 返回 `(tesseract_bin, tessdata_dir)`：
-/// - 优先配置/环境变量指定的 engine_path
-/// - 其次 exe 旁的打包版（Windows: `<exe>/tesseract/tesseract.exe`，其余: `<exe>/bin/tesseract`）
-/// - 其次缓存（`<cache>/tesseract/<平台可执行名>`，首次使用下载到这里）
-/// - 其次系统 PATH（如 apt/brew 装的 `/usr/bin/tesseract`）
-/// - 最后自动下载
-fn find_or_download_tesseract() -> (std::path::PathBuf, Option<std::path::PathBuf>) {
-    // 0) 配置/环境变量显式指定的 tesseract 路径
-    if let Some(ep) = crate::config::engine_path() {
-        if ep.exists() {
-            let td = crate::config::tessdata_dir().filter(|p| p.exists());
-            tracing::info!("OCR: 使用配置的 tesseract: {}", ep.display());
-            return (ep, td);
-        }
-        tracing::warn!("OCR: 配置的 tesseract 不存在，回退自动查找: {}", ep.display());
-    }
-
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let cache = crate::config::cache_dir();
-    let cache_bin = cache.join("tesseract").join(tesseract_exe_name());
-    let cache_td = cache.join("tessdata");
-    let bundled_bin = exe_dir.as_ref().map(|d| {
-        #[cfg(target_os = "windows")]
-        {
-            d.join("tesseract").join("tesseract.exe")
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            d.join("bin").join("tesseract")
-        }
-    });
-
-    if let Some(b) = bundled_bin.filter(|p| p.exists()) {
-        return (b, exe_dir.map(|d| d.join("tessdata")).filter(|p| p.exists()));
-    }
-    if cache_bin.exists() {
-        return (cache_bin, Some(cache_td).filter(|p| p.exists()));
-    }
-    // 系统已安装（PATH 中的 tesseract）直接用，不下载
-    if let Some(sys) = find_in_path(tesseract_exe_name()) {
-        tracing::info!("OCR: 使用系统 tesseract: {}", sys.display());
-        return (sys, None);
-    }
-
-    tracing::info!("未检测到 tesseract，尝试从 {} 下载…", crate::config::download_url());
-    match download_tesseract(&cache) {
-        Ok(()) if cache_bin.exists() => {
-            tracing::info!("tesseract 已下载到 {}", cache.display());
-            (cache_bin, Some(cache_td).filter(|p| p.exists()))
-        }
-        Ok(_) => (std::path::PathBuf::from("tesseract"), None),
-        Err(e) => {
-            tracing::error!("tesseract 下载失败: {e}");
-            (std::path::PathBuf::from("tesseract"), None)
-        }
-    }
-}
-
-/// 下载 `tesseract.zip` 并解压到缓存目录。
-fn download_tesseract(cache: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
-    let zip_path = cache.join("tesseract.zip");
-
-    // 下载（阻塞；仅首次使用 OCR 时执行一次）
-    let resp = ureq::get(&crate::config::download_url())
-        .call()
-        .map_err(|e| format!("下载失败: {e}"))?;
-    let mut body = resp.into_reader();
-    {
-        let mut file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
-        std::io::copy(&mut body, &mut file).map_err(|e| e.to_string())?;
-    }
-
-    // 解压
-    let file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = entry.name().to_string();
-        if name.contains("..") {
-            continue; // 防路径穿越
-        }
-        let outpath = cache.join(&name);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&outpath).ok();
-        } else {
-            if let Some(p) = outpath.parent() {
-                std::fs::create_dir_all(p).ok();
-            }
-            let mut out = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
-        }
-    }
-
-    // 非 Windows 平台解压后补可执行权限（zip 不保留 unix 权限位）
-    #[cfg(not(target_os = "windows"))]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = cache.join("tesseract").join(tesseract_exe_name());
-        if let Ok(meta) = std::fs::metadata(&bin) {
-            let mut perm = meta.permissions();
-            perm.set_mode(0o755);
-            let _ = std::fs::set_permissions(&bin, perm);
-        }
-    }
-
-    let _ = std::fs::remove_file(&zip_path);
-    Ok(())
 }
 
 impl Render for OverlayView {
@@ -5556,24 +5396,6 @@ fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i3
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn search_path_finds_existing_file() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("screenshot-rs-path-test-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("tesseract");
-        std::fs::write(&bin, b"x").unwrap();
-        let path = std::env::join_paths([&dir]).unwrap();
-
-        assert_eq!(search_path(&path, "tesseract"), Some(bin));
-        assert_eq!(search_path(&path, "missing"), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn text_move_down_keeps_size_and_clamps_to_selection() {

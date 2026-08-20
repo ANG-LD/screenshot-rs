@@ -14,26 +14,16 @@
 
 [ocr]
 
-# tesseract 可执行文件绝对路径。
-# 不填则自动查找：exe 旁打包版 → 下载缓存 → 系统 PATH。
-# 也可用环境变量 TESSERACT_ENGINE_PATH 覆盖。
-# engine_path = "/usr/bin/tesseract"
-# engine_path = "C:\\tools\\tesseract\\tesseract.exe"
+# PaddleOCR 模型目录。指定后直接使用该目录下的模型文件（不再自动下载）。
+# 目录需包含三个文件：
+#   pp-ocrv6_medium_det.onnx   （检测模型，约 62 MB）
+#   pp-ocrv6_medium_rec.onnx   （识别模型，约 76 MB）
+#   ppocrv6_dict.txt           （词典，18708 字符）
+# 也可用环境变量 OCR_MODEL_DIR 覆盖。
+# 不填则依次查找：项目内 models/PP-OCRv6 → 缓存目录（自动下载）。
+# model_dir = "/data/PP-OCRv6"
 
-# tessdata 目录（语言数据目录）。不填则用 tesseract 自带目录。
-# 也可用环境变量 TESSERACT_TESSDATA_DIR 覆盖。
-# tessdata_dir = "/usr/share/tesseract-ocr/4.00/tessdata"
-
-# tesseract 下载包地址（自动下载时使用）。
-# 支持 {platform} 占位符，程序按平台替换为 windows / macos / linux：
-#   即分别下载 tesseract-windows.zip / tesseract-linux.zip / tesseract-macos.zip，
-#   请在 GitHub Releases 上传这三个 asset。
-# 也可填写不含占位符的具体 URL（跨平台同一地址，需自己保证平台匹配）。
-# 默认是占位符，请替换为你的 GitHub Releases 地址。
-# 包结构需为：tesseract/<可执行文件>（Windows 为 tesseract.exe，其余平台为 tesseract）+ tessdata/。
-# 也可用环境变量 TESSERACT_DOWNLOAD_URL 覆盖。
-# download_url = "https://github.com/YOUR_USER/YOUR_REPO/releases/latest/download/tesseract-{platform}.zip"
-
-# 下载缓存目录。默认 %LOCALAPPDATA%/screenshot-rs（其他平台为系统临时目录）。
-# 也可用环境变量 TESSERACT_CACHE_DIR 覆盖。
+# 模型下载缓存目录。不填则用系统缓存目录
+# （Linux/macOS: ~/.cache/screenshot-rs，Windows: %LOCALAPPDATA%\screenshot-rs）。
+# 也可用环境变量 OCR_CACHE_DIR 覆盖。
 # cache_dir = "/data/ocr-cache"

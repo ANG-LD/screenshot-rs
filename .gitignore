@@ -12,3 +12,6 @@ assets/fonts/*.ttf
 # tesseract 打包资源（仅用于生成 tesseract.zip 上传 GitHub Releases，不随应用分发）
 vendor/
 tesseract.zip
+
+# PP-OCRv6 medium 原始 Paddle 格式模型（用户手动下载；推理用 ONNX 版，此目录不随应用分发）
+PP-OCRv6_medium/
