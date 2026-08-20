@@ -5202,6 +5202,7 @@ impl Render for OcrModelsView {
         use crate::ocr::paddle::{FileStatus, ModelSnapshot};
         let snap: ModelSnapshot = crate::ocr::paddle::model_snapshot();
         let downloading = snap.downloading;
+        let downloading_tier = snap.downloading_tier.clone();
         let (done, total) = snap.progress;
         let pct = total
             .filter(|t| *t > 0)
@@ -5214,7 +5215,8 @@ impl Render for OcrModelsView {
             let tier = t.tier.clone();
             let selected = t.selected;
             let note = t.note.clone();
-            let busy = downloading;
+            // 只有「正在下载的档位」显示下载中；其他档位按钮保持可点
+            let busy = downloading && downloading_tier.as_deref() == Some(tier.as_str());
             let file_rows = t.files.iter().map(|f| {
                 let (mark, mark_color) = match &f.status {
                     FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
@@ -5334,11 +5336,19 @@ impl Render for OcrModelsView {
                                 })
                                 .with_size(gpui_component::Size::XSmall)
                                 .disabled(busy)
-                                .on_click(cx.listener(move |_, _, _, _| {
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     match crate::ocr::paddle::start_download(&tier) {
-                                        Ok(()) => tracing::info!("OCR: 开始重新下载模型（{tier}）"),
-                                        Err(e) => tracing::error!("OCR: 启动下载失败: {e}"),
+                                        Ok(()) => {
+                                            this.activation_error = None;
+                                            tracing::info!("OCR: 开始重新下载模型（{tier}）");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("OCR: 启动下载失败: {e}");
+                                            this.activation_error =
+                                                Some((tier.clone(), e));
+                                        }
                                     }
+                                    cx.notify();
                                 })),
                         ),
                 )
@@ -5388,9 +5398,7 @@ impl Render for OcrModelsView {
                                 div()
                                     .text_color(gpui::rgba(0xEF5350FF))
                                     .text_xs()
-                                    .child(gpui::SharedString::from(format!(
-                                        "{t} 激活失败：{msg}"
-                                    ))),
+                                    .child(gpui::SharedString::from(format!("{t}：{msg}"))),
                             )
                     } else {
                         div()

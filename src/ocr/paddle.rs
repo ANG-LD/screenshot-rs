@@ -68,6 +68,8 @@ pub struct ModelSnapshot {
     pub tiers: Vec<TierStatus>,
     /// 是否有下载任务进行中
     pub downloading: bool,
+    /// 正在下载的档位（None=无；供 UI 只把对应档位按钮置为「下载中」）
+    pub downloading_tier: Option<String>,
     /// 当前文件下载进度（已下载字节, 总字节）
     pub progress: (u64, Option<u64>),
     /// 最近一次下载结果（None=尚无下载动作）
@@ -77,6 +79,8 @@ pub struct ModelSnapshot {
 /// 全局模型管理状态（下载线程与 UI 线程共享）
 struct ModelManagerState {
     downloading: bool,
+    /// 正在下载的档位（None=无下载任务；供 UI 区分各档位按钮状态）
+    current_tier: Option<String>,
     /// 当前文件进度
     progress: (u64, Option<u64>),
     /// 当前下载的文件名
@@ -91,6 +95,7 @@ fn manager() -> &'static Mutex<ModelManagerState> {
     MANAGER.get_or_init(|| {
         Mutex::new(ModelManagerState {
             downloading: false,
+            current_tier: None,
             progress: (0, None),
             current_file: String::new(),
             last_download: None,
@@ -265,6 +270,7 @@ pub fn model_snapshot() -> ModelSnapshot {
             })
             .collect(),
         downloading: state.downloading,
+        downloading_tier: state.current_tier.clone(),
         progress: state.progress,
         last_download: state.last_download.clone(),
     }
@@ -366,6 +372,7 @@ pub fn start_download(tier: &str) -> Result<(), String> {
         return Err("已有下载任务进行中".into());
     }
     g.downloading = true;
+    g.current_tier = Some(tier.to_string());
     g.progress = (0, None);
     g.last_download = None;
     drop(g);
@@ -387,6 +394,7 @@ pub fn start_download(tier: &str) -> Result<(), String> {
         }
         if let Ok(mut g) = manager().lock() {
             g.downloading = false;
+            g.current_tier = None;
             g.last_download = Some(result);
         }
     });
