@@ -112,6 +112,28 @@ pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
     Ok(*guard.as_ref().unwrap())
 }
 
+/// 应用启动时后台预加载 OCR 引擎（不阻塞 UI 线程）。
+///
+/// 触发时机：`AppState::new()` 末尾。模型不存在时内部会自动下载
+/// （首次可能耗时较长，但全程在后台线程）；加载完成后 `ENGINE`
+/// 单例就绪，用户首次使用 OCR 时无需再等待模型加载。
+/// 失败不 panic：仅记录警告，首次 OCR 时会再次尝试加载。
+pub fn preload() {
+    std::thread::spawn(|| {
+        let t0 = std::time::Instant::now();
+        let cache_dir = crate::config::ocr_cache_dir();
+        match engine(&cache_dir) {
+            Ok(_) => tracing::info!(
+                "OCR: 引擎后台预加载完成（耗时 {:?}，内存约 550MB）",
+                t0.elapsed()
+            ),
+            Err(e) => tracing::warn!(
+                "OCR: 引擎后台预加载失败: {e}（首次 OCR 时将重试）"
+            ),
+        }
+    });
+}
+
 /// 识别一块 RGB 图像（w×h×3 字节），返回按行拼接的文本。
 pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
     let img = oar_ocr::utils::create_rgb_image(w, h, rgb.to_vec())
