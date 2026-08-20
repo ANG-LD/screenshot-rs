@@ -109,11 +109,47 @@ fn download_lock() -> &'static Mutex<()> {
     DOWNLOAD_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// 手动切换档位：写入内存覆盖并复位引擎，下次 OCR 用新档位。
-/// 模型文件缺失时由 `ensure_models` 在后台自动下载（进度可见）。
-pub fn set_tier(tier: &str) {
+/// 检查指定档位三件套是否本地齐全（显式目录 / 项目 models/PP-OCRv6 / 缓存）。
+/// 返回 `Ok(())` 齐全；`Err` 携带缺失文件名列表。
+pub fn tier_ready(tier: &str) -> Result<(), Vec<String>> {
+    let cache_dir = crate::config::ocr_cache_dir();
+    let mut missing = Vec::new();
+    for name in model_names_for_tier(tier) {
+        let mut exists = false;
+        for dir in crate::config::ocr_model_dir()
+            .into_iter()
+            .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
+            .chain(std::iter::once(cache_dir.clone()))
+        {
+            if dir.join(name).exists() {
+                exists = true;
+                break;
+            }
+        }
+        if !exists {
+            missing.push(name.to_string());
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
+/// 手动切换档位：先校验模型齐全（缺失不允许激活），再写入内存覆盖并复位引擎。
+/// 返回 Err 时未做任何切换。
+pub fn set_tier(tier: &str) -> Result<(), String> {
     let t = tier.to_ascii_lowercase();
     let t = if t == "medium" { "medium".to_string() } else { "small".to_string() };
+    // 激活前置校验：模型文件必须本地齐全，否则拒绝切换并提示缺失文件
+    if let Err(missing) = tier_ready(&t) {
+        tracing::warn!("OCR: 拒绝激活 {t}：缺失模型文件 {missing:?}");
+        return Err(format!(
+            "模型文件不齐全（缺失 {}），请先点击「重新下载」",
+            missing.join("、")
+        ));
+    }
     let cell = TIER_OVERRIDE.get_or_init(|| Mutex::new(None));
     if let Ok(mut g) = cell.lock() {
         *g = Some(t.clone());
@@ -124,8 +160,7 @@ pub fn set_tier(tier: &str) {
     if let Err(e) = crate::config::persist_model_tier(&t) {
         tracing::warn!("OCR: 写入 config.toml 档位失败: {e}（本次运行仍生效）");
     }
-    // 后台确保该档位模型就绪（缺啥自动下载，可被 engine 取消，进度上报）
-    background_ensure(&t);
+    Ok(())
 }
 
 /// 当前生效档位：内存覆盖 > config（env OCR_MODEL_TIER > ocr.model_tier > small）。
@@ -432,31 +467,6 @@ fn ensure_models_impl(
     }
     Ok(out)
 }
-
-/// 切换档位后的后台模型确保：缺啥自动下载，可被 engine 取消。
-/// 与手动「重新下载」走同一套下载实现（download_one + 下载锁 + 进度上报）。
-fn background_ensure(tier: &str) {
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Ok(mut cell) = download_task_cell().lock() {
-        *cell = Some(DownloadTask { cancel: cancel.clone() });
-    }
-    let cache_dir = crate::config::ocr_cache_dir();
-    let tier = tier.to_string();
-    let cancel_for_task = cancel.clone();
-    std::thread::spawn(move || {
-        let result = ensure_models_impl(&cache_dir, Some(&cancel_for_task));
-        if let Ok(mut cell) = download_task_cell().lock() {
-            if cell.as_ref().map(|t| std::sync::Arc::ptr_eq(&t.cancel, &cancel_for_task)).unwrap_or(false) {
-                *cell = None;
-            }
-        }
-        match result {
-            Ok(_) => tracing::info!("OCR: 档位 {tier} 模型就绪"),
-            Err(e) => tracing::warn!("OCR: 档位 {tier} 模型就绪检查失败: {e}"),
-        }
-    });
-}
-
 
 /// 获取（或懒初始化）识别引擎。模型路径来自缓存目录。
 pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {

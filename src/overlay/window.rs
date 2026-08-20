@@ -5184,12 +5184,15 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
 /// 下载期间由打开处的定时器驱动重绘。
 pub struct OcrModelsView {
     focus_handle: FocusHandle,
+    /// 最近一次激活失败的提示（档位, 原因）；None=无错误
+    activation_error: Option<(String, String)>,
 }
 
 impl OcrModelsView {
     fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            activation_error: None,
         }
     }
 }
@@ -5305,8 +5308,17 @@ impl Render for OcrModelsView {
                                     .label("激活")
                                     .with_variant(ButtonVariant::Success)
                                     .with_size(gpui_component::Size::XSmall)
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        crate::ocr::paddle::set_tier(&tier);
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        match crate::ocr::paddle::set_tier(&tier) {
+                                            Ok(()) => {
+                                                this.activation_error = None;
+                                                tracing::info!("OCR: 已激活档位 {tier}");
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("OCR: 激活 {tier} 失败: {e}");
+                                                this.activation_error = Some((tier.clone(), e));
+                                            }
+                                        }
                                         cx.notify();
                                     }))
                             }
@@ -5360,6 +5372,29 @@ impl Render for OcrModelsView {
                     )
                     .children(tier_blocks)
                     // 下载进度 / 最近结果
+                    // 激活失败提示（模型文件不齐全时显示）
+                    .child(if let Some((t, msg)) = &self.activation_error {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(gpui::rgba(0xEF535088))
+                            .bg(gpui::rgba(0xEF535020))
+                            .child(
+                                div()
+                                    .text_color(gpui::rgba(0xEF5350FF))
+                                    .text_xs()
+                                    .child(gpui::SharedString::from(format!(
+                                        "{t} 激活失败：{msg}"
+                                    ))),
+                            )
+                    } else {
+                        div()
+                    })
                     .child(if downloading {
                         let pct_text = match (done, total) {
                             (d, Some(t)) if t > 0 => format!(
