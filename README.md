@@ -24,17 +24,23 @@ cargo build --release
 
 ## OCR 模型
 
-识别引擎为 **PaddleOCR PP-OCRv6 medium**（ONNX 格式，检测 62 MB + 识别 76 MB），
-首次使用 OCR 时自动下载到缓存目录（`~/.cache/screenshot-rs/paddle`）；
-也支持本地放置模型（免下载、离线可用）：
+识别引擎为 **PaddleOCR PP-OCRv6**（ONNX 格式），支持两个档位：
+
+| 档位 | 模型大小 | CPU 速度（14 行代码区）| 准确率 |
+|---|---|---|---|
+| **small（默认）** | ~30 MB | ~0.8s | ~95% |
+| medium | ~132 MB | ~14s | ~99% |
+
+切换档位：`config.toml` 的 `[ocr] model_tier = "small"`（或 `"medium"`），
+也可用环境变量 `OCR_MODEL_TIER`。首次使用 OCR 时自动下载模型到缓存目录
+（`~/.cache/screenshot-rs/paddle`）；也支持本地放置模型（免下载、离线可用）：
 
 ```bash
 mkdir -p models/PP-OCRv6
-# 放入三个文件（可从 https://github.com/GreatV/oar-ocr/releases 或 ModelScope
-# https://modelscope.cn/models/RapidAI/RapidOCR 下载）：
-#   pp-ocrv6_medium_det.onnx   检测模型
-#   pp-ocrv6_medium_rec.onnx   识别模型
-#   ppocrv6_dict.txt           词典（18708 字符）
+# 放入三个文件（small 档示例；可从 https://github.com/GreatV/oar-ocr/releases 下载）：
+#   pp-ocrv6_small_det.onnx   检测模型（9.4 MB）
+#   pp-ocrv6_small_rec.onnx   识别模型（21 MB）
+#   ppocrv6_dict.txt          词典（18708 字符）
 ```
 
 模型查找顺序：`OCR_MODEL_DIR` 环境变量 / 配置 `ocr.model_dir` →

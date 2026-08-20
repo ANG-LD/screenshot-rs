@@ -14,11 +14,16 @@
 
 [ocr]
 
+# 模型档位：small（默认）或 medium。
+# small ≈30MB：CPU 上快（代码区 14 行实测 0.77s），准确率 ~95%。
+# medium ≈132MB：准确率更高（~99%），但 CPU 上多行场景慢（~14s）。
+# 也可用环境变量 OCR_MODEL_TIER 覆盖。
+# model_tier = "small"
+
 # PaddleOCR 模型目录。指定后直接使用该目录下的模型文件（不再自动下载）。
-# 目录需包含三个文件：
-#   pp-ocrv6_medium_det.onnx   （检测模型，约 62 MB）
-#   pp-ocrv6_medium_rec.onnx   （识别模型，约 76 MB）
-#   ppocrv6_dict.txt           （词典，18708 字符）
+# 目录需包含三个文件（文件名随档位）：
+#   small: pp-ocrv6_small_det.onnx / pp-ocrv6_small_rec.onnx / ppocrv6_dict.txt
+#   medium: pp-ocrv6_medium_det.onnx / pp-ocrv6_medium_rec.onnx / ppocrv6_dict.txt
 # 也可用环境变量 OCR_MODEL_DIR 覆盖。
 # 不填则依次查找：项目内 models/PP-OCRv6 → 缓存目录（自动下载）。
 # model_dir = "/data/PP-OCRv6"

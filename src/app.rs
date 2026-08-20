@@ -30,19 +30,17 @@ impl AppState {
         // 预热配置（OCR 插件/下载路径），静默读取，失败不阻塞启动
         let _ = crate::config::config();
 
-        Ok(Self {
+        let state = Self {
             capture: platform_capture(),
             clipboard: ClipboardService::new(),
             hotkey: HotkeyService::new()?,
             tray: TrayService::new()?,
             overlay: OverlayService::new(),
-        })
-        .map(|state| {
-            // OCR 引擎后台预加载：模型不存在则自动下载，全程不阻塞 UI。
-            // 加载完成后首次 OCR 无需等待（引擎为全局单例，之后每次复用）。
-            crate::ocr::paddle::preload();
-            state
-        })
+        };
+        // OCR 引擎后台预加载：模型不存在则自动下载，全程不阻塞 UI。
+        // 加载完成后首次 OCR 无需等待（引擎为全局单例，之后每次复用）。
+        crate::ocr::paddle::preload();
+        Ok(state)
     }
 
     /// 主事件循环（MVP 简化版）

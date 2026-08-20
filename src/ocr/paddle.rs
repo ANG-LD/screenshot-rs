@@ -16,10 +16,24 @@ use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
 /// 引擎通过 `Box::leak` 提升为 `'static`（程序生命周期内常驻，不释放）。
 static ENGINE: OnceLock<Mutex<Option<&'static OAROCR>>> = OnceLock::new();
 
-/// 模型文件名（oar-ocr v0.7.0 release 的 PP-OCRv6 medium 档，检测 + 识别约 132 MB）
-pub const MODEL_DET: &str = "pp-ocrv6_medium_det.onnx";
-pub const MODEL_REC: &str = "pp-ocrv6_medium_rec.onnx";
-pub const MODEL_DICT: &str = "ppocrv6_dict.txt";
+/// 模型档位 → 模型文件名（oar-ocr v0.7.0 release 资产）。
+/// small ≈30MB（det 9.4MB + rec 21MB + dict 75KB，CPU 快）；
+/// medium ≈132MB（det 62MB + rec 76MB，准确率更高但 CPU 慢）。
+/// 档位由 `config::ocr_model_tier()` 决定（env OCR_MODEL_TIER > 配置 > 默认 small）。
+fn model_names() -> [&'static str; 3] {
+    match crate::config::ocr_model_tier().as_str() {
+        "medium" => [
+            "pp-ocrv6_medium_det.onnx",
+            "pp-ocrv6_medium_rec.onnx",
+            "ppocrv6_dict.txt",
+        ],
+        _ => [
+            "pp-ocrv6_small_det.onnx",
+            "pp-ocrv6_small_rec.onnx",
+            "ppocrv6_dict.txt",
+        ],
+    }
+}
 
 /// 模型下载基址。注意：必须固定 v0.7.0 —— `latest` 指向 v0.9.2，但该
 /// release 不带模型资产（404）；v0.7.0 起所有模型资产齐全（已逐一验证 HTTP 200）。
@@ -32,27 +46,29 @@ const MODEL_BASE_URL: &str = "https://github.com/GreatV/oar-ocr/releases/downloa
 /// 2. 项目内 `models/PP-OCRv6`（开发者放置，相对当前工作目录）；
 /// 3. 缓存目录：文件存在则用，否则从 GitHub 自动下载。
 pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
+    let [det, rec, dict] = model_names();
+    let tier = crate::config::ocr_model_tier();
     for dir in crate::config::ocr_model_dir()
         .into_iter()
         .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
     {
-        let paths = [dir.join(MODEL_DET), dir.join(MODEL_REC), dir.join(MODEL_DICT)];
+        let paths = [dir.join(det), dir.join(rec), dir.join(dict)];
         if paths.iter().all(|p| p.exists()) {
-            tracing::info!("OCR: 使用本地模型目录 {}", dir.display());
+            tracing::info!("OCR: 使用本地模型目录 {}（档位 {tier}）", dir.display());
             return Ok(paths);
         }
         tracing::warn!(
             "OCR: 模型目录 {} 缺少文件（需要 {}/{}/{}），继续查找",
             dir.display(),
-            MODEL_DET,
-            MODEL_REC,
-            MODEL_DICT
+            det,
+            rec,
+            dict
         );
     }
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
-    let mut out = [cache_dir.join(MODEL_DET), cache_dir.join(MODEL_REC), cache_dir.join(MODEL_DICT)];
-    for (path, name) in out.iter_mut().zip([MODEL_DET, MODEL_REC, MODEL_DICT]) {
+    let mut out = [cache_dir.join(det), cache_dir.join(rec), cache_dir.join(dict)];
+    for (path, name) in out.iter_mut().zip([det, rec, dict]) {
         if !path.exists() {
             let url = format!("{MODEL_BASE_URL}/{name}");
             tracing::info!("OCR: 下载模型 {name} ← {url}");
@@ -89,10 +105,10 @@ pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
             box_threshold: 0.45,
             unclip_ratio: 1.4,
             max_candidates: 3000,
-            // det 默认 limit_side_len=960：任何输入都 resize 到最长边 960 推理，
-            // 屏幕截图小区域也付出全尺寸检测成本（实测固定 ~1.4s）。
-            // 640 按面积算约快 2.2 倍；文本 ≥16px 时检测精度不受影响。
-            limit_side_len: Some(480),
+            // det 最长边 960：低于此值时屏幕小字号文本会被过度缩小导致漏检
+            // （实测 480 时 1191px 宽图文本行缩到 6px，small det 漏检 1/3）。
+            // 960 保精度：det 推理 ~300ms，配合 small rec 总耗时仍 <800ms。
+            limit_side_len: Some(960),
             limit_type: Some(LimitType::Max),
             ..Default::default()
         })
@@ -105,6 +121,10 @@ pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
                 )
                 .with_intra_threads(6),
         )
+        // rec 批大小：batch 张量宽度取组内最大行宽，一行超宽行会撑大整组
+        // 导致窄行也被 padding 浪费计算（medium 下实测 batch8=17.6s,
+        // batch4=15.8s, batch1=13.9s）→ 用 1 最小化 padding。
+        .region_batch_size(1)
         .build()
         .map_err(|e| format!("初始化 PaddleOCR 引擎失败: {e}"))?;
         *guard = Some(Box::leak(Box::new(ocr)));

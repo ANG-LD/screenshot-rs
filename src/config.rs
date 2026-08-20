@@ -24,6 +24,8 @@ pub struct OcrConfig {
     pub cache_dir: Option<PathBuf>,
     /// PaddleOCR 模型目录（显式指定后不自动下载，直接使用目录下的模型文件）
     pub model_dir: Option<PathBuf>,
+    /// 模型档位：small（默认，~30MB，CPU 快）或 medium（~132MB，准确率更高但慢）
+    pub model_tier: Option<String>,
 }
 
 static CONFIG: Lazy<Config> = Lazy::new(load_quiet);
@@ -97,6 +99,18 @@ pub fn ocr_model_dir() -> Option<PathBuf> {
     env_path("OCR_MODEL_DIR")
         .or_else(|| config().ocr.model_dir.clone())
         .map(expand_home)
+}
+
+/// 模型档位：env `OCR_MODEL_TIER` > 配置 `ocr.model_tier` > 默认 "small"。
+/// small ≈30MB（CPU 上快 ~18 倍，代码区实测 0.77s vs medium 13.9s）；
+/// medium ≈132MB（准确率更高，但 CPU 上多行场景过慢）。
+pub fn ocr_model_tier() -> String {
+    std::env::var("OCR_MODEL_TIER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config().ocr.model_tier.clone())
+        .unwrap_or_else(|| "small".to_string())
+        .to_ascii_lowercase()
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
