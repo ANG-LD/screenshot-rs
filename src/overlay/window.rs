@@ -5206,6 +5206,7 @@ impl Render for OcrModelsView {
         let snap: ModelSnapshot = crate::ocr::paddle::model_snapshot();
         let downloading = snap.downloading;
         let downloading_tier = snap.downloading_tier.clone();
+        let batch_download = snap.batch_download;
         let current_file = snap.current_file.clone();
         let (done, total) = snap.progress;
         let pct = total
@@ -5219,12 +5220,18 @@ impl Render for OcrModelsView {
             let tier = t.tier.clone();
             let selected = t.selected;
             let note = t.note.clone();
-            // 只有「正在下载的档位」显示下载中；其他档位按钮保持可点
-            let busy = downloading && downloading_tier.as_deref() == Some(tier.as_str());
+            // 只有「本档整档下载中」才置按钮为下载中；其他档位按钮保持可点
+            let busy = downloading
+                && batch_download
+                && downloading_tier.as_deref() == Some(tier.as_str());
+            // 本档三件套是否全部就绪：决定整档按钮显示「重新下载」还是「批量下载」
+            let all_ready = t.files.iter().all(|f| matches!(f.status, FileStatus::Ready));
             // file_rows 闭包持有档位名/弱引用/下载状态的独立副本，避免与外层借用冲突
             let file_rows_tier = tier.clone();
             let file_rows_weak = self.weak.clone();
             let file_rows_current_file = current_file.clone();
+            let file_rows_downloading_tier = downloading_tier.clone();
+            let file_rows_batch = batch_download;
             let file_rows = t.files.iter().map(move |f| {
                 // 正在下载的文件行状态置为「下载中…」
                 let (mark, mark_color) = if downloading
@@ -5251,6 +5258,25 @@ impl Render for OcrModelsView {
                 let url = f.url.clone();
                 let tier_for_btn = file_rows_tier.clone();
                 let name_for_btn = f.name.to_string();
+                // 单文件按钮状态：只有正在下载的这个按钮变「下载中…」，其他保持原样。
+                // 未下载=「下载」；已存在=「重新下载」。
+                let file_busy = downloading
+                    && !file_rows_batch
+                    && file_rows_downloading_tier.as_deref() == Some(file_rows_tier.as_str())
+                    && file_rows_current_file.as_deref() == Some(f.name);
+                let file_ready = matches!(f.status, FileStatus::Ready);
+                let file_label = if file_busy {
+                    "下载中…"
+                } else if file_ready {
+                    "重新下载"
+                } else {
+                    "下载"
+                };
+                let file_variant = if file_busy {
+                    ButtonVariant::Default
+                } else {
+                    ButtonVariant::Info
+                };
                 div()
                     .flex_col()
                     .gap(px(1.0))
@@ -5264,14 +5290,12 @@ impl Render for OcrModelsView {
                             .child(div().text_color(mark_color).text_sm().child(gpui::SharedString::from(mark)))
                             .child(div().flex_1().text_sm().child(gpui::SharedString::from(f.name)))
                             .child(div().text_color(gpui::rgba(0x9E9E9EFF)).text_xs().child(gpui::SharedString::from(size_text)))
-                            // 单文件下载按钮：只补这一个文件（已存在则跳过），
-                            // 避免整档重下时已成功的文件被重新下载
                             .child(
                                 Button::new(format!("dl-file-{file_rows_tier}-{name_for_btn}"))
-                                    .label("下载")
-                                    .with_variant(ButtonVariant::Info)
+                                    .label(file_label)
+                                    .with_variant(file_variant)
                                     .with_size(gpui_component::Size::XSmall)
-                                    .disabled(downloading)
+                                    .disabled(file_busy)
                                     .on_click({
                                         let weak = file_rows_weak.clone();
                                         move |_, _, app| {
@@ -5387,10 +5411,17 @@ impl Render for OcrModelsView {
                                 })
                             }
                         })
-                        // 重新下载（蓝色；下载中禁用变灰）
+                        // 整档按钮：全部存在=「重新下载」(全部重下)；有缺失=「批量下载」(只补缺失)；
+                        // 本档整档下载中才变「下载中…」
                         .child(
                             Button::new(format!("dl-{tier}"))
-                                .label(if busy { "下载中…" } else { "重新下载" })
+                                .label(if busy {
+                                    "下载中…"
+                                } else if all_ready {
+                                    "重新下载"
+                                } else {
+                                    "批量下载"
+                                })
                                 .with_variant(if busy {
                                     ButtonVariant::Default
                                 } else {

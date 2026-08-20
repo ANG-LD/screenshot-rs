@@ -70,6 +70,8 @@ pub struct ModelSnapshot {
     pub downloading: bool,
     /// 正在下载的档位（None=无；供 UI 只把对应档位按钮置为「下载中」）
     pub downloading_tier: Option<String>,
+    /// true=整档下载中；false=单文件下载中（供 UI 区分按钮「下载中」归属）
+    pub batch_download: bool,
     /// 正在下载的文件名（供 UI 把对应文件行状态置为「下载中」）
     pub current_file: Option<String>,
     /// 当前文件下载进度（已下载字节, 总字节）
@@ -81,6 +83,8 @@ pub struct ModelSnapshot {
 /// 全局模型管理状态（下载线程与 UI 线程共享）
 struct ModelManagerState {
     downloading: bool,
+    /// true=整档下载（批量/重新下载）；false=单文件下载
+    batch: bool,
     /// 正在下载的档位（None=无下载任务；供 UI 区分各档位按钮状态）
     current_tier: Option<String>,
     /// 当前文件进度
@@ -97,6 +101,7 @@ fn manager() -> &'static Mutex<ModelManagerState> {
     MANAGER.get_or_init(|| {
         Mutex::new(ModelManagerState {
             downloading: false,
+            batch: false,
             current_tier: None,
             progress: (0, None),
             current_file: String::new(),
@@ -273,6 +278,7 @@ pub fn model_snapshot() -> ModelSnapshot {
             .collect(),
         downloading: state.downloading,
         downloading_tier: state.current_tier.clone(),
+        batch_download: state.batch,
         current_file: if state.downloading { Some(state.current_file.clone()) } else { None },
         progress: state.progress,
         last_download: state.last_download.clone(),
@@ -374,7 +380,13 @@ pub fn start_download(tier: &str) -> Result<(), String> {
     if g.downloading {
         return Err("已有下载任务进行中".into());
     }
+    // 全部存在 → 重新下载（覆盖全部）；有缺失 → 批量下载（只补缺失）
+    let cache_dir = crate::config::ocr_cache_dir();
+    let all_exist = model_names_for_tier(tier)
+        .iter()
+        .all(|n| cache_dir.join(n).exists());
     g.downloading = true;
+    g.batch = true;
     g.current_tier = Some(tier.to_string());
     g.progress = (0, None);
     g.last_download = None;
@@ -384,11 +396,10 @@ pub fn start_download(tier: &str) -> Result<(), String> {
     if let Ok(mut cell) = download_task_cell().lock() {
         *cell = Some(DownloadTask { cancel: cancel.clone() });
     }
-    let cache_dir = crate::config::ocr_cache_dir();
     let tier = tier.to_string();
     let cancel_for_task = cancel.clone();
     std::thread::spawn(move || {
-        let result = download_tier_force(&tier, &cache_dir, Some(&cancel_for_task));
+        let result = download_tier_force(&tier, &cache_dir, Some(&cancel_for_task), all_exist);
         // 任务结束：若仍是自己的注册则清空（engine 取消时已 take，这里不再覆盖）
         if let Ok(mut cell) = download_task_cell().lock() {
             if cell.as_ref().map(|t| std::sync::Arc::ptr_eq(&t.cancel, &cancel_for_task)).unwrap_or(false) {
@@ -404,11 +415,13 @@ pub fn start_download(tier: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 强制下载指定档位三件套到缓存目录（带逐块进度上报与取消检查）。
+/// 下载指定档位三件套到缓存目录（带逐块进度上报与取消检查）。
+/// `force=true`：全部重新下载（覆盖已有文件）；`force=false`：只下载缺失文件。
 fn download_tier_force(
     tier: &str,
     cache_dir: &Path,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    force: bool,
 ) -> Result<(), String> {
     let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
     let names = model_names_for_tier(tier);
@@ -419,8 +432,8 @@ fn download_tier_force(
         if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
             return Err("下载已取消".into());
         }
-        // 已存在的文件跳过：只补缺失/失败的，避免每次重下全部三件套
-        if cache_dir.join(name).exists() {
+        // 非强制模式：已存在的文件跳过，只补缺失/失败的
+        if !force && cache_dir.join(name).exists() {
             tracing::info!("OCR: {name} 已存在，跳过");
             continue;
         }
@@ -437,6 +450,7 @@ pub fn start_download_file(tier: &str, name: &str) -> Result<(), String> {
         return Err("已有下载任务进行中".into());
     }
     g.downloading = true;
+    g.batch = false;
     g.current_tier = Some(tier.to_string());
     g.current_file = name.to_string();
     g.progress = (0, None);
@@ -453,9 +467,7 @@ pub fn start_download_file(tier: &str, name: &str) -> Result<(), String> {
     std::thread::spawn(move || {
         let result = (|| {
             let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
-            if cache_dir.join(&name).exists() {
-                return Ok(());
-            }
+            // 总是下载该文件（已存在则覆盖，即「重新下载」语义）
             download_one(&name, &cache_dir, Some(&cancel_for_task))
         })();
         if let Ok(mut cell) = download_task_cell().lock() {
