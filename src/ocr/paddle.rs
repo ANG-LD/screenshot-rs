@@ -5,6 +5,7 @@
 //! `oar-ocr` 驱动（ONNX Runtime，构建时由 `download-binaries` feature
 //! 下载 CPU 版运行时）。
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -16,12 +17,85 @@ use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
 /// 引擎通过 `Box::leak` 提升为 `'static`（程序生命周期内常驻，不释放）。
 static ENGINE: OnceLock<Mutex<Option<&'static OAROCR>>> = OnceLock::new();
 
+// ---------------------------------------------------------------------------
+// 模型管理：状态快照 + 进度感知下载（供托盘「OCR 模型管理」窗口展示/重下）
+// ---------------------------------------------------------------------------
+
+/// 单个模型文件的本地状态
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileStatus {
+    /// 已找到本地文件（显式目录 / 项目 models / 缓存）
+    Ready,
+    /// 本地不存在（可下载）
+    Missing,
+    /// 正在下载
+    Downloading,
+    /// 下载失败
+    Error(String),
+}
+
+/// 单个模型文件的展示信息
+#[derive(Debug, Clone)]
+pub struct ModelFileInfo {
+    pub name: &'static str,
+    pub url: String,
+    /// 找到的本地路径（仅 Ready 时有值）
+    pub local_path: Option<PathBuf>,
+    /// 本地文件大小（仅 Ready 时有值）
+    pub size: Option<u64>,
+    pub status: FileStatus,
+}
+
+/// 模型下载/管理的整体状态快照（窗口每次刷新重新计算）
+#[derive(Debug, Clone)]
+pub struct ModelSnapshot {
+    /// 当前档位（config 解析结果）
+    pub tier: String,
+    /// 档位说明
+    pub tier_note: String,
+    /// 模型下载基址
+    pub base_url: String,
+    /// 缓存目录
+    pub cache_dir: PathBuf,
+    /// 三件套文件状态（检测 / 识别 / 词典）
+    pub files: Vec<ModelFileInfo>,
+    /// 是否有下载任务进行中
+    pub downloading: bool,
+    /// 当前文件下载进度（已下载字节, 总字节）
+    pub progress: (u64, Option<u64>),
+    /// 最近一次下载结果（None=尚无下载动作）
+    pub last_download: Option<Result<(), String>>,
+}
+
+/// 全局模型管理状态（下载线程与 UI 线程共享）
+struct ModelManagerState {
+    downloading: bool,
+    /// 当前文件进度
+    progress: (u64, Option<u64>),
+    /// 当前下载的文件名
+    current_file: String,
+    /// 最近一次下载结果
+    last_download: Option<Result<(), String>>,
+}
+
+static MANAGER: OnceLock<Mutex<ModelManagerState>> = OnceLock::new();
+
+fn manager() -> &'static Mutex<ModelManagerState> {
+    MANAGER.get_or_init(|| {
+        Mutex::new(ModelManagerState {
+            downloading: false,
+            progress: (0, None),
+            current_file: String::new(),
+            last_download: None,
+        })
+    })
+}
+
 /// 模型档位 → 模型文件名（oar-ocr v0.7.0 release 资产）。
 /// small ≈30MB（det 9.4MB + rec 21MB + dict 75KB，CPU 快）；
 /// medium ≈132MB（det 62MB + rec 76MB，准确率更高但 CPU 慢）。
-/// 档位由 `config::ocr_model_tier()` 决定（env OCR_MODEL_TIER > 配置 > 默认 small）。
-fn model_names() -> [&'static str; 3] {
-    match crate::config::ocr_model_tier().as_str() {
+fn model_names_for_tier(tier: &str) -> [&'static str; 3] {
+    match tier {
         "medium" => [
             "pp-ocrv6_medium_det.onnx",
             "pp-ocrv6_medium_rec.onnx",
@@ -35,9 +109,148 @@ fn model_names() -> [&'static str; 3] {
     }
 }
 
+/// 档位说明（供窗口展示）
+fn tier_note(tier: &str) -> String {
+    match tier {
+        "medium" => "medium ≈132MB：准确率更高，但 CPU 上多行场景慢（~14s）".into(),
+        _ => "small ≈30MB：CPU 快（代码区 ~0.8s），准确率 ~95%".into(),
+    }
+}
+
+/// 当前档位（config 解析）
+fn model_names() -> [&'static str; 3] {
+    model_names_for_tier(&crate::config::ocr_model_tier())
+}
+
 /// 模型下载基址。注意：必须固定 v0.7.0 —— `latest` 指向 v0.9.2，但该
 /// release 不带模型资产（404）；v0.7.0 起所有模型资产齐全（已逐一验证 HTTP 200）。
 const MODEL_BASE_URL: &str = "https://github.com/GreatV/oar-ocr/releases/download/v0.7.0";
+
+/// 收集模型管理快照：按档位扫描本地查找位置，报告每个文件的状态。
+pub fn model_snapshot() -> ModelSnapshot {
+    let tier = crate::config::ocr_model_tier();
+    let names = model_names_for_tier(&tier);
+    let cache_dir = crate::config::ocr_cache_dir();
+    let state = manager()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let snapshot = ModelSnapshot {
+        tier: tier.clone(),
+        tier_note: tier_note(&tier),
+        base_url: MODEL_BASE_URL.to_string(),
+        cache_dir: cache_dir.clone(),
+        files: names
+            .iter()
+            .map(|name| {
+                // 查找顺序：显式目录 → 项目 models/PP-OCRv6 → 缓存
+                let mut local = None;
+                for dir in crate::config::ocr_model_dir()
+                    .into_iter()
+                    .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
+                    .chain(std::iter::once(cache_dir.clone()))
+                {
+                    let p = dir.join(name);
+                    if p.exists() {
+                        local = Some(p);
+                        break;
+                    }
+                }
+                let (status, size) = match &local {
+                    Some(p) => match p.metadata() {
+                        Ok(md) => (FileStatus::Ready, Some(md.len())),
+                        Err(_) => (FileStatus::Error("无法读取文件信息".into()), None),
+                    },
+                    None => (FileStatus::Missing, None),
+                };
+                ModelFileInfo {
+                    name,
+                    url: format!("{MODEL_BASE_URL}/{name}"),
+                    local_path: local,
+                    size,
+                    status,
+                }
+            })
+            .collect(),
+        downloading: state.downloading,
+        progress: state.progress,
+        last_download: state.last_download.clone(),
+    };
+    snapshot
+}
+
+/// 更新下载进度（下载循环每块调用；UI 线程读取）
+fn update_progress(name: &str, downloaded: u64, total: Option<u64>) {
+    if let Ok(mut g) = manager().lock() {
+        g.current_file = name.to_string();
+        g.progress = (downloaded, total);
+    }
+}
+
+/// 后台强制重新下载指定档位模型到缓存目录（已存在也覆盖，供「重新下载」）。
+/// 进度写入全局状态，UI 轮询 `model_snapshot()` 展示。返回后 `last_download`
+/// 记录结果。
+pub fn start_download(tier: &str) -> Result<(), String> {
+    let mut g = manager().lock().map_err(|_| "模型管理锁失效".to_string())?;
+    if g.downloading {
+        return Err("已有下载任务进行中".into());
+    }
+    g.downloading = true;
+    g.progress = (0, None);
+    g.last_download = None;
+    drop(g);
+
+    let cache_dir = crate::config::ocr_cache_dir();
+    let tier = tier.to_string();
+    std::thread::spawn(move || {
+        let result = download_tier_force(&tier, &cache_dir);
+        if let Ok(mut g) = manager().lock() {
+            g.downloading = false;
+            g.last_download = Some(result);
+        }
+    });
+    Ok(())
+}
+
+/// 强制下载指定档位三件套到缓存目录（带逐块进度上报）。
+fn download_tier_force(tier: &str, cache_dir: &Path) -> Result<(), String> {
+    let names = model_names_for_tier(tier);
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
+    for name in names {
+        let dest = cache_dir.join(name);
+        let url = format!("{MODEL_BASE_URL}/{name}");
+        tracing::info!("OCR: 下载模型 {name} ← {url}");
+        let resp = ureq::get(&url)
+            .call()
+            .map_err(|e| format!("下载模型 {name} 失败: {e}"))?;
+        let total = resp
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok());
+        let mut reader = resp.into_reader();
+        let tmp = cache_dir.join(format!("{name}.part"));
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut downloaded: u64 = 0;
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("读取模型 {name} 失败: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
+            downloaded += n as u64;
+            update_progress(name, downloaded, total);
+        }
+        std::fs::rename(&tmp, &dest)
+            .map_err(|e| format!("移动模型 {name} 失败: {e}"))?;
+        tracing::info!("OCR: 模型 {name} 下载完成（{} 字节）", downloaded);
+        update_progress(name, downloaded, total);
+    }
+    Ok(())
+}
 
 /// 返回模型三件套路径。
 ///
@@ -70,17 +283,33 @@ pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
     let mut out = [cache_dir.join(det), cache_dir.join(rec), cache_dir.join(dict)];
     for (path, name) in out.iter_mut().zip([det, rec, dict]) {
         if !path.exists() {
+            // 下载（带进度上报，模型管理窗口可见）
             let url = format!("{MODEL_BASE_URL}/{name}");
             tracing::info!("OCR: 下载模型 {name} ← {url}");
             let resp = ureq::get(&url)
                 .call()
                 .map_err(|e| format!("下载模型 {name} 失败: {e}"))?;
+            let total = resp
+                .header("Content-Length")
+                .and_then(|s| s.parse::<u64>().ok());
             let mut reader = resp.into_reader();
             let tmp = cache_dir.join(format!("{name}.part"));
             let mut file = std::fs::File::create(&tmp)
                 .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
-            std::io::copy(&mut reader, &mut file)
-                .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
+            let mut buf = vec![0u8; 128 * 1024];
+            let mut downloaded: u64 = 0;
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| format!("读取模型 {name} 失败: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .map_err(|e| format!("写入模型 {name} 失败: {e}"))?;
+                downloaded += n as u64;
+                update_progress(name, downloaded, total);
+            }
             std::fs::rename(&tmp, path)
                 .map_err(|e| format!("移动模型 {name} 失败: {e}"))?;
             tracing::info!("OCR: 模型 {name} 下载完成");

@@ -91,6 +91,10 @@ impl AppState {
                         tracing::info!("托盘触发：退出");
                         return Ok(());
                     }
+                    TrayMenuEvent::OpenOcrModels => {
+                        tracing::info!("托盘触发：打开 OCR 模型管理窗口");
+                        self.overlay.open_ocr_models();
+                    }
                 }
             }
 

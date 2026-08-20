@@ -4172,6 +4172,8 @@ enum OverlayCommand {
     },
     /// 在同一个 GPUI 应用里打开 Pin 窗口
     OpenPin(PinPayload),
+    /// 打开 OCR 模型管理窗口（查看模型状态 / 重新下载 / 进度）
+    OpenOcrModels,
     /// 打开滚动截屏进度小窗（cancel/progress 由主线程与 GPUI 线程共享原子）
     ShowProgress {
         cancel: Arc<AtomicBool>,
@@ -4237,6 +4239,11 @@ impl OverlayService {
     /// 在同一个 GPUI 应用里打开 Pin 窗口（fire-and-forget）。
     pub fn open_pin(&self, payload: PinPayload) {
         let _ = self.cmd.send(OverlayCommand::OpenPin(payload));
+    }
+
+    /// 打开 OCR 模型管理窗口（fire-and-forget）。
+    pub fn open_ocr_models(&self) {
+        let _ = self.cmd.send(OverlayCommand::OpenOcrModels);
     }
 
     /// 打开自动滚动截屏进度小窗（主线程调用，不阻塞）
@@ -4394,6 +4401,9 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         }
                         Ok(OverlayCommand::OpenPin(payload)) => {
                             let _ = async_cx.update(|cx| open_pin_in_app(payload, cx));
+                        }
+                        Ok(OverlayCommand::OpenOcrModels) => {
+                            let _ = async_cx.update(open_ocr_models_in_app);
                         }
                         Ok(OverlayCommand::ShowProgress { cancel, done, progress: progress_arc, moving, bottom_has_content, confirming, manual, region_px, screen_px }) => {
                             // 先关掉可能残留的旧进度窗
@@ -5163,6 +5173,301 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
         },
     )
     .expect("open pin window failed");
+}
+
+// ---------------------------------------------------------------------------
+// OCR 模型管理窗口：查看本地模型状态 / 远程地址 / 重新下载 / 下载进度
+// ---------------------------------------------------------------------------
+
+/// OCR 模型管理视图：每次 render 从 `paddle::model_snapshot()` 拉最新状态，
+/// 下载期间由打开处的定时器驱动重绘。
+pub struct OcrModelsView {
+    focus_handle: FocusHandle,
+}
+
+impl OcrModelsView {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl Render for OcrModelsView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::ocr::paddle::{FileStatus, ModelSnapshot};
+        let snap: ModelSnapshot = crate::ocr::paddle::model_snapshot();
+        let downloading = snap.downloading;
+        let (done, total) = snap.progress;
+        let pct = total
+            .filter(|t| *t > 0)
+            .map(|t| (done as f64 / t as f64 * 100.0).min(100.0));
+        let tier = snap.tier.clone();
+        let tier_note = snap.tier_note.clone();
+        let cache_dir = snap.cache_dir.display().to_string();
+        let last_download = snap.last_download.clone();
+
+        // 文件行：状态标记 + 文件名 + 大小 + 本地路径
+        let file_rows = snap.files.iter().map(|f| {
+            let (mark, mark_color) = match &f.status {
+                FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
+                FileStatus::Missing => ("未下载", gpui::rgba(0x9E9E9EFF)),
+                FileStatus::Downloading => ("下载中…", gpui::rgba(0x42A5F5FF)),
+                FileStatus::Error(_) => ("失败", gpui::rgba(0xEF5350FF)),
+            };
+            let size_text = f.size.map(|s| format!("{:.1} MB", s as f64 / 1048576.0))
+                .unwrap_or_else(|| "-".into());
+            let path_text = f
+                .local_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "（本地无此文件）".into());
+            let url = f.url.clone();
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p(px(8.0))
+                .rounded_md()
+                .bg(gpui::rgba(0x222222FF))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_color(mark_color)
+                                .text_sm()
+                                .child(gpui::SharedString::from(mark)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .child(gpui::SharedString::from(f.name)),
+                        )
+                        .child(
+                            div()
+                                .text_color(gpui::rgba(0x9E9E9EFF))
+                                .text_xs()
+                                .child(gpui::SharedString::from(size_text)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(gpui::rgba(0x808080FF))
+                        .text_xs()
+                        .child(gpui::SharedString::from(path_text)),
+                )
+                .child(
+                    div()
+                        .text_color(gpui::rgba(0x5C6BC0FF))
+                        .text_xs()
+                        .child(gpui::SharedString::from(url)),
+                )
+        });
+
+        div()
+            .id("ocr-models")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(gpui::rgba(0x181818FF))
+            .text_color(gpui::rgba(0xE6E6E6FF))
+            .track_focus(&self.focus_handle)
+            // 标题栏
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(10.0))
+                    .h(px(36.0))
+                    .border_b_1()
+                    .border_color(gpui::rgba(0x3A3A3AFF))
+                    .child(div().text_sm().child("OCR 模型管理"))
+                    .child(
+                        Button::new("ocr-models-close")
+                            .icon(IconName::Close)
+                            .compact()
+                            .on_click(|_, window, _| window.remove_window()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .p(px(12.0))
+                    // 档位信息
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(gpui::SharedString::from(format!(
+                                        "当前档位：{tier}"
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(gpui::rgba(0x9E9E9EFF))
+                                    .text_xs()
+                                    .child(gpui::SharedString::from(tier_note)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(gpui::rgba(0x808080FF))
+                                    .text_xs()
+                                    .child(gpui::SharedString::from(format!(
+                                        "缓存目录：{cache_dir}"
+                                    ))),
+                            ),
+                    )
+                    // 文件列表
+                    .child(div().flex_col().gap(px(6.0)).children(file_rows))
+                    // 下载进度 / 最近结果
+                    .child(if downloading {
+                        let pct_text = match (done, total) {
+                            (d, Some(t)) if t > 0 => {
+                                format!("{:.0}%  {:.1}/{:.1} MB", pct.unwrap_or(0.0), d as f64 / 1048576.0, t as f64 / 1048576.0)
+                            }
+                            (d, _) => format!("{:.1} MB", d as f64 / 1048576.0),
+                        };
+                        div()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .text_color(gpui::rgba(0x42A5F5FF))
+                                    .text_sm()
+                                    .child(gpui::SharedString::from(format!(
+                                        "正在下载：{pct_text}"
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(gpui::rgba(0x2A2A2AFF))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .rounded_full()
+                                            .w(px(300.0 * pct.unwrap_or(0.0) as f32 / 100.0))
+                                            .bg(gpui::rgba(0x42A5F5FF)),
+                                    ),
+                            )
+                    } else {
+                        div().child(
+                            match &last_download {
+                                Some(Ok(())) => div()
+                                    .text_color(gpui::rgba(0x4CAF50FF))
+                                    .text_sm()
+                                    .child("✓ 最近一次下载完成"),
+                                Some(Err(e)) => div()
+                                    .text_color(gpui::rgba(0xEF5350FF))
+                                    .text_sm()
+                                    .child(gpui::SharedString::from(format!(
+                                        "最近一次下载失败：{e}"
+                                    ))),
+                                None => div()
+                                    .text_color(gpui::rgba(0x808080FF))
+                                    .text_xs()
+                                    .child("未执行过下载（首次使用 OCR 时会自动下载缺失模型）"),
+                            },
+                        )
+                    })
+                    // 按钮行
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("ocr-models-redownload")
+                                    .label(if downloading {
+                                        "下载中…"
+                                    } else {
+                                        "重新下载（当前档位）"
+                                    })
+                                    .on_click(move |_, _, _| {
+                                        let tier = tier.clone();
+                                        match crate::ocr::paddle::start_download(&tier) {
+                                            Ok(()) => {
+                                                tracing::info!("OCR: 开始重新下载模型（{tier}）")
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("OCR: 启动下载失败: {e}")
+                                            }
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("ocr-models-close2")
+                                    .label("关闭")
+                                    .on_click(|_, window, _| window.remove_window()),
+                            ),
+                    ),
+            )
+    }
+}
+
+/// 在常驻应用里打开 OCR 模型管理窗口（屏幕居中，fire-and-forget）。
+fn open_ocr_models_in_app(cx: &mut App) {
+    let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
+        Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: Size::new(px(1280.0), px(800.0)),
+        }
+    });
+    let win_w = 560.0_f32;
+    let win_h = 430.0_f32;
+    let origin = point(
+        px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
+        px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
+    );
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin,
+                size: Size::new(px(win_w), px(win_h)),
+            })),
+            window_background: WindowBackgroundAppearance::Opaque,
+            titlebar: None,
+            kind: WindowKind::Normal,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            focus: true,
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(OcrModelsView::new);
+            // 下载进行中时每 300ms 重绘一次刷新进度；窗口关闭（实体销毁）后退出。
+            let weak = view.downgrade();
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(300))
+                        .await;
+                    let Some(entity) = weak.upgrade() else {
+                        break;
+                    };
+                    entity.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+            let handle = view.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+            view
+        },
+    )
+    .expect("open ocr models window failed");
 }
 
 /// 取窗口的 Win32 HWND（仅 Windows；非 Win32 句柄返回 None）。

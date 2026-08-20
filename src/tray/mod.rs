@@ -53,6 +53,8 @@ fn load_tray_icon_rgba() -> AppResult<Vec<u8>> {
 pub enum TrayMenuEvent {
     /// 用户点击了「截图」菜单项，触发与全局热键 Alt+S 相同的区域截图流程。
     TriggerScreenshot,
+    /// 用户点击了「OCR 模型管理」菜单项，打开模型管理窗口。
+    OpenOcrModels,
     /// 用户点击了「退出」菜单项，请求结束应用。
     Quit,
 }
@@ -95,10 +97,13 @@ impl TrayService {
         // `MenuItem::new` 的第三个参数是 `Option<Accelerator>`（快捷键文本），
         // 我们不需要全局快捷键（已有 alt+s），传 `None` 即可。
         let screenshot_item = MenuItem::new("截图", true, None);
+        let ocr_models_item = MenuItem::new("OCR 模型管理…", true, None);
         let quit_item = MenuItem::new("退出", true, None);
 
         // 将菜单项追加到菜单。`append` 在 Linux GTK 初始化失败时返回错误。
         menu.append(&screenshot_item)
+            .map_err(|e| AppError::Tray(e.to_string()))?;
+        menu.append(&ocr_models_item)
             .map_err(|e| AppError::Tray(e.to_string()))?;
         menu.append(&quit_item)
             .map_err(|e| AppError::Tray(e.to_string()))?;
@@ -124,6 +129,7 @@ impl TrayService {
         // 这里使用 clone 而不是引用，是因为 MenuItem 内部 id 是 Rc<MenuId>，
         // 而我们这里 clone 出独立的 MenuId 用于线程间比较。
         let screenshot_id = screenshot_item.id().clone();
+        let ocr_models_id = ocr_models_item.id().clone();
         let quit_id = quit_item.id().clone();
 
         // 启动后台监听线程：不断轮询 tray-icon 的全局 MenuEvent 通道，
@@ -137,6 +143,8 @@ impl TrayService {
                     if event.id == screenshot_id {
                         // 忽略发送失败（主应用可能已退出）
                         let _ = event_tx.send(TrayMenuEvent::TriggerScreenshot);
+                    } else if event.id == ocr_models_id {
+                        let _ = event_tx.send(TrayMenuEvent::OpenOcrModels);
                     } else if event.id == quit_id {
                         let _ = event_tx.send(TrayMenuEvent::Quit);
                     }
