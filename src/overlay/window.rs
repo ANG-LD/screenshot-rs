@@ -2441,21 +2441,10 @@ fn run_ocr_sync(
         }
     }
 
-    // PP-OCR 检测器按 ~32px 高的文本行训练，屏幕截图 1x 文本偏小，中英混排/
-    // 小字号极易漏检。放大到长边 ≤4096px（最多 3 倍）能显著提升识别率。
-    let upscale = (4096u32 / w.max(h).max(1)).clamp(1, 3);
-    let src =
-        image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| image::RgbImage::new(w, h));
-    let up = if upscale > 1 {
-        image::imageops::resize(
-            &src,
-            w.saturating_mul(upscale).max(1),
-            h.saturating_mul(upscale).max(1),
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        src
-    };
+    // 注意：不再放大。PaddleOCR 检测器内部会把输入 resize 到
+    // limit_side_len（480）再推理，放大只会增加内存/耗时、无识别收益
+    // （实测放大 2 倍识别结果与耗时均无变化）。
+    let up = image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| image::RgbImage::new(w, h));
 
     // 写入预处理后的调试 PNG（用系统临时目录，Linux 的 /tmp 在 Windows/macOS 上不存在）
     let debug_path = std::env::temp_dir().join("screenshot_ocr_debug.png");
@@ -2463,13 +2452,10 @@ fn run_ocr_sync(
         tracing::error!("OCR: 保存调试 PNG 失败: {}", e);
     } else {
         tracing::info!(
-            "OCR: 调试 PNG 已保存到 {} ({}x{} → {}x{} ×{})",
+            "OCR: 调试 PNG 已保存到 {} ({}x{})",
             debug_path.display(),
             w,
             h,
-            up.width(),
-            up.height(),
-            upscale,
         );
     }
 
