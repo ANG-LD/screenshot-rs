@@ -98,7 +98,8 @@ pub struct OverlayView {
     /// 标注历史：含 undo / redo
     drawing: DrawingState,
     /// 当前正在画的一笔（mouse_down 到 mouse_up 之间）
-    in_progress: Option<DrawCommand>,
+    /// Arc 共享：拖动绘制时每帧克隆为 O(1) 指针复制，避免深拷贝增长的 Freehand/Mosaic 数据
+    in_progress: Option<std::sync::Arc<DrawCommand>>,
 
     /// 已提交形状的离屏光栅化缓存（见 `ShapeLayerCache`）
     shape_layer_cache: Option<ShapeLayerCache>,
@@ -449,7 +450,7 @@ impl OverlayView {
         let lw = self.toolbar.line_width;
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
         tracing::info!("begin_draw: tool={:?} p=({},{}) color={:?} lw={}", tool, p.x, p.y, color, lw);
-        self.in_progress = Some(match tool {
+        self.in_progress = Some(std::sync::Arc::new(match tool {
             ToolButton::Rectangle => DrawCommand::Rectangle {
                 rect: (dp, dp),
                 color,
@@ -490,12 +491,14 @@ impl OverlayView {
             ToolButton::Text | ToolButton::Ocr | ToolButton::ColorPicker | ToolButton::Undo
             | ToolButton::Redo | ToolButton::Bold | ToolButton::Scroll | ToolButton::ScrollManual
             | ToolButton::Finish | ToolButton::Cancel | ToolButton::Pin => return,
-        });
+        }));
     }
 
     /// 推进 in_progress 的当前点（鼠标拖动时调用）
     fn update_in_progress(&mut self, p: BoundsPoint) {
         let Some(cmd) = self.in_progress.as_mut() else { return };
+        // make_mut：渲染闭包每帧替换后计数=1，原地修改零拷贝
+        let cmd = std::sync::Arc::make_mut(cmd);
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
         match cmd {
             DrawCommand::Rectangle { rect, .. }
@@ -538,6 +541,8 @@ impl OverlayView {
     /// 结束 in_progress：归一化 rect，过滤太小的图形，push 到 DrawingState
     fn finish_draw(&mut self) {
         let Some(cmd) = self.in_progress.take() else { return };
+        // 解 Arc：唯一持有者直接取出，否则克隆内容
+        let cmd = std::sync::Arc::try_unwrap(cmd).unwrap_or_else(|a| (*a).clone());
         tracing::info!("finish_draw: cmd={:?}", cmd);
         let valid = match &cmd {
             DrawCommand::Rectangle { rect, .. }
@@ -594,7 +599,7 @@ impl OverlayView {
         };
         self.drawing.push(normalized);
         // 绘制完成后自动选中，方便用户二次编辑（Mosaic 画笔不支持拖拽编辑）
-        match &self.drawing.commands.last() {
+        match self.drawing.commands.last().map(|a| &**a) {
             Some(DrawCommand::Rectangle { .. })
             | Some(DrawCommand::Ellipse { .. })
             | Some(DrawCommand::Arrow { .. }) => {
@@ -1239,7 +1244,7 @@ fn render_simple_button(
                         this.finalize_text_input_if_active(cx);
                         let s = this.selection.current().or(Some(this.screen_bounds));
                         let cmds: Vec<DrawCommand> =
-                            this.drawing.visible_commands().cloned().collect();
+                            this.drawing.visible_commands().map(|a| &**a).cloned().collect();
 
                         let wb = window.bounds();
                         let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
@@ -1348,7 +1353,7 @@ fn render_simple_button(
                         this.finalize_text_input_if_active(cx);
                         let s = this.selection.current().or(Some(this.screen_bounds));
                         let cmds: Vec<DrawCommand> =
-                            this.drawing.visible_commands().cloned().collect();
+                            this.drawing.visible_commands().map(|a| &**a).cloned().collect();
                         this.commit(OverlayResult { selection: s, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                     }
                     _ => {}
@@ -2460,7 +2465,8 @@ impl Render for OverlayView {
 
         // 收集 in_progress + 可见命令给 canvas paint 闭包用
         let in_progress = self.in_progress.clone();
-        let visible_cmds: Vec<DrawCommand> =
+        // Arc 共享：克隆指针(O(1))而非深拷贝已提交命令(Freehand点集/Mosaic区域)
+        let visible_cmds: Vec<std::sync::Arc<DrawCommand>> =
             self.drawing.visible_commands().cloned().collect();
         // canvas 闭包会 move visible_cmds，这里提前克隆一份给后面的元素层文字渲染用
         let sel_visible_idx = self.selected_cmd_actual_idx.and_then(|idx| {
@@ -2484,6 +2490,7 @@ impl Render for OverlayView {
                 .drawing
                 .visible_commands()
                 .filter(|c| is_shape_command(c))
+                .map(|c| &**c)
                 .collect();
             self.shape_layer_cache =
                 rasterize_shapes(&committed, scale_factor, window).map(|(image, bounds)| {
@@ -2502,7 +2509,7 @@ impl Render for OverlayView {
 
         // 当前笔画：每帧增量重绘（只含 in_progress 那一笔，量小）
         let in_progress_shape_layer = match &self.in_progress {
-            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[ip], scale_factor, window),
+            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[&**ip], scale_factor, window),
             _ => None,
         };
 
@@ -2688,7 +2695,7 @@ impl Render for OverlayView {
                     // 跳过已提交但由元素层展示的 Text 命令，避免文字重复
                     // 矩形/椭圆/箭头/画图 → 已提交形状走缓存 + in_progress 增量重绘；
                     // Text（GPUI 文字）/ Mosaic（棋盘模拟）仍走 paint_command。
-                    for (i, cmd) in visible_cmds.iter().enumerate() {
+                    for (i, cmd) in visible_cmds.iter().map(|c| &**c).enumerate() {
                         if skip_canvas_idx == Some(i) {
                             continue;
                         }
@@ -2731,7 +2738,7 @@ impl Render for OverlayView {
 
                     // 2.6) 在选中的已绘制命令上渲染拖拽手柄
                     if let Some(vidx) = sel_visible_idx {
-                        if let Some(cmd) = visible_cmds.get(vidx) {
+                        if let Some(cmd) = visible_cmds.get(vidx).map(|c| &**c) {
                             let handle_fill = Hsla::from(rgba(0xFFFFFFFF));
                             let handle_border = Hsla::from(rgba(0x0066CCFF));
                             let half = px(HANDLE_VISUAL_SIZE / 2.0);
@@ -3208,6 +3215,7 @@ impl Render for OverlayView {
                                 let visible: Vec<(usize, &DrawCommand)> = this
                                     .drawing
                                     .visible_commands_with_indices()
+                                    .map(|(i, a)| (i, &**a))
                                     .collect();
                                 let mut edit = None;
                                 for (idx, cmd) in visible.iter().rev() {
@@ -3242,6 +3250,7 @@ impl Render for OverlayView {
                             let visible: Vec<(usize, &DrawCommand)> = this
                                 .drawing
                                 .visible_commands_with_indices()
+                                .map(|(i, a)| (i, &**a))
                                 .collect();
                             for (idx, cmd) in visible.iter().rev() {
                                 if let Some(mode) = hit_test_cmd_drag(cmd, p) {
@@ -3526,6 +3535,7 @@ impl Render for OverlayView {
                         let cmds: Vec<DrawCommand> = this
                             .drawing
                             .visible_commands()
+                            .map(|a| &**a)
                             .cloned()
                             .collect();
                         this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
@@ -3555,6 +3565,7 @@ impl Render for OverlayView {
                     let cmds: Vec<DrawCommand> = this
                         .drawing
                         .visible_commands()
+                        .map(|a| &**a)
                         .cloned()
                         .collect();
                     this.commit(OverlayResult { selection: sel, commands: cmds, no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);

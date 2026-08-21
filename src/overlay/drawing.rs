@@ -107,8 +107,9 @@ impl FontWeight {
 
 /// 绘图状态：维护命令列表 + 历史索引，支持撤销/重做
 pub struct DrawingState {
-    /// 所有命令（删除的也保留，便于重做）
-    pub commands: Vec<DrawCommand>,
+    /// 所有命令（删除的也保留，便于重做）。
+    /// Arc 共享：渲染/画布闭包克隆指针(O(1))而非深拷贝大对象(Freehand点集/Mosaic区域)。
+    pub commands: Vec<std::sync::Arc<DrawCommand>>,
     /// 当前可见的命令数量（0..=commands.len()）
     pub history_index: usize,
     /// 任何命令内容/可见集变更都递增：渲染缓存据此判断是否需要重建
@@ -130,7 +131,7 @@ impl DrawingState {
     /// 截断已撤销的尾部命令后追加，保证 push 后 history_index == commands.len()。
     pub fn push(&mut self, cmd: DrawCommand) {
         self.commands.truncate(self.history_index);
-        self.commands.push(cmd);
+        self.commands.push(std::sync::Arc::new(cmd));
         self.history_index = self.commands.len();
         self.revision += 1;
     }
@@ -159,20 +160,21 @@ impl DrawingState {
         i < self.history_index
     }
 
-    /// 当前可见的命令迭代器
-    pub fn visible_commands(&self) -> impl Iterator<Item = &DrawCommand> {
+    /// 当前可见的命令迭代器（Item=&Arc：克隆即 O(1) 指针复制，避免深拷贝大对象）
+    pub fn visible_commands(&self) -> impl Iterator<Item = &std::sync::Arc<DrawCommand>> {
         self.commands.iter().take(self.history_index)
     }
 
     /// 遍历可见命令及其实际索引（用于命中测试定位命令）
-    pub fn visible_commands_with_indices(&self) -> impl Iterator<Item = (usize, &DrawCommand)> {
+    pub fn visible_commands_with_indices(&self) -> impl Iterator<Item = (usize, &std::sync::Arc<DrawCommand>)> {
         self.commands.iter().enumerate().take(self.history_index)
     }
 
-    /// 按实际索引获取可见命令的可变引用（用于原地修改）
+    /// 按实际索引获取可见命令的可变引用（用于原地修改）。
+    /// Arc::make_mut：若无其他持有者则原地修改（零拷贝）；否则深拷贝一份再改。
     pub fn get_visible_mut(&mut self, index: usize) -> Option<&mut DrawCommand> {
         if self.is_visible(index) {
-            self.commands.get_mut(index)
+            Some(std::sync::Arc::make_mut(&mut self.commands[index]))
         } else {
             None
         }
@@ -186,7 +188,8 @@ impl DrawingState {
         let cmd = self.commands.remove(index);
         self.history_index -= 1;
         self.revision += 1;
-        Some(cmd)
+        // 解 Arc：唯一持有者直接取出，否则克隆内容
+        Some(std::sync::Arc::try_unwrap(cmd).unwrap_or_else(|arc| (*arc).clone()))
     }
 }
 
