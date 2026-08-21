@@ -20,6 +20,15 @@
 # 也可用环境变量 OCR_MODEL_TIER 覆盖。
 # model_tier = "small"
 
+# 推理后端：cpu（默认）/ cuda / directml / openvino。
+# - cpu: 默认，无需额外依赖
+# - cuda: NVIDIA GPU，需构建时 --features ocr-cuda 且装 NVIDIA 驱动/CUDA 运行库
+# - directml: Windows 通用 GPU（AMD/Intel/NVIDIA），需构建时 --features ocr-directml
+# - openvino: Intel GPU/CPU 加速，需构建时 --features ocr-openvino
+# 也可用环境变量 OCR_EXECUTION_PROVIDER 覆盖。
+# 非 cpu 但运行库缺失时自动回落 CPU（日志会提示实际生效的后端）。
+# execution_provider = "cpu"
+
 # PaddleOCR 模型目录。指定后直接使用该目录下的模型文件（不再自动下载）。
 # 目录需包含三个文件（文件名随档位）：
 #   small: pp-ocrv6_small_det.onnx / pp-ocrv6_small_rec.onnx / ppocrv6_dict.txt

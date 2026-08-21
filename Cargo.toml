@@ -5,6 +5,18 @@ edition = "2021"
 description = "Cross-platform screenshot tool built with GPUI"
 license = "MIT"
 
+# 可选 GPU 推理：默认 CPU（ort-sys 下载 CPU 版 ONNX Runtime）。
+# 启用任一 GPU feature 时，构建会下载对应的 GPU 版运行时（几百 MB）：
+#   ocr-cuda      → NVIDIA CUDA（需 NVIDIA 驱动 + CUDA 运行库）
+#   ocr-directml  → DirectML（Windows 通用，AMD/Intel/NVIDIA 均可）
+#   ocr-openvino  → Intel OpenVINO
+# 启用后还需在 config.toml 设置 ocr.execution_provider = "cuda"/"directml"/"openvino"
+[features]
+default = []
+ocr-cuda = ["oar-ocr/cuda"]
+ocr-directml = ["oar-ocr/directml"]
+ocr-openvino = ["oar-ocr/openvino"]
+
 [dependencies]
 # GPUI（Zed 团队，固定 commit 以保证可复现构建）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

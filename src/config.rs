@@ -26,6 +26,10 @@ pub struct OcrConfig {
     pub model_dir: Option<PathBuf>,
     /// 模型档位：small（默认，~30MB，CPU 快）或 medium（~132MB，准确率更高但慢）
     pub model_tier: Option<String>,
+    /// 推理后端：cpu（默认）/ cuda / directml / openvino。
+    /// 非 cpu 需构建时启用对应 feature（ocr-cuda 等）且系统装有对应运行库，
+    /// 否则 ORT 会回落 CPU（日志会提示实际生效的 provider）。
+    pub execution_provider: Option<String>,
 }
 
 static CONFIG: Lazy<Config> = Lazy::new(load_quiet);
@@ -99,6 +103,17 @@ pub fn ocr_model_dir() -> Option<PathBuf> {
     env_path("OCR_MODEL_DIR")
         .or_else(|| config().ocr.model_dir.clone())
         .map(expand_home)
+}
+
+/// 推理后端：env `OCR_EXECUTION_PROVIDER` > 配置 `ocr.execution_provider` > "cpu"。
+/// 合法值：cpu / cuda / directml / openvino。
+pub fn ocr_execution_provider() -> String {
+    std::env::var("OCR_EXECUTION_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config().ocr.execution_provider.clone())
+        .unwrap_or_else(|| "cpu".to_string())
+        .to_ascii_lowercase()
 }
 
 /// 模型档位：env `OCR_MODEL_TIER` > 配置 `ocr.model_tier` > 默认 "small"。

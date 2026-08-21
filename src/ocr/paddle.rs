@@ -624,6 +624,39 @@ fn ensure_models_impl(
     Ok(out)
 }
 
+/// 按配置名构造 ORT execution providers（按优先级排列，GPU 在前、CPU 兜底）。
+/// 非 cpu 需要构建时启用对应 feature（ocr-cuda 等）且系统有对应运行库；
+/// ORT 找不到对应 provider 时自动回落 CPU（实际生效的 provider 由 ONNX Runtime
+/// 决定，可通过日志确认）。
+fn execution_providers(name: &str) -> Vec<oar_ocr::core::config::OrtExecutionProvider> {
+    use oar_ocr::core::config::OrtExecutionProvider;
+    match name {
+        "cuda" => vec![
+            OrtExecutionProvider::CUDA {
+                device_id: Some(0),
+                gpu_mem_limit: None,
+                arena_extend_strategy: None,
+                cudnn_conv_algo_search: None,
+                cudnn_conv_use_max_workspace: None,
+            },
+            OrtExecutionProvider::CPU,
+        ],
+        "directml" => vec![
+            OrtExecutionProvider::DirectML { device_id: Some(0) },
+            OrtExecutionProvider::CPU,
+        ],
+        "openvino" => vec![
+            OrtExecutionProvider::OpenVINO {
+                device_type: Some("GPU".into()),
+                num_threads: None,
+            },
+            OrtExecutionProvider::CPU,
+        ],
+        // cpu 或未知值：只请求 CPU（未知值告警由调用方打）
+        _ => vec![OrtExecutionProvider::CPU],
+    }
+}
+
 /// 获取（或懒初始化）识别引擎。模型路径来自缓存目录。
 pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
     let mtx = ENGINE.get_or_init(|| Mutex::new(None));
@@ -647,15 +680,28 @@ pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
             limit_type: Some(LimitType::Max),
             ..Default::default()
         })
-        .ort_session(
-            oar_ocr::core::config::OrtSessionConfig::new()
+        .ort_session({
+            use oar_ocr::core::config::OrtSessionConfig;
+            let provider_name = crate::config::ocr_execution_provider();
+            let providers = execution_providers(&provider_name);
+            tracing::info!(
+                "OCR: 推理后端配置 = {provider_name}（请求 provider: {}），CPU 线程 {}",
+                providers
+                    .iter()
+                    .map(|p| format!("{p:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                6
+            );
+            OrtSessionConfig::new()
                 // 默认只做 Level1 基础图优化；Level3 常量折叠/算子融合对
                 // PP-OCRv6 的卷积网络收益明显（实测推理 1.47s → ~0.9s）。
                 .with_optimization_level(
                     oar_ocr::core::config::OrtGraphOptimizationLevel::All,
                 )
-                .with_intra_threads(6),
-        )
+                .with_intra_threads(6)
+                .with_execution_providers(providers)
+        })
         // rec 批大小：batch 张量宽度取组内最大行宽，一行超宽行会撑大整组
         // 导致窄行也被 padding 浪费计算（medium 下实测 batch8=17.6s,
         // batch4=15.8s, batch1=13.9s）→ 用 1 最小化 padding。

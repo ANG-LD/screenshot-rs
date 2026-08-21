@@ -48,6 +48,29 @@ mkdir -p models/PP-OCRv6
 项目内 `models/PP-OCRv6` → 缓存目录（不存在则自动下载）。
 运行时二进制已静态链接 ONNX Runtime，**发行包无需附带任何运行库**。
 
+### 推理后端：CPU / GPU
+
+默认 **CPU 推理**（ONNX Runtime CPU 版，静态链接）。启动日志会打印实际生效的
+后端（`OCR: 推理后端配置 = cpu ...`）。
+
+切换到 **GPU 推理**（需 NVIDIA 显卡）：
+
+1. 构建时启用 GPU feature（会下载对应的 GPU 版 ONNX Runtime，约几百 MB）：
+   ```bash
+   cargo build --release --features ocr-cuda        # NVIDIA CUDA
+   # 或 ocr-directml（Windows 通用 GPU）/ ocr-openvino（Intel）
+   ```
+2. 配置 `config.toml`（或环境变量 `OCR_EXECUTION_PROVIDER`）：
+   ```toml
+   [ocr]
+   execution_provider = "cuda"   # cpu / cuda / directml / openvino
+   ```
+3. 系统需装有 NVIDIA 驱动与 CUDA 运行库。运行库缺失时 ONNX Runtime 自动
+   回落 CPU（日志仍显示请求的配置，实际生效以后端决定）。
+
+GPU 收益：det+rec 推理从 CPU 的数百毫秒~秒级降到几十毫秒（小图），
+代码区 small 档约 0.8s → 预计 <0.2s；medium 多行场景收益更大。
+
 ## 使用
 
 1. 启动应用：托盘出现
