@@ -5685,8 +5685,9 @@ fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<OcrModelsView>
 struct OcrPinView {
     focus_handle: FocusHandle,
     image: Arc<RenderImage>,
-    /// 图片逻辑显示宽度（高度取窗口高度，与选区比例一致）
+    /// 图片逻辑显示宽高（用于保持宽高比，窗口缩放不变形）
     img_w: f32,
+    img_h: f32,
     /// None=识别中;Some(text)=显示文字
     text: Option<String>,
 }
@@ -5696,6 +5697,7 @@ impl OcrPinView {
         frame: CapturedFrame,
         text: Option<String>,
         disp_w: f32,
+        disp_h: f32,
         cx: &mut Context<Self>,
     ) -> Self {
         let (w, h, pixels) = (frame.width, frame.height, frame.pixels);
@@ -5704,6 +5706,7 @@ impl OcrPinView {
             focus_handle: cx.focus_handle(),
             image: img,
             img_w: disp_w,
+            img_h: disp_h,
             text,
         }
     }
@@ -5713,6 +5716,7 @@ impl Render for OcrPinView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.image.clone();
         let img_w = self.img_w;
+        let img_h = self.img_h;
         // 右侧结果区
         let right = match &self.text {
             None => div()
@@ -5753,11 +5757,24 @@ impl Render for OcrPinView {
                     )
             }
         };
-        // canvas 占满父容器，按 bounds 把图片绘制进去
+        // canvas 占满图片区；绘制时按图片宽高比 letterbox 居中（窗口缩放不变形）
         let paint = canvas(
             move |_, _, _| image.clone(),
             move |bounds, img, window, _cx| {
-                let _ = window.paint_image(bounds, Default::default(), img.clone(), 0, false);
+                // 在可用区域内按 img_w:img_h 比例计算居中子矩形（保持比例）
+                let avail_w = f32::from(bounds.size.width);
+                let avail_h = f32::from(bounds.size.height);
+                let scale = (avail_w / img_w).min(avail_h / img_h).max(0.001);
+                let draw_w = img_w * scale;
+                let draw_h = img_h * scale;
+                let target = Bounds {
+                    origin: point(
+                        bounds.origin.x + px((avail_w - draw_w) / 2.0),
+                        bounds.origin.y + px((avail_h - draw_h) / 2.0),
+                    ),
+                    size: Size::new(px(draw_w), px(draw_h)),
+                };
+                let _ = window.paint_image(target, Default::default(), img.clone(), 0, false);
             },
         )
         .size_full();
@@ -5768,10 +5785,10 @@ impl Render for OcrPinView {
             .bg(gpui::rgba(0x181818FF))
             .text_color(gpui::rgba(0xE6E6E6FF))
             .track_focus(&self.focus_handle)
-            // 左侧图片区：宽度=图片显示宽，高度=窗口高度（图片按 bounds 等比填充）
+            // 左侧图片区：flex 自适应占满剩余空间，窗口缩放时图片保持比例居中
             .child(
                 div()
-                    .w(px(img_w))
+                    .flex_1()
                     .h_full()
                     .bg(gpui::rgba(0x000000FF))
                     .child(paint),
@@ -5825,7 +5842,7 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, cx));
+            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, cx));
             let h = view.read(cx).focus_handle.clone();
             h.focus(window, cx);
             view
