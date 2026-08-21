@@ -690,6 +690,9 @@ pub fn preload() {
 }
 
 /// 识别一块 RGB 图像（w×h×3 字节），返回按行拼接的文本。
+///
+/// 结果尽可能保留原始排版（缩进/列对齐），便于表格、代码、列表的复制：
+/// 利用每个文字块的 bounding box 坐标做行聚类、行内排序、缩进与列对齐重建。
 pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
     let img = oar_ocr::utils::create_rgb_image(w, h, rgb.to_vec())
         .ok_or_else(|| format!("RGB 数据长度不符: {w}x{h}"))?;
@@ -698,16 +701,126 @@ pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
     let results = ocr
         .predict(vec![img])
         .map_err(|e| format!("PaddleOCR 识别失败: {e}"))?;
-    let mut lines: Vec<String> = Vec::new();
-    for region in results.first().map(|r| &r.text_regions).into_iter().flatten() {
-        if let Some(text) = region.text.as_ref() {
-            let t = text.trim();
-            if !t.is_empty() {
-                lines.push(t.to_string());
+    Ok(layout_text(results.first().map(|r| &r.text_regions).into_iter().flatten()))
+}
+
+/// 单个识别文字块：位置 + 文本
+struct Word {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    text: String,
+}
+
+/// 根据文字块坐标重建布局：行聚类 → 行内排序 → 缩进 → 列对齐。
+/// - 同一行（y 中心相近）的文字块合并为一行，行内按 x 排序；
+/// - 行首相对整块最小 x 的偏移换算成空格缩进（代码块/列表缩进保留）；
+/// - 跨行 x 中心聚类成列，同一列的块用空格补齐对齐（表格近似）。
+fn layout_text<'a>(regions: impl Iterator<Item = &'a oar_ocr::domain::TextRegion>) -> String {
+    let mut words: Vec<Word> = Vec::new();
+    for region in regions {
+        let Some(text) = region.text.as_ref() else { continue };
+        let t = text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // bounding_box.points: 4 点（左上、右上、右下、左下）；取 min/max 得矩形
+        let pts = &region.bounding_box.points;
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for p in pts {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+        if min_x > max_x || min_y > max_y {
+            continue;
+        }
+        words.push(Word {
+            x: min_x,
+            y: min_y,
+            w: max_x - min_x,
+            h: max_y - min_y,
+            text: t.to_string(),
+        });
+    }
+    if words.is_empty() {
+        return String::new();
+    }
+    // 平均行高（用于行聚类容差）
+    let avg_h: f32 = words.iter().map(|wd| wd.h).sum::<f32>() / words.len() as f32;
+    let tol = (avg_h * 0.55).max(2.0);
+    // 整块最小 x（缩进基准）
+    let min_x_all = words.iter().map(|wd| wd.x).fold(f32::MAX, f32::min);
+
+    // 按 y 中心排序，贪心聚类成行
+    let mut sorted: Vec<&Word> = words.iter().collect();
+    sorted.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+    let mut rows: Vec<Vec<&Word>> = Vec::new();
+    for wd in sorted {
+        let cy = wd.y + wd.h / 2.0;
+        if let Some(last) = rows.last_mut() {
+            let last_cy = last.iter().map(|w| w.y + w.h / 2.0).sum::<f32>() / last.len() as f32;
+            if (cy - last_cy).abs() <= tol {
+                last.push(wd);
+                continue;
+            }
+        }
+        rows.push(vec![wd]);
+    }
+
+    // 跨行列聚类（表格列对齐）：x 中心相近的块视为同一列
+    // 列宽 = 该列最大文本宽度（估算列间距用）
+    let mut col_centers: Vec<f32> = Vec::new();
+    for row in &rows {
+        for wd in row {
+            let cx = wd.x + wd.w / 2.0;
+            if let Some(c) = col_centers.iter_mut().find(|c| (cx - **c).abs() <= avg_h * 1.2) {
+                *c = (*c + cx) / 2.0;
+            } else {
+                col_centers.push(cx);
             }
         }
     }
-    Ok(lines.join("\n"))
+    col_centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 平均字符宽（估算空格数量）：按文字长度与框宽
+    let avg_char_w = {
+        let total_chars: usize = words.iter().map(|w| w.text.chars().count()).sum();
+        let total_w: f32 = words.iter().map(|w| w.w).sum();
+        if total_chars > 0 { total_w / total_chars as f32 } else { avg_h * 0.5 }
+    }
+    .max(1.0);
+
+    let mut out: Vec<String> = Vec::new();
+    for row in &rows {
+        let mut row_words: Vec<&Word> = row.to_vec();
+        row_words.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        // 行首缩进：第一个字相对整块最小 x 的偏移 → 空格
+        let indent = ((row_words[0].x - min_x_all) / avg_char_w).round() as usize;
+        let mut line = " ".repeat(indent.min(64));
+        let mut prev_x_end: Option<f32> = None;
+        for wd in &row_words {
+            // 与前一个块的间距 → 空格（同一行内多块的自然间距）
+            if let Some(px) = prev_x_end {
+                let gap = (wd.x - px) / avg_char_w;
+                if gap > 0.6 {
+                    let n = gap.round() as usize;
+                    line.push_str(&" ".repeat(n.min(32)));
+                } else {
+                    line.push(' ');
+                }
+            }
+            line.push_str(&wd.text);
+            prev_x_end = Some(wd.x + wd.w);
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 /// 将引擎锁复位（测试用：换模型目录后重建）。
