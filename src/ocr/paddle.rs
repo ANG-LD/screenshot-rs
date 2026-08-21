@@ -701,7 +701,18 @@ pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
     let results = ocr
         .predict(vec![img])
         .map_err(|e| format!("PaddleOCR 识别失败: {e}"))?;
-    Ok(layout_text(results.first().map(|r| &r.text_regions).into_iter().flatten()))
+    let words = collect_words(results.first().map(|r| &r.text_regions).into_iter().flatten());
+    if words.is_empty() {
+        return Ok(String::new());
+    }
+    // 检测表格网格（水平线/竖线）：命中则输出 Markdown 表格，否则按布局输出
+    if let Some((xs, ys)) = detect_table_grid(rgb, w, h) {
+        if xs.len() >= 2 && ys.len() >= 2 {
+            tracing::info!("OCR: 检测到表格网格 {}x{}（竖线{}条 横线{}条）", xs.len() - 1, ys.len() - 1, xs.len(), ys.len());
+            return Ok(layout_as_table(&words, &xs, &ys));
+        }
+    }
+    Ok(layout_text(words))
 }
 
 /// 单个识别文字块：位置 + 文本
@@ -713,11 +724,8 @@ struct Word {
     text: String,
 }
 
-/// 根据文字块坐标重建布局：行聚类 → 行内排序 → 缩进 → 列对齐。
-/// - 同一行（y 中心相近）的文字块合并为一行，行内按 x 排序；
-/// - 行首相对整块最小 x 的偏移换算成空格缩进（代码块/列表缩进保留）；
-/// - 跨行 x 中心聚类成列，同一列的块用空格补齐对齐（表格近似）。
-fn layout_text<'a>(regions: impl Iterator<Item = &'a oar_ocr::domain::TextRegion>) -> String {
+/// 从识别结果提取文字块（含坐标）。
+fn collect_words<'a>(regions: impl Iterator<Item = &'a oar_ocr::domain::TextRegion>) -> Vec<Word> {
     let mut words: Vec<Word> = Vec::new();
     for region in regions {
         let Some(text) = region.text.as_ref() else { continue };
@@ -748,6 +756,14 @@ fn layout_text<'a>(regions: impl Iterator<Item = &'a oar_ocr::domain::TextRegion
             text: t.to_string(),
         });
     }
+    words
+}
+
+/// 根据文字块坐标重建布局：行聚类 → 行内排序 → 缩进 → 列对齐。
+/// - 同一行（y 中心相近）的文字块合并为一行，行内按 x 排序；
+/// - 行首相对整块最小 x 的偏移换算成空格缩进（代码块/列表缩进保留）；
+/// - 跨行 x 中心聚类成列，同一列的块用空格补齐对齐（表格近似）。
+fn layout_text(words: Vec<Word>) -> String {
     if words.is_empty() {
         return String::new();
     }
@@ -819,6 +835,132 @@ fn layout_text<'a>(regions: impl Iterator<Item = &'a oar_ocr::domain::TextRegion
             prev_x_end = Some(wd.x + wd.w);
         }
         out.push(line);
+    }
+    out.join("\n")
+}
+
+/// 检测表格网格：扫描图像找水平线/竖线（暗色长线段），返回 (竖线x, 横线y) 位置列表。
+///
+/// 方法：逐行统计暗色像素（RGB 均值 < 阈值）占比，占比高（>=0.6）说明该行大部分
+/// 是暗色连续段（表格线），文字行占比低（文字是离散的）。竖线同理逐列扫描。
+/// 连续相邻的线位置聚合成一条线（去重）。无网格返回 None。
+fn detect_table_grid(rgb: &[u8], w: u32, h: u32) -> Option<(Vec<f32>, Vec<f32>)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let dark = |i: usize| -> bool {
+        // rgb 三通道均值 < 100 视为暗色（线/文字像素）
+        let r = rgb[i] as u32;
+        let g = rgb[i + 1] as u32;
+        let b = rgb[i + 2] as u32;
+        (r + g + b) / 3 < 100
+    };
+
+    // 水平线：逐行扫描
+    let mut h_lines: Vec<f32> = Vec::new();
+    for y in 0..h {
+        let row = (y * w) as usize * 3;
+        let mut dark_count = 0usize;
+        for x in 0..w {
+            if dark(row + (x as usize) * 3) {
+                dark_count += 1;
+            }
+        }
+        let ratio = dark_count as f32 / w as f32;
+        // 连续若干行都是"线"（表格横线是 1-3px 厚的连续暗行）
+        if ratio >= 0.55 {
+            h_lines.push(y as f32);
+        }
+    }
+    // 竖线：逐列扫描
+    let mut v_lines: Vec<f32> = Vec::new();
+    for x in 0..w {
+        let mut dark_count = 0usize;
+        for y in 0..h {
+            if dark(((y * w + x) as usize) * 3) {
+                dark_count += 1;
+            }
+        }
+        let ratio = dark_count as f32 / h as f32;
+        if ratio >= 0.55 {
+            v_lines.push(x as f32);
+        }
+    }
+
+    // 相邻线聚类（厚度可能 2-3px，合并成一条中心线）
+    let cluster = |lines: Vec<f32>, gap: f32| -> Vec<f32> {
+        let mut out: Vec<f32> = Vec::new();
+        for l in lines {
+            if let Some(last) = out.last_mut() {
+                if (l - *last).abs() <= gap {
+                    *last = (*last + l) / 2.0;
+                    continue;
+                }
+            }
+            out.push(l);
+        }
+        out
+    };
+    let (h_n, v_n) = (h_lines.len(), v_lines.len());
+    let ys = cluster(h_lines, 3.0);
+    let xs = cluster(v_lines, 3.0);
+    tracing::info!(
+        "OCR: 网格检测 横线候选{}条->{}条 竖线候选{}条->{}条",
+        h_n, ys.len(), v_n, xs.len()
+    );
+    if xs.len() >= 2 && ys.len() >= 2 {
+        Some((xs, ys))
+    } else {
+        None
+    }
+}
+
+/// 按检测到的网格把文字填入单元格，输出 Markdown 表格。
+/// 每个文字块根据其中心位置分配到 (行, 列)；同格多块用空格拼接。
+fn layout_as_table(words: &[Word], xs: &[f32], ys: &[f32]) -> String {
+    let rows_n = ys.len() - 1;
+    let cols_n = xs.len() - 1;
+    // 网格单元 → 该格文字
+    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); cols_n]; rows_n];
+    for wd in words {
+        let cx = wd.x + wd.w / 2.0;
+        let cy = wd.y + wd.h / 2.0;
+        // 找所在列（cx 落在哪两条竖线之间）
+        let mut ci = cols_n; // 默认最后一列
+        for i in 0..cols_n {
+            if cx >= xs[i] && cx <= xs[i + 1] {
+                ci = i;
+                break;
+            }
+        }
+        let mut ri = rows_n;
+        for i in 0..rows_n {
+            if cy >= ys[i] && cy <= ys[i + 1] {
+                ri = i;
+                break;
+            }
+        }
+        if ci < cols_n && ri < rows_n {
+            if cells[ri][ci].is_empty() {
+                cells[ri][ci] = wd.text.clone();
+            } else {
+                cells[ri][ci].push(' ');
+                cells[ri][ci].push_str(&wd.text);
+            }
+        }
+    }
+    // 输出 markdown 表格
+    let mut out: Vec<String> = Vec::new();
+    for (ri, row) in cells.iter().enumerate() {
+        let line: Vec<String> = row.iter().map(|c| c.trim().to_string()).collect();
+        out.push(format!("| {} |", line.join(" | ")));
+        if ri == 0 {
+            // 表头分隔行
+            out.push(format!(
+                "| {} |",
+                vec!["---"; cols_n].join(" | ")
+            ));
+        }
     }
     out.join("\n")
 }
