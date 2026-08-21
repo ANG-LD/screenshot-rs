@@ -624,23 +624,50 @@ fn ensure_models_impl(
     Ok(out)
 }
 
+/// 运行时探测：当前机器是否有可用的 CUDA GPU。
+/// 通过 ORT 的 EP 设备枚举（`Environment::devices()`）查询——编译进二进制的
+/// CUDA provider 在无 NVIDIA 硬件/驱动/CUDA 运行库时枚举不到设备。
+fn detect_cuda_device() -> bool {
+    let env = match ort::environment::Environment::current() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("OCR: 查询 ORT 环境失败（视为无 GPU）: {e}");
+            return false;
+        }
+    };
+    for dev in env.devices() {
+        match dev.ep() {
+            Ok(name) if name.contains("CUDA") => {
+                tracing::info!("OCR: 运行时检测到 CUDA GPU 设备（{name}）→ 使用 GPU 推理");
+                return true;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("OCR: 查询设备 provider 失败: {e}"),
+        }
+    }
+    tracing::info!("OCR: 未检测到 CUDA GPU → 使用 CPU 推理");
+    false
+}
+
 /// 按配置名构造 ORT execution providers（按优先级排列，GPU 在前、CPU 兜底）。
-/// 非 cpu 需要构建时启用对应 feature（ocr-cuda 等）且系统有对应运行库；
-/// ORT 找不到对应 provider 时自动回落 CPU（实际生效的 provider 由 ONNX Runtime
-/// 决定，可通过日志确认）。
+///
+/// `auto`（默认）：**运行时检测**——探测到 CUDA 设备则请求 [CUDA, CPU]，
+/// 否则纯 [CPU]。一个安装包（默认已含 CUDA 能力）在任何机器上都自动适配：
+/// 有 NVIDIA 显卡用 GPU，没有用 CPU。也可显式指定 cpu/cuda/directml/openvino。
 fn execution_providers(name: &str) -> Vec<oar_ocr::core::config::OrtExecutionProvider> {
     use oar_ocr::core::config::OrtExecutionProvider;
+    let cuda = || vec![
+        OrtExecutionProvider::CUDA {
+            device_id: Some(0),
+            gpu_mem_limit: None,
+            arena_extend_strategy: None,
+            cudnn_conv_algo_search: None,
+            cudnn_conv_use_max_workspace: None,
+        },
+        OrtExecutionProvider::CPU,
+    ];
     match name {
-        "cuda" => vec![
-            OrtExecutionProvider::CUDA {
-                device_id: Some(0),
-                gpu_mem_limit: None,
-                arena_extend_strategy: None,
-                cudnn_conv_algo_search: None,
-                cudnn_conv_use_max_workspace: None,
-            },
-            OrtExecutionProvider::CPU,
-        ],
+        "cuda" => cuda(),
         "directml" => vec![
             OrtExecutionProvider::DirectML { device_id: Some(0) },
             OrtExecutionProvider::CPU,
@@ -652,8 +679,15 @@ fn execution_providers(name: &str) -> Vec<oar_ocr::core::config::OrtExecutionPro
             },
             OrtExecutionProvider::CPU,
         ],
-        // cpu 或未知值：只请求 CPU（未知值告警由调用方打）
-        _ => vec![OrtExecutionProvider::CPU],
+        "cpu" => vec![OrtExecutionProvider::CPU],
+        // auto / 未知值：运行时检测 CUDA 设备
+        _ => {
+            if detect_cuda_device() {
+                cuda()
+            } else {
+                vec![OrtExecutionProvider::CPU]
+            }
+        }
     }
 }
 

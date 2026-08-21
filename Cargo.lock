@@ -7042,6 +7042,7 @@ dependencies = [
  "libc",
  "oar-ocr",
  "once_cell",
+ "ort",
  "raw-window-handle",
  "screenshots",
  "serde",

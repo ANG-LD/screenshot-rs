@@ -105,14 +105,15 @@ pub fn ocr_model_dir() -> Option<PathBuf> {
         .map(expand_home)
 }
 
-/// 推理后端：env `OCR_EXECUTION_PROVIDER` > 配置 `ocr.execution_provider` > "cpu"。
-/// 合法值：cpu / cuda / directml / openvino。
+/// 推理后端：env `OCR_EXECUTION_PROVIDER` > 配置 `ocr.execution_provider` > "auto"。
+/// "auto"（默认）= 运行时检测：有 CUDA GPU 用 GPU，否则 CPU。
+/// 也可显式指定：cpu / cuda / directml / openvino。
 pub fn ocr_execution_provider() -> String {
     std::env::var("OCR_EXECUTION_PROVIDER")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| config().ocr.execution_provider.clone())
-        .unwrap_or_else(|| "cpu".to_string())
+        .unwrap_or_else(|| "auto".to_string())
         .to_ascii_lowercase()
 }
 

@@ -5,14 +5,11 @@ edition = "2021"
 description = "Cross-platform screenshot tool built with GPUI"
 license = "MIT"
 
-# 可选 GPU 推理：默认 CPU（ort-sys 下载 CPU 版 ONNX Runtime）。
-# 启用任一 GPU feature 时，构建会下载对应的 GPU 版运行时（几百 MB）：
-#   ocr-cuda      → NVIDIA CUDA（需 NVIDIA 驱动 + CUDA 运行库）
-#   ocr-directml  → DirectML（Windows 通用，AMD/Intel/NVIDIA 均可）
-#   ocr-openvino  → Intel OpenVINO
-# 启用后还需在 config.toml 设置 ocr.execution_provider = "cuda"/"directml"/"openvino"
+# GPU 推理：默认启用 ocr-cuda——一个安装包同时含 CPU+CUDA 能力，
+# 运行时自动检测：有 NVIDIA 显卡用 GPU，没有则回落 CPU（无需用户配置）。
+# ocr-directml（Windows 通用 GPU）/ ocr-openvino（Intel）可替代 cuda。
 [features]
-default = []
+default = ["ocr-cuda"]
 ocr-cuda = ["oar-ocr/cuda"]
 ocr-directml = ["oar-ocr/directml"]
 ocr-openvino = ["oar-ocr/openvino"]
@@ -41,6 +38,9 @@ dirs = "6"
 # PaddleOCR（PP-OCRv6）本地推理：替换 tesseract CLI，中文准确率更高。
 # 依赖 oar-ocr 包装（内部为 ONNX Runtime，默认 features 构建时下载 CPU 版运行时）。
 oar-ocr = "0.9"
+# ort 运行时设备探测（与 oar-ocr 内部同一版本，避免两个 ORT 全局实例冲突；
+# 只用于检测 CUDA 设备，session 仍由 oar-ocr 创建）
+ort = "=2.0.0-rc.13"
 
 # OCR 模型下载（首次使用时从 GitHub release 拉取 PP-OCRv6 模型到缓存目录）
 ureq = "2"

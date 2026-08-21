@@ -48,25 +48,17 @@ mkdir -p models/PP-OCRv6
 项目内 `models/PP-OCRv6` → 缓存目录（不存在则自动下载）。
 运行时二进制已静态链接 ONNX Runtime，**发行包无需附带任何运行库**。
 
-### 推理后端：CPU / GPU
+### 推理后端：自动检测（有 GPU 用 GPU，没有用 CPU）
 
-默认 **CPU 推理**（ONNX Runtime CPU 版，静态链接）。启动日志会打印实际生效的
-后端（`OCR: 推理后端配置 = cpu ...`）。
+**一个安装包自动适配**：二进制内置 CPU + CUDA 两种能力（默认启用
+`ocr-cuda` feature，静态链接 GPU 版 ONNX Runtime）。运行时**自动检测**：
 
-切换到 **GPU 推理**（需 NVIDIA 显卡）：
+- 机器有 NVIDIA 显卡 + 驱动/CUDA 运行库 → **GPU 推理**（日志：
+  `运行时检测到 CUDA GPU 设备 → 使用 GPU 推理`）
+- 没有 → **CPU 推理**（日志：`未检测到 CUDA GPU → 使用 CPU 推理`）
 
-1. 构建时启用 GPU feature（会下载对应的 GPU 版 ONNX Runtime，约几百 MB）：
-   ```bash
-   cargo build --release --features ocr-cuda        # NVIDIA CUDA
-   # 或 ocr-directml（Windows 通用 GPU）/ ocr-openvino（Intel）
-   ```
-2. 配置 `config.toml`（或环境变量 `OCR_EXECUTION_PROVIDER`）：
-   ```toml
-   [ocr]
-   execution_provider = "cuda"   # cpu / cuda / directml / openvino
-   ```
-3. 系统需装有 NVIDIA 驱动与 CUDA 运行库。运行库缺失时 ONNX Runtime 自动
-   回落 CPU（日志仍显示请求的配置，实际生效以后端决定）。
+无需任何配置。也可手动指定（`config.toml` 或环境变量
+`OCR_EXECUTION_PROVIDER`）：`auto`（默认）/ `cpu` / `cuda` / `directml` / `openvino`。
 
 GPU 收益：det+rec 推理从 CPU 的数百毫秒~秒级降到几十毫秒（小图），
 代码区 small 档约 0.8s → 预计 <0.2s；medium 多行场景收益更大。
