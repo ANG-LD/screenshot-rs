@@ -2200,11 +2200,10 @@ fn rasterize_shapes(
     let size_w = (max_x - origin_x).ceil().max(1.0).min((win_w - origin_x).max(1.0));
     let size_h = (max_y - origin_y).ceil().max(1.0).min((win_h - origin_y).max(1.0));
 
-    // 超采样（SSAA=2）：缓冲以 2×scale_factor 分辨率光栅化，bounds 保持逻辑尺寸，
-    // paint_image 缩小时线性过滤——细线（1~3px）边缘过渡从 0.5px 变 0.25px，
-    // 消除 1x 屏幕上 paint_quad/整数光栅化的齿纹/棱刺感。
-    const SSAA: f32 = 2.0;
-    let raster_scale = scale_factor * SSAA;
+    // 1x 分辨率光栅化（与提交成图一致）：不超采样——超采样图缩小显示依赖
+    // GPU 线性过滤，1x 屏幕上边界对齐/采样行为不可控（曾出现线条缺像素）。
+    // 边缘平滑由 draw_thick_line 的 AA 过渡带宽（aa=1.0）保证。
+    let raster_scale = scale_factor;
     let phys_w = (size_w * raster_scale).round() as u32;
     let phys_h = (size_h * raster_scale).round() as u32;
     if phys_w == 0 || phys_h == 0 {

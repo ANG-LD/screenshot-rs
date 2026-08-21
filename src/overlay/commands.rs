@@ -336,20 +336,12 @@ pub fn apply_commands(
                 }
             }
             DrawCommand::Freehand { points, color, line_width } => {
-                // 折线：只首段 A 圆帽、末段 B 圆帽；中间段平头连接，
-                // 避免每段两端圆帽（半径含 AA 外扩）在密采样点处形成珠串凸点
-                let n_seg = points.len().saturating_sub(1);
-                for (i, w) in points.windows(2).enumerate() {
-                    let p1 = translate(w[0], region_origin_x, region_origin_y);
-                    let p2 = translate(w[1], region_origin_x, region_origin_y);
-                    // 首段起点/末段终点：全圆帽（圆头）；
-                    // 中间顶点：精确圆帽（半径=线半宽）——覆盖折角缺口且不鼓包
-                    let cap_a = if i == 0 { Cap::Full } else { Cap::Exact };
-                    let cap_b = if i + 1 == n_seg { Cap::Full } else { Cap::Exact };
-                    draw_thick_line(
-                        frame, p1.0, p1.1, p2.0, p2.1, *line_width, *color, cap_a, cap_b,
-                    )?;
-                }
+                // 整条折线一次光栅化：连接处连续无缝隙（逐段绘制会因 AA 带错位缺像素）
+                let pts: Vec<(f32, f32)> = points
+                    .iter()
+                    .map(|p| translate(*p, region_origin_x, region_origin_y))
+                    .collect();
+                draw_polyline(frame, &pts, *line_width, *color)?;
             }
             DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
@@ -364,6 +356,30 @@ pub fn apply_commands(
 /// 把屏幕坐标的命令点平移到 frame 局部坐标
 fn translate(p: DrawPoint, ox: f32, oy: f32) -> (f32, f32) {
     (p.x - ox, p.y - oy)
+}
+
+/// 测试用：光栅化一条粗线（暴露 draw_thick_line 供连续性验证）
+pub fn test_draw_line(
+    frame: &mut CapturedFrame,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    lw: f32,
+) {
+    let _ = draw_thick_line(
+        frame, x1, y1, x2, y2, lw,
+        RGBA { r: 255, g: 0, b: 0, a: 255 },
+        Cap::Full, Cap::Full,
+    );
+}
+
+/// 测试用：光栅化整条折线（暴露 draw_polyline）
+pub fn test_draw_polyline(frame: &mut CapturedFrame, pts: &[(f32, f32)], lw: f32) {
+    let _ = draw_polyline(
+        frame, pts, lw,
+        RGBA { r: 255, g: 0, b: 0, a: 255 },
+    );
 }
 
 /// 给两个对角点，返回 (x1, y1, x2, y2) 其中 x1<=x2, y1<=y2
@@ -410,7 +426,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 #[derive(Clone, Copy, PartialEq)]
 enum Cap {
     Full,
-    Exact,
+
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,7 +443,9 @@ fn draw_thick_line(
 ) -> AppResult<()> {
     // 不设最小下限：允许 0.5 线宽比 1 更细（半宽 0.25 vs 0.5）
     let half = lw / 2.0;
-    let aa = 0.5_f32;
+    // AA 过渡带宽 1px：比 0.5 更柔和（替代超采样的平滑效果），
+    // 且不依赖 GPU 缩小采样（1x 光栅化，避免线条缺像素）
+    let aa = 1.0_f32;
     let r = half + aa;
 
     let dx = x2 - x1;
@@ -455,10 +473,7 @@ fn draw_thick_line(
 
         // 端点圆帽：Full=含AA外扩圆头；Exact=精确线宽圆帽（折线连接补缺口，
         // 不超出线宽故无珠串）；None=平头（闭合曲线段间）
-        let cap_r = |c: Cap| match c {
-            Cap::Full => Some(r),
-            Cap::Exact => Some(half),
-        };
+        let cap_r = |_c: Cap| Some(r);
         // 端点 A 的圆帽
         let dya = py - y1;
         if let Some(cr) = cap_r(cap_a) {
@@ -661,6 +676,85 @@ fn draw_filled_triangle(
 }
 
 /// 画一个反走样圆点（退化用）
+/// 整条折线一次性光栅化（Freehand / 椭圆轮廓）。
+///
+/// 逐段独立光栅化在段连接处会因 AA 带错位出现空隙/收窄（椭圆越大越明显）；
+/// 本函数对每个像素计算**到整条折线**的距离（所有段 + 顶点），连接处天然连续。
+/// 中间顶点圆帽半径 = 线半宽（补凹角外侧缺口，不鼓包）；首尾顶点 Full（圆头）。
+#[allow(clippy::too_many_arguments)]
+fn draw_polyline(
+    frame: &mut CapturedFrame,
+    pts: &[(f32, f32)],
+    lw: f32,
+    color: RGBA,
+) -> AppResult<()> {
+    let n = pts.len();
+    if n < 2 {
+        return Ok(());
+    }
+    let half = lw / 2.0;
+    let aa = 1.0_f32;
+    let r = half + aa;
+
+    // 包围盒（外扩 r 覆盖 AA 与圆帽）
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in pts {
+        min_x = min_x.min(p.0);
+        min_y = min_y.min(p.1);
+        max_x = max_x.max(p.0);
+        max_y = max_y.max(p.1);
+    }
+    min_x -= r;
+    min_y -= r;
+    max_x += r;
+    max_y += r;
+
+    let w_px = frame.width as i32;
+    let h_px = frame.height as i32;
+    let scan_y0 = (min_y.floor() as i32).max(0);
+    let scan_y1 = (max_y.ceil() as i32).min(h_px - 1);
+    let scan_x0 = (min_x.floor() as i32).max(0);
+    let scan_x1 = (max_x.ceil() as i32).min(w_px - 1);
+
+    for scan_y in scan_y0..=scan_y1 {
+        let py = scan_y as f32 + 0.5;
+        for scan_x in scan_x0..=scan_x1 {
+            let px = scan_x as f32 + 0.5;
+            // 到整条折线的距离 = min(所有段, 所有顶点)
+            let mut d = f32::MAX;
+            for w in pts.windows(2) {
+                let sd = point_to_segment_distance(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
+                d = d.min(sd);
+            }
+            // 顶点圆帽：首尾 Full（圆头），中间 half（补凹角外侧缺口，不鼓包）
+            for (i, p) in pts.iter().enumerate() {
+                let vr = if i == 0 || i == n - 1 { r } else { half };
+                let vd = ((px - p.0).powi(2) + (py - p.1).powi(2)).sqrt();
+                if vd <= vr {
+                    d = d.min(vd);
+                }
+            }
+            if d > r {
+                continue;
+            }
+            let coverage = if d <= half {
+                1.0
+            } else {
+                1.0 - smoothstep(half, r, d)
+            };
+            let alpha = ((color.a as f32) * coverage).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let soft = RGBA { r: color.r, g: color.g, b: color.b, a: alpha.min(255) as u8 };
+            let idx = ((scan_y * w_px + scan_x) as usize) * 4;
+            blend_pixel(&mut frame.pixels[idx..idx + 4], soft);
+        }
+    }
+    Ok(())
+}
+
 fn fill_round_dot(
     frame: &mut CapturedFrame,
     cx: f32,
@@ -718,17 +812,13 @@ fn draw_ellipse_outline(
     let rx = (x2 - x1) / 2.0;
     let ry = (y2 - y1) / 2.0;
     let n = 128;
-    let mut prev: Option<(f32, f32)> = None;
+    // 整条椭圆折线一次光栅化（polyline）：连接处连续，越大越平滑
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
-        let px = cx + rx * theta.cos();
-        let py = cy + ry * theta.sin();
-        if let Some((px0, py0)) = prev {
-            // 闭合曲线：段间精确圆帽（补缺口不鼓包），首尾重合处同样覆盖
-            draw_thick_line(frame, px0, py0, px, py, lw, color, Cap::Exact, Cap::Exact)?;
-        }
-        prev = Some((px, py));
+        pts.push((cx + rx * theta.cos(), cy + ry * theta.sin()));
     }
+    draw_polyline(frame, &pts, lw, color)?;
     Ok(())
 }
 
