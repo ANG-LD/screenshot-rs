@@ -30,7 +30,7 @@ dirs = "6"
 # 依赖 oar-ocr 包装（内部为 ONNX Runtime，默认 features 构建时下载 CPU 版运行时）。
 oar-ocr = "0.9"
 
-# OCR 依赖按需下载（首次使用 OCR 时从 GitHub 拉取 tesseract，不打包进应用）
+# OCR 模型下载（首次使用时从 GitHub release 拉取 PP-OCRv6 模型到缓存目录）
 ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
@@ -40,12 +40,8 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# 异步运行时（外部 crate 需要）
-tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
-
 # 序列化
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 toml = "0.8"
 
 # GPUI 内部用的小数组（RenderImage::new 需要）

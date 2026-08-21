@@ -2387,47 +2387,27 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
 /// `window_w` / `window_h` 是 GPUI 窗口的实际尺寸（逻辑像素），必须从
 /// `window.bounds()` 获取。它与 frame 物理尺寸可能有差异（如任务栏挤压），
 /// `paint_image` 会基于两者之比缩放图像，像素提取需用相同比率。
+/// 在后台线程对选区区域做 OCR：接收选区 RGBA 像素（已裁剪，避免克隆整帧）。
 fn run_ocr_sync(
-    rect: ub::Bounds,
-    frame_pixels: &[u8],
-    frame_width: u32,
-    frame_height: u32,
-    window_w: f32,
-    window_h: f32,
+    region_pixels: Vec<u8>,
+    region_width: u32,
+    region_height: u32,
 ) -> String {
-    // canvas 坐标 → 物理像素：需要考虑 paint_image 的缩放比
-    let x_ratio = frame_width as f32 / window_w.max(1.0);
-    let y_ratio = frame_height as f32 / window_h.max(1.0);
-    let x = (rect.origin.x * x_ratio).round().max(0.0) as u32;
-    let y = (rect.origin.y * y_ratio).round().max(0.0) as u32;
-    let w = (rect.size.x * x_ratio).round() as u32;
-    let h = (rect.size.y * y_ratio).round() as u32;
-
-    tracing::info!(
-        "OCR: logical rect=({:.1},{:.1} {}x{}) win=({:.0}x{:.0}) ratio=({:.3},{:.3}) -> physical ({},{}) {}x{}; frame={}x{}",
-        rect.origin.x, rect.origin.y, rect.size.x, rect.size.y,
-        window_w, window_h,
-        x_ratio, y_ratio,
-        x, y, w, h,
-        frame_width, frame_height,
-    );
-
-    // 边界裁剪
-    let w = w.min(frame_width.saturating_sub(x));
-    let h = h.min(frame_height.saturating_sub(y));
+    let w = region_width;
+    let h = region_height;
     if w == 0 || h == 0 {
         return String::new();
     }
 
-    // 从 RGBA 帧中提取区域，转为 RGB
+    // 从 RGBA 区域像素转 RGB
     let mut rgb: Vec<u8> = Vec::with_capacity((w * h * 3) as usize);
     for row in 0..h {
-        let base = ((y + row) * frame_width + x) as usize * 4;
+        let base = row as usize * w as usize * 4;
         for col in 0..w {
             let idx = base + col as usize * 4;
-            rgb.push(frame_pixels[idx]);     // R
-            rgb.push(frame_pixels[idx + 1]); // G
-            rgb.push(frame_pixels[idx + 2]); // B
+            rgb.push(region_pixels[idx]);     // R
+            rgb.push(region_pixels[idx + 1]); // G
+            rgb.push(region_pixels[idx + 2]); // B
         }
     }
 
@@ -3457,6 +3437,11 @@ impl Render for OverlayView {
                                 ) {
                                     let pin_x = this.client_origin.x + rect.origin.x;
                                     let pin_y = this.client_origin.y + rect.origin.y;
+                                    // 选区区域像素（RGBA，几百 KB）给后台 OCR 线程——只克隆选区
+                                    // 而非整帧（整帧 8MB 一次性拷贝），显著减少内存与拷贝耗时。
+                                    let region_pixels = clipped.pixels.clone();
+                                    let region_w = clipped.width;
+                                    let region_h = clipped.height;
                                     let payload = PinPayload {
                                         frame: clipped,
                                         origin_x: pin_x,
@@ -3464,15 +3449,11 @@ impl Render for OverlayView {
                                         sx,
                                         sy,
                                     };
-                                    // 克隆帧像素给后台线程（同步识别会卡住遮罩窗口）
-                                    let pixels = this.frame_pixels.clone();
                                     // 立即打开左图右文 OcrPin 窗口（右侧显示"识别中…"）
                                     let _ = ensure_started().send(OverlayCommand::OpenOcrPin(payload));
                                     std::thread::spawn(move || {
-                                        let text = run_ocr_sync(
-                                            rect, &pixels, fw, fh,
-                                            f32::from(wb.size.width), f32::from(wb.size.height),
-                                        );
+                                        let text =
+                                            run_ocr_sync(region_pixels, region_w, region_h);
                                         if !text.is_empty() {
                                             if let Err(e) = crate::clipboard::global().write_text(&text) {
                                                 tracing::error!("OCR: 结果写入剪贴板失败: {e}");
