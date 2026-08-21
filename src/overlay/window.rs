@@ -4376,6 +4376,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
 
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
                 let mut ocr_pin: Option<WindowHandle<OcrPinView>> = None;
+                let mut ocr_models: Option<WindowHandle<OcrModelsView>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -4427,7 +4428,22 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                             let _ = async_cx.update(|cx| open_pin_in_app(payload, cx));
                         }
                         Ok(OverlayCommand::OpenOcrModels) => {
-                            let _ = async_cx.update(open_ocr_models_in_app);
+                            // 始终只有一个 OCR 模型窗口：已存在则聚焦到前台，不重复开
+                            let alive = if let Some(h) = &ocr_models {
+                                h.update(async_cx, |_, window, _| {
+                                    window.activate_window();
+                                    true
+                                })
+                                .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            if !alive {
+                                match async_cx.update(open_ocr_models_in_app) {
+                                    Ok(h) => ocr_models = Some(h),
+                                    Err(e) => tracing::error!("[overlay] 打开 OCR 模型窗口失败: {e}"),
+                                }
+                            }
                         }
                         Ok(OverlayCommand::OpenOcrPin(payload)) => {
                             // 多次 OCR 只保留一个窗口：关掉旧的，开新的（左图右文）
@@ -5606,7 +5622,7 @@ impl Render for OcrModelsView {
 }
 
 /// 在常驻应用里打开 OCR 模型管理窗口（屏幕居中，fire-and-forget）。
-fn open_ocr_models_in_app(cx: &mut App) {
+fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<OcrModelsView>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -5660,7 +5676,7 @@ fn open_ocr_models_in_app(cx: &mut App) {
             view
         },
     )
-    .expect("open ocr models window failed");
+    .map_err(|e| AppError::Gpui(format!("打开 OCR 模型窗口失败: {e}")))
 }
 
 /// OCR 识别窗口：左侧选区图 + 右侧识别结果（类似微信文字识别）。
