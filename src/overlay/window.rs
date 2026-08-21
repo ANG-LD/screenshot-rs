@@ -5677,9 +5677,8 @@ fn open_ocr_models_in_app(cx: &mut App) {
 struct OcrPinView {
     focus_handle: FocusHandle,
     image: Arc<RenderImage>,
-    /// 图片逻辑显示尺寸
+    /// 图片逻辑显示宽度（高度取窗口高度，与选区比例一致）
     img_w: f32,
-    img_h: f32,
     /// None=识别中;Some(text)=显示文字
     text: Option<String>,
 }
@@ -5689,7 +5688,6 @@ impl OcrPinView {
         frame: CapturedFrame,
         text: Option<String>,
         disp_w: f32,
-        disp_h: f32,
         cx: &mut Context<Self>,
     ) -> Self {
         let (w, h, pixels) = (frame.width, frame.height, frame.pixels);
@@ -5698,7 +5696,6 @@ impl OcrPinView {
             focus_handle: cx.focus_handle(),
             image: img,
             img_w: disp_w,
-            img_h: disp_h,
             text,
         }
     }
@@ -5708,7 +5705,6 @@ impl Render for OcrPinView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.image.clone();
         let img_w = self.img_w;
-        let img_h = self.img_h;
         // 右侧结果区
         let right = match &self.text {
             None => div()
@@ -5839,7 +5835,7 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, cx));
+            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, cx));
             let h = view.read(cx).focus_handle.clone();
             h.focus(window, cx);
             view
