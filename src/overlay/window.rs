@@ -5721,39 +5721,13 @@ impl Render for OcrPinView {
                 ),
             Some(text) => {
                 let md = format!("```text\n{}\n```", text);
-                let text_for_copy = text.clone();
+                // 右侧文字区：黑色背景、白色字体；文字顶到标题栏下方（无复制按钮）
                 div()
                     .size_full()
-                    .flex()
-                    .flex_col()
+                    .bg(gpui::rgba(0x000000FF))
+                    .text_color(gpui::rgba(0xFFFFFFFF))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .border_b_1()
-                            .border_color(gpui::rgba(0x333333FF))
-                            .child(
-                                Button::new("ocr-pin-copy")
-                                    .label("复制")
-                                    .with_variant(ButtonVariant::Info)
-                                    .with_size(gpui_component::Size::XSmall)
-                                    .on_click(move |_, _, _| {
-                                        if let Err(e) =
-                                            crate::clipboard::global().write_text(&text_for_copy)
-                                        {
-                                            tracing::error!("OCR 结果复制失败: {e}");
-                                        } else {
-                                            tracing::info!("OCR 结果已从识别窗口复制");
-                                        }
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
                             .p(px(10.0))
                             .overflow_y_scrollbar()
                             .child(
