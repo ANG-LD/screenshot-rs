@@ -2200,13 +2200,18 @@ fn rasterize_shapes(
     let size_w = (max_x - origin_x).ceil().max(1.0).min((win_w - origin_x).max(1.0));
     let size_h = (max_y - origin_y).ceil().max(1.0).min((win_h - origin_y).max(1.0));
 
-    let phys_w = (size_w * scale_factor).round() as u32;
-    let phys_h = (size_h * scale_factor).round() as u32;
+    // 超采样（SSAA=2）：缓冲以 2×scale_factor 分辨率光栅化，bounds 保持逻辑尺寸，
+    // paint_image 缩小时线性过滤——细线（1~3px）边缘过渡从 0.5px 变 0.25px，
+    // 消除 1x 屏幕上 paint_quad/整数光栅化的齿纹/棱刺感。
+    const SSAA: f32 = 2.0;
+    let raster_scale = scale_factor * SSAA;
+    let phys_w = (size_w * raster_scale).round() as u32;
+    let phys_h = (size_h * raster_scale).round() as u32;
     if phys_w == 0 || phys_h == 0 {
         return None;
     }
-    let phys_origin_x = origin_x * scale_factor;
-    let phys_origin_y = origin_y * scale_factor;
+    let phys_origin_x = origin_x * raster_scale;
+    let phys_origin_y = origin_y * raster_scale;
 
     // 透明离屏缓冲：形状坐标转物理像素后走与 commit 相同的解析式 AA
     let mut frame = CapturedFrame {
@@ -2217,7 +2222,7 @@ fn rasterize_shapes(
     let scaled: Vec<DrawCommand> = shapes
         .iter()
         .copied()
-        .map(|c| scale_draw_command(c, scale_factor, scale_factor))
+        .map(|c| scale_draw_command(c, raster_scale, raster_scale))
         .collect();
     let _ = crate::overlay::commands::apply_commands(
         &mut frame,
