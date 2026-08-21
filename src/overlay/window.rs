@@ -4375,8 +4375,8 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 let mut overlay: Option<OverlayWindowSlot> = async_cx.update(open_parked_overlay);
 
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
-                let mut ocr_pin: Option<WindowHandle<OcrPinView>> = None;
-                let mut ocr_models: Option<WindowHandle<OcrModelsView>> = None;
+                let mut ocr_pin: Option<WindowHandle<gpui_component::Root>> = None;
+                let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -4457,19 +4457,24 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         }
                         Ok(OverlayCommand::UpdateOcrPin(text)) => {
                             if let Some(handle) = &ocr_pin {
-                                let _ = handle.update(async_cx, |view, _, cx| {
-                                    if text.is_empty() {
-                                        view.text = None;
-                                        view.text_state = None;
-                                    } else {
-                                        view.text = Some(text.clone());
-                                        // 重建 TextViewState（markdown 解析），支持选中/复制/全选
-                                        view.text_state = Some(cx.new(|cx| {
-                                            let md = format!("```text\n{}\n```", text);
-                                            gpui_component::text::TextViewState::markdown(&md, cx)
-                                        }));
+                                let _ = handle.update(async_cx, |root, _, cx| {
+                                    // Root 包裹后 downcast 访问 OcrPinView
+                                    if let Ok(view) = root.view().clone().downcast::<OcrPinView>() {
+                                        let _ = view.update(cx, |view, cx| {
+                                            if text.is_empty() {
+                                                view.text = None;
+                                                view.text_state = None;
+                                            } else {
+                                                view.text = Some(text.clone());
+                                                // 重建 TextViewState（markdown 解析），支持选中/复制/全选
+                                                view.text_state = Some(cx.new(|cx| {
+                                                    let md = format!("```text\n{}\n```", text);
+                                                    gpui_component::text::TextViewState::markdown(&md, cx)
+                                                }));
+                                            }
+                                            cx.notify();
+                                        });
                                     }
-                                    cx.notify();
                                 });
                             }
                         }
@@ -5632,7 +5637,7 @@ impl Render for OcrModelsView {
 }
 
 /// 在常驻应用里打开 OCR 模型管理窗口（屏幕居中，fire-and-forget）。
-fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<OcrModelsView>> {
+fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -5683,7 +5688,8 @@ fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<OcrModelsView>
             .detach();
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
-            view
+            // 包 Root：与 OcrPinView 一致（TextView 选择控制器依赖 Root）
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开 OCR 模型窗口失败: {e}")))
@@ -5844,7 +5850,7 @@ impl Render for OcrPinView {
 }
 
 /// 打开 OCR 识别窗口（左图右文）。窗口大小 = 图片显示宽 + 360，高度按比例。
-fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHandle<OcrPinView>> {
+fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
     let PinPayload { frame, sx, sy, .. } = payload;
     let img_w = frame.width as f32 / sx;
     let img_h = frame.height as f32 / sy;
@@ -5890,7 +5896,10 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
             let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, cx));
             let h = view.read(cx).focus_handle.clone();
             h.focus(window, cx);
-            view
+            // 包 gpui-component Root：TextView 的鼠标选择控制器依赖 Root 的
+            // selection scope（window.on_mouse_event + Root::update），
+            // 不包 Root 则右侧文字无法拖选。
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开 OCR 识别窗口失败: {e}")))
