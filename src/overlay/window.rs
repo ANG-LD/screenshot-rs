@@ -5721,7 +5721,14 @@ impl Render for OcrPinView {
                 ),
             Some(text) => {
                 let md = format!("```text\n{}\n```", text);
-                // 右侧文字区：黑色背景、白色字体；文字顶到标题栏下方（无复制按钮）
+                // 覆盖代码块配色：黑底白字（默认 muted 灰底），文字顶到标题栏下
+                let code_style = gpui::StyleRefinement::default()
+                    .bg(gpui::rgba(0x000000FF))
+                    .text_color(gpui::rgba(0xFFFFFFFF));
+                let tv_style = gpui_component::text::TextViewStyle {
+                    code_block: code_style,
+                    ..Default::default()
+                };
                 div()
                     .size_full()
                     .bg(gpui::rgba(0x000000FF))
@@ -5732,6 +5739,7 @@ impl Render for OcrPinView {
                             .overflow_y_scrollbar()
                             .child(
                                 gpui_component::text::TextView::markdown("ocr-pin-text", md)
+                                    .style(tv_style)
                                     .selectable(true),
                             ),
                     )
