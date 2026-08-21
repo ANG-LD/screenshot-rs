@@ -4458,7 +4458,17 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                         Ok(OverlayCommand::UpdateOcrPin(text)) => {
                             if let Some(handle) = &ocr_pin {
                                 let _ = handle.update(async_cx, |view, _, cx| {
-                                    view.text = if text.is_empty() { None } else { Some(text) };
+                                    if text.is_empty() {
+                                        view.text = None;
+                                        view.text_state = None;
+                                    } else {
+                                        view.text = Some(text.clone());
+                                        // 重建 TextViewState（markdown 解析），支持选中/复制/全选
+                                        view.text_state = Some(cx.new(|cx| {
+                                            let md = format!("```text\n{}\n```", text);
+                                            gpui_component::text::TextViewState::markdown(&md, cx)
+                                        }));
+                                    }
                                     cx.notify();
                                 });
                             }
@@ -5690,6 +5700,8 @@ struct OcrPinView {
     img_h: f32,
     /// None=识别中;Some(text)=显示文字
     text: Option<String>,
+    /// 文字视图状态：支持鼠标拖选 + Ctrl+C 复制 + Ctrl+A 全选
+    text_state: Option<Entity<gpui_component::text::TextViewState>>,
 }
 
 impl OcrPinView {
@@ -5708,12 +5720,13 @@ impl OcrPinView {
             img_w: disp_w,
             img_h: disp_h,
             text,
+            text_state: None,
         }
     }
 }
 
 impl Render for OcrPinView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.image.clone();
         let img_w = self.img_w;
         let img_h = self.img_h;
@@ -5732,7 +5745,6 @@ impl Render for OcrPinView {
                         .child(gpui::SharedString::from("OCR 识别中…")),
                 ),
             Some(text) => {
-                let md = format!("```text\n{}\n```", text);
                 // 覆盖代码块配色：黑底白字（默认 muted 灰底），文字顶到标题栏下
                 let code_style = gpui::StyleRefinement::default()
                     .bg(gpui::rgba(0x000000FF))
@@ -5740,6 +5752,15 @@ impl Render for OcrPinView {
                 let tv_style = gpui_component::text::TextViewStyle {
                     code_block: code_style,
                     ..Default::default()
+                };
+                let text_view = if let Some(state) = &self.text_state {
+                    // 有状态句柄：支持拖选/Ctrl+C/Ctrl+A
+                    gpui_component::text::TextView::new(state).style(tv_style).selectable(true)
+                } else {
+                    let md = format!("```text\n{}\n```", text);
+                    gpui_component::text::TextView::markdown("ocr-pin-text", md)
+                        .style(tv_style)
+                        .selectable(true)
                 };
                 div()
                     .size_full()
@@ -5749,11 +5770,7 @@ impl Render for OcrPinView {
                         div()
                             .p(px(10.0))
                             .overflow_y_scrollbar()
-                            .child(
-                                gpui_component::text::TextView::markdown("ocr-pin-text", md)
-                                    .style(tv_style)
-                                    .selectable(true),
-                            ),
+                            .child(text_view),
                     )
             }
         };
@@ -5785,6 +5802,34 @@ impl Render for OcrPinView {
             .bg(gpui::rgba(0x181818FF))
             .text_color(gpui::rgba(0xE6E6E6FF))
             .track_focus(&self.focus_handle)
+            // Ctrl+C / Cmd+C 复制选中文字、Ctrl+A / Cmd+A 全选。
+            // 用 arboard 长存剪贴板（GPUI write_to_clipboard 在 X11 不可靠），
+            // 且不依赖焦点落在 TextView 上（根拦截）。
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                let is_c = ev.keystroke.key == "c" || ev.keystroke.key == "C";
+                let is_a = ev.keystroke.key == "a" || ev.keystroke.key == "A";
+                let mods = ev.keystroke.modifiers;
+                let copy = (mods.control || mods.platform) && is_c;
+                let select_all = (mods.control || mods.platform) && is_a;
+                if !copy && !select_all {
+                    return;
+                }
+                let Some(state) = &this.text_state else { return };
+                if copy {
+                    let selected = state.read(cx).selected_text();
+                    if !selected.trim().is_empty() {
+                        if let Err(e) = crate::clipboard::global().write_text(&selected) {
+                            tracing::error!("OCR 复制选中文字失败: {e}");
+                        } else {
+                            tracing::info!("OCR 已复制选中文字 ({} bytes)", selected.len());
+                        }
+                    }
+                    cx.stop_propagation();
+                } else if select_all {
+                    state.update(cx, |s, cx| s.select_all(cx));
+                    cx.stop_propagation();
+                }
+            }))
             // 左侧图片区：flex 自适应占满剩余空间，窗口缩放时图片保持比例居中
             .child(
                 div()
