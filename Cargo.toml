@@ -5,12 +5,17 @@ edition = "2021"
 description = "Cross-platform screenshot tool built with GPUI"
 license = "MIT"
 
-# GPU 推理：默认启用 ocr-cuda——一个安装包同时含 CPU+CUDA 能力，
-# 运行时自动检测：有 NVIDIA 显卡用 GPU，没有则回落 CPU（无需用户配置）。
-# ocr-directml（Windows 通用 GPU）/ ocr-openvino（Intel）可替代 cuda。
+# GPU 推理（按平台在构建时启用，不能默认——macOS 无 CUDA 预编译包）：
+#   Linux/Windows: --features ocr-cuda   （NVIDIA，一个包同时含 CPU+CUDA，
+#                                          运行时自动检测：有卡用 GPU 无卡用 CPU）
+#   macOS:         --features ocr-coreml （Apple 芯片 GPU/神经引擎加速）
+#   Windows 通用:   --features ocr-directml （AMD/Intel/NVIDIA 均可）
+#   Intel:         --features ocr-openvino
+# 构建指引见 README「推理后端」。CI 打包脚本按平台选择对应 feature。
 [features]
-default = ["ocr-cuda"]
+default = []
 ocr-cuda = ["oar-ocr/cuda"]
+ocr-coreml = ["oar-ocr/coreml"]
 ocr-directml = ["oar-ocr/directml"]
 ocr-openvino = ["oar-ocr/openvino"]
 

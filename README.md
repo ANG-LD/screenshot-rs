@@ -50,15 +50,24 @@ mkdir -p models/PP-OCRv6
 
 ### 推理后端：自动检测（有 GPU 用 GPU，没有用 CPU）
 
-**一个安装包自动适配**：二进制内置 CPU + CUDA 两种能力（默认启用
-`ocr-cuda` feature，静态链接 GPU 版 ONNX Runtime）。运行时**自动检测**：
+**构建时按平台启用加速 feature**（macOS 无 CUDA 预编译包，不能默认）：
 
-- 机器有 NVIDIA 显卡 + 驱动/CUDA 运行库 → **GPU 推理**（日志：
-  `运行时检测到 CUDA GPU 设备 → 使用 GPU 推理`）
-- 没有 → **CPU 推理**（日志：`未检测到 CUDA GPU → 使用 CPU 推理`）
+| 平台 | 构建命令 | 加速后端 |
+|---|---|---|
+| Linux / Windows | `cargo build --release --features ocr-cuda` | NVIDIA CUDA |
+| macOS（Apple 芯片）| `cargo build --release --features ocr-coreml` | CoreML（GPU/神经引擎）|
+| Windows 通用 GPU | `cargo build --release --features ocr-directml` | DirectML |
+| Intel 平台 | `cargo build --release --features ocr-openvino` | OpenVINO |
+| 纯 CPU | `cargo build --release` | 无 |
+
+**运行时自动检测**：加速 feature 构建的安装包同时含 CPU + 加速能力，
+启动时枚举真实硬件设备自动选择——
+
+- 有对应加速硬件 → 加速推理（日志：`运行时检测到 CUDA GPU 设备 → 使用 GPU 推理`）
+- 没有 → **CPU 推理**（日志：`未检测到可用加速设备 → 使用 CPU 推理`）
 
 无需任何配置。也可手动指定（`config.toml` 或环境变量
-`OCR_EXECUTION_PROVIDER`）：`auto`（默认）/ `cpu` / `cuda` / `directml` / `openvino`。
+`OCR_EXECUTION_PROVIDER`）：`auto`（默认）/ `cpu` / `cuda` / `coreml` / `directml` / `openvino`。
 
 GPU 收益：det+rec 推理从 CPU 的数百毫秒~秒级降到几十毫秒（小图），
 代码区 small 档约 0.8s → 预计 <0.2s；medium 多行场景收益更大。

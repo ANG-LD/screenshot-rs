@@ -624,29 +624,46 @@ fn ensure_models_impl(
     Ok(out)
 }
 
-/// 运行时探测：当前机器是否有可用的 CUDA GPU。
-/// 通过 ORT 的 EP 设备枚举（`Environment::devices()`）查询——编译进二进制的
-/// CUDA provider 在无 NVIDIA 硬件/驱动/CUDA 运行库时枚举不到设备。
-fn detect_cuda_device() -> bool {
+/// 运行时探测可用的加速 EP（CUDA / CoreML / DirectML / OpenVINO）。
+/// 通过 ORT 的 `Environment::devices()` 枚举——只枚举**编译进二进制**的 EP 的
+/// **真实硬件设备**（无硬件/驱动/运行库时枚举不到），因此同一安装包在不同机器
+/// 自动适配：有加速硬件用加速，没有用 CPU。
+/// 返回探测到的 EP 名（"cuda"/"coreml"/"directml"/"openvino"），无则 None。
+fn detect_accelerator() -> Option<&'static str> {
     let env = match ort::environment::Environment::current() {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!("OCR: 查询 ORT 环境失败（视为无 GPU）: {e}");
-            return false;
+            tracing::warn!("OCR: 查询 ORT 环境失败（视为无加速器）: {e}");
+            return None;
         }
     };
+    let mut names: Vec<String> = Vec::new();
     for dev in env.devices() {
-        match dev.ep() {
-            Ok(name) if name.contains("CUDA") => {
+        if let Ok(name) = dev.ep() {
+            names.push(name.to_string());
+            if name.contains("CUDA") {
                 tracing::info!("OCR: 运行时检测到 CUDA GPU 设备（{name}）→ 使用 GPU 推理");
-                return true;
+                return Some("cuda");
             }
-            Ok(_) => {}
-            Err(e) => tracing::debug!("OCR: 查询设备 provider 失败: {e}"),
+            if name.contains("CoreML") {
+                tracing::info!("OCR: 运行时检测到 CoreML 设备（{name}）→ 使用 GPU/神经引擎推理");
+                return Some("coreml");
+            }
+            if name.contains("Dml") || name.contains("DirectML") {
+                tracing::info!("OCR: 运行时检测到 DirectML 设备（{name}）→ 使用 GPU 推理");
+                return Some("directml");
+            }
+            if name.contains("OpenVINO") {
+                tracing::info!("OCR: 运行时检测到 OpenVINO 设备（{name}）→ 使用加速推理");
+                return Some("openvino");
+            }
         }
     }
-    tracing::info!("OCR: 未检测到 CUDA GPU → 使用 CPU 推理");
-    false
+    tracing::info!(
+        "OCR: 未检测到可用加速设备（ORT 设备: {}）→ 使用 CPU 推理",
+        if names.is_empty() { "无".to_string() } else { names.join(", ") }
+    );
+    None
 }
 
 /// 按配置名构造 ORT execution providers（按优先级排列，GPU 在前、CPU 兜底）。
@@ -679,15 +696,37 @@ fn execution_providers(name: &str) -> Vec<oar_ocr::core::config::OrtExecutionPro
             },
             OrtExecutionProvider::CPU,
         ],
+        "coreml" => vec![
+            OrtExecutionProvider::CoreML {
+                ane_only: None,
+                subgraphs: None,
+            },
+            OrtExecutionProvider::CPU,
+        ],
         "cpu" => vec![OrtExecutionProvider::CPU],
-        // auto / 未知值：运行时检测 CUDA 设备
-        _ => {
-            if detect_cuda_device() {
-                cuda()
-            } else {
-                vec![OrtExecutionProvider::CPU]
-            }
-        }
+        // auto / 未知值：运行时探测任何可用加速 EP
+        _ => match detect_accelerator() {
+            Some("cuda") => cuda(),
+            Some("directml") => vec![
+                OrtExecutionProvider::DirectML { device_id: Some(0) },
+                OrtExecutionProvider::CPU,
+            ],
+            Some("openvino") => vec![
+                OrtExecutionProvider::OpenVINO {
+                    device_type: Some("GPU".into()),
+                    num_threads: None,
+                },
+                OrtExecutionProvider::CPU,
+            ],
+            Some("coreml") => vec![
+                OrtExecutionProvider::CoreML {
+                    ane_only: None,
+                    subgraphs: None,
+                },
+                OrtExecutionProvider::CPU,
+            ],
+            _ => vec![OrtExecutionProvider::CPU],
+        },
     }
 }
 
