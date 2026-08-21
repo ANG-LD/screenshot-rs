@@ -5685,14 +5685,20 @@ struct OcrPinView {
 }
 
 impl OcrPinView {
-    fn new(frame: CapturedFrame, text: Option<String>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        frame: CapturedFrame,
+        text: Option<String>,
+        disp_w: f32,
+        disp_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (w, h, pixels) = (frame.width, frame.height, frame.pixels);
         let img = build_render_image_from_pixels(w, h, pixels);
         Self {
             focus_handle: cx.focus_handle(),
             image: img,
-            img_w: w as f32,
-            img_h: h as f32,
+            img_w: disp_w,
+            img_h: disp_h,
             text,
         }
     }
@@ -5767,7 +5773,8 @@ impl Render for OcrPinView {
             move |bounds, img, window, _cx| {
                 let _ = window.paint_image(bounds, Default::default(), img.clone(), 0, false);
             },
-        );
+        )
+        .size_full();
         div()
             .id("ocr-pin")
             .size_full()
@@ -5775,11 +5782,11 @@ impl Render for OcrPinView {
             .bg(gpui::rgba(0x181818FF))
             .text_color(gpui::rgba(0xE6E6E6FF))
             .track_focus(&self.focus_handle)
-            // 左侧图片区：固定显示尺寸（按比例缩放后的宽度/高度）
+            // 左侧图片区：宽度=图片显示宽，高度=窗口高度（图片按 bounds 等比填充）
             .child(
                 div()
                     .w(px(img_w))
-                    .h(px(img_h))
+                    .h_full()
                     .bg(gpui::rgba(0x000000FF))
                     .child(paint),
             )
@@ -5793,7 +5800,7 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
     let PinPayload { frame, sx, sy, .. } = payload;
     let img_w = frame.width as f32 / sx;
     let img_h = frame.height as f32 / sy;
-    // 限制显示尺寸
+    // 限制显示尺寸（选区高度即默认窗口高度，左侧宽度即图片显示宽度）
     let max_w = 900.0_f32;
     let max_h = 700.0_f32;
     let scale = (max_w / img_w).min(max_h / img_h).min(1.0).max(150.0 / img_w);
@@ -5832,7 +5839,7 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| OcrPinView::new(frame, None, cx));
+            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, cx));
             let h = view.read(cx).focus_handle.clone();
             h.focus(window, cx);
             view
