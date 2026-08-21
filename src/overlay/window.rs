@@ -4460,7 +4460,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                 let _ = handle.update(async_cx, |root, _, cx| {
                                     // Root 包裹后 downcast 访问 OcrPinView
                                     if let Ok(view) = root.view().clone().downcast::<OcrPinView>() {
-                                        let _ = view.update(cx, |view, cx| {
+                                        view.update(cx, |view, cx| {
                                             if text.is_empty() {
                                                 view.text = None;
                                                 view.text_state = None;
