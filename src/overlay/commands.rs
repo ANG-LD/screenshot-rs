@@ -323,7 +323,7 @@ pub fn apply_commands(
                     let bx = t.0 - ux * head_len;
                     let by = t.1 - uy * head_len;
                     // 主线：均匀宽度，直达箭头底部
-                    draw_thick_line(frame, f.0, f.1, bx, by, *line_width, *color, true, true)?;
+                    draw_thick_line(frame, f.0, f.1, bx, by, *line_width, *color, Cap::Full, Cap::Full)?;
                     // 实心箭头头：填满三角形，底边完全盖住主线末端，连接无缝
                     let px = -uy;
                     let py = ux;
@@ -332,7 +332,7 @@ pub fn apply_commands(
                     draw_filled_triangle(frame, t.0, t.1, p1.0, p1.1, p2.0, p2.1, *color)?;
                 } else {
                     // 极短线：至少画一个点
-                    draw_thick_line(frame, f.0, f.1, t.0, t.1, *line_width, *color, true, true)?;
+                    draw_thick_line(frame, f.0, f.1, t.0, t.1, *line_width, *color, Cap::Full, Cap::Full)?;
                 }
             }
             DrawCommand::Freehand { points, color, line_width } => {
@@ -342,8 +342,10 @@ pub fn apply_commands(
                 for (i, w) in points.windows(2).enumerate() {
                     let p1 = translate(w[0], region_origin_x, region_origin_y);
                     let p2 = translate(w[1], region_origin_x, region_origin_y);
-                    let cap_a = i == 0;
-                    let cap_b = i + 1 == n_seg;
+                    // 首段起点/末段终点：全圆帽（圆头）；
+                    // 中间顶点：精确圆帽（半径=线半宽）——覆盖折角缺口且不鼓包
+                    let cap_a = if i == 0 { Cap::Full } else { Cap::Exact };
+                    let cap_b = if i + 1 == n_seg { Cap::Full } else { Cap::Exact };
                     draw_thick_line(
                         frame, p1.0, p1.1, p2.0, p2.1, *line_width, *color, cap_a, cap_b,
                     )?;
@@ -403,6 +405,14 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// - d > half+0.5 → 跳过
 ///
 /// 相比之前的重叠软圆方案，内部像素只写一次，不再因多次叠加变糊。
+/// 线段端点圆帽：Full=全圆帽（半径含 AA 外扩，线端圆头）；
+/// Exact=精确圆帽（半径=线半宽，覆盖折线连接缺口、不超出线宽——不产生珠串鼓包）。
+#[derive(Clone, Copy, PartialEq)]
+enum Cap {
+    Full,
+    Exact,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_thick_line(
     frame: &mut CapturedFrame,
@@ -412,8 +422,8 @@ fn draw_thick_line(
     y2: f32,
     lw: f32,
     color: RGBA,
-    cap_a: bool,
-    cap_b: bool,
+    cap_a: Cap,
+    cap_b: Cap,
 ) -> AppResult<()> {
     // 不设最小下限：允许 0.5 线宽比 1 更细（半宽 0.25 vs 0.5）
     let half = lw / 2.0;
@@ -443,19 +453,29 @@ fn draw_thick_line(
         let mut x_min = f32::MAX;
         let mut x_max = f32::MIN;
 
-        // 端点 A 的圆帽（折线中间段不画，避免圆帽半径含 AA 外扩导致珠串凸点）
+        // 端点圆帽：Full=含AA外扩圆头；Exact=精确线宽圆帽（折线连接补缺口，
+        // 不超出线宽故无珠串）；None=平头（闭合曲线段间）
+        let cap_r = |c: Cap| match c {
+            Cap::Full => Some(r),
+            Cap::Exact => Some(half),
+        };
+        // 端点 A 的圆帽
         let dya = py - y1;
-        if cap_a && dya.abs() < r {
-            let c = (r * r - dya * dya).sqrt();
-            x_min = x_min.min(x1 - c);
-            x_max = x_max.max(x1 + c);
+        if let Some(cr) = cap_r(cap_a) {
+            if dya.abs() < cr {
+                let c = (cr * cr - dya * dya).sqrt();
+                x_min = x_min.min(x1 - c);
+                x_max = x_max.max(x1 + c);
+            }
         }
         // 端点 B 的圆帽
         let dyb = py - y2;
-        if cap_b && dyb.abs() < r {
-            let c = (r * r - dyb * dyb).sqrt();
-            x_min = x_min.min(x2 - c);
-            x_max = x_max.max(x2 + c);
+        if let Some(cr) = cap_r(cap_b) {
+            if dyb.abs() < cr {
+                let c = (cr * cr - dyb * dyb).sqrt();
+                x_min = x_min.min(x2 - c);
+                x_max = x_max.max(x2 + c);
+            }
         }
 
         // 线段主体（两条平行边界线与扫描行的交点）
@@ -704,8 +724,8 @@ fn draw_ellipse_outline(
         let px = cx + rx * theta.cos();
         let py = cy + ry * theta.sin();
         if let Some((px0, py0)) = prev {
-            // 闭合曲线：所有段平头连接（无端点圆帽），避免珠串
-            draw_thick_line(frame, px0, py0, px, py, lw, color, false, false)?;
+            // 闭合曲线：段间精确圆帽（补缺口不鼓包），首尾重合处同样覆盖
+            draw_thick_line(frame, px0, py0, px, py, lw, color, Cap::Exact, Cap::Exact)?;
         }
         prev = Some((px, py));
     }
@@ -724,10 +744,10 @@ fn draw_rect_outline(
 ) -> AppResult<()> {
     let w = x2 - x1;
     let h = y2 - y1;
-    draw_thick_line(frame, x1, y1, x2, y1, lw, color, true, true)?;
-    draw_thick_line(frame, x1, y2, x2, y2, lw, color, true, true)?;
-    draw_thick_line(frame, x1, y1, x1, y2, lw, color, true, true)?;
-    draw_thick_line(frame, x2, y1, x2, y2, lw, color, true, true)?;
+    draw_thick_line(frame, x1, y1, x2, y1, lw, color, Cap::Full, Cap::Full)?;
+    draw_thick_line(frame, x1, y2, x2, y2, lw, color, Cap::Full, Cap::Full)?;
+    draw_thick_line(frame, x1, y1, x1, y2, lw, color, Cap::Full, Cap::Full)?;
+    draw_thick_line(frame, x2, y1, x2, y2, lw, color, Cap::Full, Cap::Full)?;
     // 让编译器闭嘴（h 没用上）
     let _ = (w, h);
     Ok(())
