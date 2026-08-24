@@ -749,8 +749,10 @@ fn draw_polyline(
         let y1 = w[0].1.max(w[1].1) + r;
         seg_boxes.push((x0, y0, x1, y1, idx));
     }
-    // 按 y_min 排序（保留原始段索引，距离计算必须用原始 pts 段）
-    seg_boxes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 按 y_max(by1) 升序排序：行过滤时 y_max < py 的段可安全跳过
+    // （y_max 有序；若按 y_min 排序后 break，会漏掉 y_min 小但 y_max 大、
+    //  跨越当前行的竖直长段——长笔画前段变虚的根因）
+    seg_boxes.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
     // 顶点圆帽：首尾 Full，中间 half；按 y_min(p.y - vr) 排序做行范围过滤
     let mut vcaps: Vec<(f32, f32, f32)> = pts
         .iter()
@@ -760,7 +762,8 @@ fn draw_polyline(
             (p.0, p.1, vr)
         })
         .collect();
-    vcaps.sort_by(|a, b| (a.1 - a.2).partial_cmp(&(b.1 - b.2)).unwrap_or(std::cmp::Ordering::Equal));
+    // 按 y_max(vy+vr) 升序：行过滤安全（y_max 有序，y_min 小的长竖直段不丢）
+    vcaps.sort_by(|a, b| (a.1 + a.2).partial_cmp(&(b.1 + b.2)).unwrap_or(std::cmp::Ordering::Equal));
 
     let step = step.max(1);
     let mut scan_y = scan_y0;
@@ -772,12 +775,11 @@ fn draw_polyline(
             let px = scan_x as f32 + 0.5;
             // 到整条折线的距离 = min(横穿该行的段, 覆盖该行的顶点圆帽)
             let mut d = f32::MAX;
-            // 只检查 y_min <= py 的段（二分），反向遍历时 y_max < py 提前结束
-            let seg_lo = seg_boxes.partition_point(|b| b.1 <= py);
-            for k in (0..seg_lo).rev() {
-                let (bx0, _by0, bx1, by1, seg_idx) = seg_boxes[k];
-                if by1 < py {
-                    break;
+            // 遍历 y_max >= py 的段（y_max 升序二分起点），continue 跳过 y_min > py
+            let seg_hi = seg_boxes.partition_point(|b| b.3 < py);
+            for &(bx0, by0, bx1, _by1, seg_idx) in &seg_boxes[seg_hi..] {
+                if by0 > py {
+                    continue; // 段起点在 py 之下（该行还没进入段）
                 }
                 if px < bx0 || px > bx1 {
                     continue;
@@ -787,13 +789,13 @@ fn draw_polyline(
                 let sd = point_to_segment_distance(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
                 d = d.min(sd);
             }
-            // 顶点圆帽：只检查 y_min(p.y-vr) <= py 的顶点（二分定位），
-            // 再跳过 y_max(p.y+vr) < py 的——Freehand 数千点时避免每像素全遍历
-            let lo = vcaps
-                .partition_point(|v| v.1 - v.2 <= py);
-            for (vx, vy, vr) in vcaps[..lo].iter().rev() {
-                if *vy + *vr < py {
-                    break; // y_max < py（按 y_min 排序，反向遍历提前结束）
+            // 顶点圆帽：遍历 y_max(vy+vr) >= py 的顶点（y_max 升序二分起点），
+            // continue 跳过 y_min(vy-vr) > py 的——长笔画不丢前段
+            let hi = vcaps
+                .partition_point(|v| v.1 + v.2 < py);
+            for (vx, vy, vr) in vcaps[hi..].iter() {
+                if vy - vr > py {
+                    continue;
                 }
                 if px < vx - vr || px > vx + vr {
                     continue;
