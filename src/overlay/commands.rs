@@ -386,6 +386,18 @@ pub fn test_draw_line(
     );
 }
 
+/// 光栅化整条折线到帧（增量渲染用：坐标已 translate 到帧局部）。
+/// 供 OverlayView 增量画新增段时直接调用，避免 DrawCommand 构造/分发开销。
+pub fn draw_polyline_pub(
+    frame: &mut CapturedFrame,
+    pts: &[(f32, f32)],
+    lw: f32,
+    color: RGBA,
+    step: u32,
+) -> AppResult<()> {
+    draw_polyline(frame, pts, lw, color, step)
+}
+
 /// 测试用：光栅化整条折线（暴露 draw_polyline）
 pub fn test_draw_polyline(frame: &mut CapturedFrame, pts: &[(f32, f32)], lw: f32) {
     let _ = draw_polyline(

@@ -2161,7 +2161,6 @@ fn update_in_progress_incr(
     self_: &mut OverlayView,
     _window: &Window,
 ) -> Option<(Arc<RenderImage>, ub::Bounds)> {
-    use crate::overlay::drawing::Point as DP;
     let scale = self_.scale_factor;
     let Some(ip) = &self_.in_progress else {
         self_.in_progress_incr = None;
@@ -2214,16 +2213,16 @@ fn update_in_progress_incr(
     if reusable {
         let st = self_.in_progress_incr.as_mut().unwrap();
         if now > st.rendered {
-            // 增量：画新段（含 rendered-1 重叠点保证与旧线连接）
+            // 增量：画新段（含 rendered-1 重叠点保证与旧线连接）。
+            // 直接调 draw_polyline_pub（坐标已 translate），省 DrawCommand 构造/分发
             let start = st.rendered.saturating_sub(1);
-            let newpts: Vec<DP> = points[start..now].iter().map(|p| DP::new(p.x, p.y)).collect();
-            let cmd = DrawCommand::Freehand {
-                points: newpts,
-                color: *color,
-                line_width: lw,
-            };
-            let _ = crate::overlay::commands::apply_commands_step(
-                &mut st.frame, phys_ox as f32, phys_oy as f32, &[cmd], 1,
+            let n = now - start;
+            let mut newpts: Vec<(f32, f32)> = Vec::with_capacity(n);
+            for p in &points[start..now] {
+                newpts.push((p.x - phys_ox as f32, p.y - phys_oy as f32));
+            }
+            let _ = crate::overlay::commands::draw_polyline_pub(
+                &mut st.frame, &newpts, lw, *color, 1,
             );
             st.rendered = now;
             let img = build_render_image_from_pixels(phys_w, phys_h, st.frame.pixels.clone());
@@ -2259,14 +2258,13 @@ fn update_in_progress_incr(
             // 画从旧已渲染点之后的新段（含重叠点连接）
             let start = old_rendered.saturating_sub(1);
             if now > start {
-                let newpts: Vec<DP> = points[start..now].iter().map(|p| DP::new(p.x, p.y)).collect();
-                let cmd = DrawCommand::Freehand {
-                    points: newpts,
-                    color: *color,
-                    line_width: lw,
-                };
-                let _ = crate::overlay::commands::apply_commands_step(
-                    &mut frame, phys_ox as f32, phys_oy as f32, &[cmd], 1,
+                let n = now - start;
+                let mut newpts: Vec<(f32, f32)> = Vec::with_capacity(n);
+                for p in &points[start..now] {
+                    newpts.push((p.x - phys_ox as f32, p.y - phys_oy as f32));
+                }
+                let _ = crate::overlay::commands::draw_polyline_pub(
+                    &mut frame, &newpts, lw, *color, 1,
                 );
             }
             let img = build_render_image_from_pixels(phys_w, phys_h, frame.pixels.clone());
@@ -2287,14 +2285,13 @@ fn update_in_progress_incr(
             };
             return Some((img, phys_bounds));
         }
-        // 首次：全量画一次
-        let cmd = DrawCommand::Freehand {
-            points: points.iter().map(|p| DP::new(p.x, p.y)).collect(),
-            color: *color,
-            line_width: lw,
-        };
-        let _ = crate::overlay::commands::apply_commands_step(
-            &mut frame, phys_ox as f32, phys_oy as f32, &[cmd], 1,
+        // 首次：全量画一次（预分配）
+        let mut allpts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
+        for p in points {
+            allpts.push((p.x - phys_ox as f32, p.y - phys_oy as f32));
+        }
+        let _ = crate::overlay::commands::draw_polyline_pub(
+            &mut frame, &allpts, lw, *color, 1,
         );
         let img = build_render_image_from_pixels(phys_w, phys_h, frame.pixels.clone());
         self_.in_progress_incr = Some(IncrFreehand {
