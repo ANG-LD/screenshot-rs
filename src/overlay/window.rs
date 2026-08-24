@@ -74,6 +74,22 @@ struct ShapeLayerCache {
 }
 
 
+/// Freehand 当前笔画增量状态：拖动时只画新增段（快）。
+/// buffer 用【逻辑分辨率】+ 线身 Exact 圆帽——与全量 rasterize_shapes
+/// 完全同一坐标系/同一线身 → 松手切换到 committed 时线条像素级不变。
+struct IncrFreehand {
+    /// CPU buffer（RGBA，透明底，逻辑像素）
+    frame: CapturedFrame,
+    /// buffer 逻辑原点（floor 整数）
+    origin: (f32, f32),
+    /// 已渲染点数
+    rendered: usize,
+    /// 线宽（变化时重建）
+    lw: f32,
+    /// 渲染结果（图 + 逻辑 bounds）
+    image: Option<(Arc<RenderImage>, ub::Bounds)>,
+}
+
 /// GPUI 视图：覆盖窗口内容
 pub struct OverlayView {
     /// 捕获帧的 GPUI 渲染图（已转 BGRA）
@@ -104,6 +120,8 @@ pub struct OverlayView {
 
     /// 已提交形状的离屏光栅化缓存（见 `ShapeLayerCache`）
     shape_layer_cache: Option<ShapeLayerCache>,
+    /// Freehand 当前笔画增量状态（拖动中与松手后同一来源，杜绝双线条）
+    in_progress_incr: Option<IncrFreehand>,
 
 
     /// Text 工具：是否正在编辑一段文字
@@ -297,6 +315,7 @@ impl OverlayView {
             drawing: DrawingState::new(),
             in_progress: None,
             shape_layer_cache: None,
+            in_progress_incr: None,
             text_input: None,
             text_input_anchor: BoundsPoint::ZERO,
             text_input_rect: ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO),
@@ -353,6 +372,7 @@ impl OverlayView {
         self.drawing = DrawingState::new();
         self.in_progress = None;
         self.shape_layer_cache = None;
+        self.in_progress_incr = None;
         self.text_input = None;
         self.text_input_anchor = BoundsPoint::ZERO;
         self.text_input_rect = ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO);
@@ -451,6 +471,9 @@ impl OverlayView {
         let color = self.toolbar.current_color;
         let lw = self.toolbar.line_width;
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
+        // 新笔画开始：清空上一条 Freehand 的增量层（它已提交，由 committed 全量渲染，
+        // 与增量线身一致 → 无差别）
+        self.in_progress_incr = None;
         self.in_progress = Some(std::sync::Arc::new(match tool {
             ToolButton::Rectangle => DrawCommand::Rectangle {
                 rect: (dp, dp),
@@ -2137,6 +2160,161 @@ fn is_shape_command(c: &DrawCommand) -> bool {
 /// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感，所以这里
 /// 复用 commit 路径的 `commands::apply_commands` 逐像素解析式 AA，得到与最终成图
 /// 一致的平滑线条。返回 `None` 若无形状。
+/// 增量渲染 Freehand 当前笔画（逻辑分辨率 buffer，与全量同坐标系同线身）：
+/// 每帧只把新增段画到已有 buffer；松手后 committed 全量渲染的线身与此
+/// 像素级一致 → 不会出现"第二根线"。
+fn update_in_progress_incr(
+    self_: &mut OverlayView,
+    _window: &Window,
+) -> Option<(Arc<RenderImage>, ub::Bounds)> {
+    let Some(ip) = &self_.in_progress else {
+        self_.in_progress_incr = None;
+        return None;
+    };
+    let DrawCommand::Freehand { points, color, line_width } = &**ip else {
+        self_.in_progress_incr = None;
+        return None;
+    };
+    if points.len() < 2 {
+        return None;
+    }
+    let lw = *line_width;
+    // 逻辑 bbox（floor 整数原点，与 rasterize_shapes 的 origin_x.floor 一致）
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in points {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    let pad = lw / 2.0 + 1.0;
+    let ox = (min_x - pad).floor();
+    let oy = (min_y - pad).floor();
+    let bw = ((max_x + pad).ceil() - ox).max(1.0).ceil() as u32;
+    let bh = ((max_y + pad).ceil() - oy).max(1.0).ceil() as u32;
+    let now = points.len();
+
+    let reusable = match &self_.in_progress_incr {
+        Some(st) => {
+            st.origin == (ox, oy) && st.frame.width == bw && st.frame.height == bh && st.lw == lw
+        }
+        None => false,
+    };
+
+    let bounds = ub::Bounds {
+        origin: ub::Point::new(ox, oy),
+        size: ub::Point::new((max_x - min_x + pad * 2.0).max(1.0), (max_y - min_y + pad * 2.0).max(1.0)),
+    };
+
+    if reusable {
+        let st = self_.in_progress_incr.as_mut().unwrap();
+        if now > st.rendered {
+            // 增量：新段（rendered-1 重叠点连接），Exact 两端（与全量中间顶点一致）
+            let start = st.rendered.saturating_sub(1);
+            let mut newpts: Vec<(f32, f32)> = Vec::with_capacity(now - start);
+            for p in &points[start..now] {
+                newpts.push((p.x - ox, p.y - oy));
+            }
+            let _ = crate::overlay::commands::draw_polyline_pub(
+                &mut st.frame, &newpts, lw, *color, 1,
+                crate::overlay::commands::Cap::Exact,
+                crate::overlay::commands::Cap::Exact,
+            );
+            st.rendered = now;
+            let img = build_render_image_from_pixels(bw, bh, st.frame.pixels.clone());
+            st.image = Some((img, bounds));
+        }
+        st.image.clone()
+    } else {
+        // 重建（bbox 变化）：拷贝旧像素 + 画剩余新段
+        let mut frame = CapturedFrame {
+            width: bw,
+            height: bh,
+            pixels: vec![0; (bw * bh * 4) as usize],
+        };
+        if let Some(old) = &self_.in_progress_incr {
+            let ox0 = old.origin.0.max(ox);
+            let oy0 = old.origin.1.max(oy);
+            let ox1 = (old.origin.0 + old.frame.width as f32).min(ox + bw as f32);
+            let oy1 = (old.origin.1 + old.frame.height as f32).min(oy + bh as f32);
+            if ox1 > ox0 && oy1 > oy0 {
+                for yy in 0..((oy1 - oy0) as u32) {
+                    let sy = (oy0 + yy as f32 - old.origin.1) as usize;
+                    let dy = (oy0 + yy as f32 - oy) as usize;
+                    let sx = (ox0 - old.origin.0) as usize;
+                    let dx = (ox0 - ox) as usize;
+                    let len = ((ox1 - ox0) as usize) * 4;
+                    let src = sy * old.frame.width as usize * 4 + sx * 4;
+                    let dst = dy * bw as usize * 4 + dx * 4;
+                    if dst + len <= frame.pixels.len() && src + len <= old.frame.pixels.len() {
+                        frame.pixels[dst..dst + len]
+                            .copy_from_slice(&old.frame.pixels[src..src + len]);
+                    }
+                }
+            }
+            let old_rendered = old.rendered;
+            let start = old_rendered.saturating_sub(1);
+            if now > start {
+                let mut newpts: Vec<(f32, f32)> = Vec::with_capacity(now - start);
+                for p in &points[start..now] {
+                    newpts.push((p.x - ox, p.y - oy));
+                }
+                let _ = crate::overlay::commands::draw_polyline_pub(
+                    &mut frame, &newpts, lw, *color, 1,
+                    crate::overlay::commands::Cap::Exact,
+                    crate::overlay::commands::Cap::Exact,
+                );
+            }
+            let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
+            self_.in_progress_incr = Some(IncrFreehand {
+                frame,
+                origin: (ox, oy),
+                rendered: now,
+                lw,
+                image: None,
+            });
+            if let Some(st) = self_.in_progress_incr.as_mut() {
+                st.image = Some((img.clone(), bounds));
+            }
+            return Some((img, bounds));
+        }
+        // 首次：全量画一次（首尾 Full 圆头，与提交一致）
+        let mut allpts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
+        for p in points {
+            allpts.push((p.x - ox, p.y - oy));
+        }
+        let _ = crate::overlay::commands::draw_polyline_pub(
+            &mut frame, &allpts, lw, *color, 1,
+            crate::overlay::commands::Cap::Full,
+            crate::overlay::commands::Cap::Full,
+        );
+        let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
+        self_.in_progress_incr = Some(IncrFreehand {
+            frame,
+            origin: (ox, oy),
+            rendered: now,
+            lw,
+            image: Some((img.clone(), bounds)),
+        });
+        Some((img, bounds))
+    }
+}
+
+/// 判断命令 c 是否是 drawing 可见命令中的最后一条 Freehand
+/// （in_progress_incr 正在显示它，committed 应跳过以免重渲染出第二条线）。
+fn is_last_freehand(self_: &OverlayView, c: &DrawCommand) -> bool {
+    let last = self_
+        .drawing
+        .visible_commands()
+        .filter(|cmd| matches!(&***cmd, DrawCommand::Freehand { .. }))
+        .last();
+    match last {
+        Some(l) => std::ptr::eq(&**l, c),
+        None => false,
+    }
+}
+
 fn rasterize_shapes(
     shapes: &[&DrawCommand],
     scale_factor: f32,
@@ -2492,11 +2670,19 @@ impl Render for OverlayView {
             Some(c) => c.revision != drawing_revision || c.scale_factor != scale_factor,
         };
         if cache_stale {
+            // 跳过最后一条 Freehand：它由 in_progress_incr 增量层显示
+            //（松手后继续用同一张图），committed 不再重渲染它 → 无第二根线
             let committed: Vec<&DrawCommand> = self
                 .drawing
                 .visible_commands()
                 .filter(|c| is_shape_command(c))
                 .map(|c| &**c)
+                .filter(|c| {
+                    // 仅当 in_progress_incr 正在显示某条 Freehand 时跳过它
+                    !(self.in_progress_incr.is_some()
+                        && matches!(c, DrawCommand::Freehand { .. })
+                        && is_last_freehand(self, c))
+                })
                 .collect();
             self.shape_layer_cache =
                 rasterize_shapes(&committed, scale_factor, window, 1).map(|(image, bounds)| {
@@ -2513,11 +2699,20 @@ impl Render for OverlayView {
             .as_ref()
             .map(|c| (c.image.clone(), c.bounds));
 
-        // 当前笔画：与提交完全一致的全量光栅化（所见即所得，无增量坐标系偏差）。
-        // 性能由 draw_polyline 的网格分桶保证（3000 点约 24ms）。
+        // 当前笔画：Freehand 走增量渲染（逻辑坐标系 + Exact 线身）。
+        // in_progress 已清空但 in_progress_incr 还在（刚松手的 Freehand）→
+        // 继续显示同一张图——松手后线条不变、无第二条线。
         let in_progress_shape_layer = match &self.in_progress {
+            Some(ip) if matches!(&**ip, DrawCommand::Freehand { .. }) => {
+                update_in_progress_incr(self, window)
+            }
             Some(ip) if is_shape_command(ip) => {
                 rasterize_shapes(&[&**ip], scale_factor, window, 1)
+            }
+            None if self.in_progress_incr.is_some() => {
+                self.in_progress_incr
+                    .as_ref()
+                    .and_then(|st| st.image.clone())
             }
             _ => None,
         };
