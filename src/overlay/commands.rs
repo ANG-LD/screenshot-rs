@@ -741,14 +741,15 @@ fn draw_polyline(
 
     // 预计算每段的 y 范围（含 AA 外扩）并按 y_min 排序——
     // 扫描行二分定位 y 范围覆盖的段，避免 O(像素×总段数)
-    let mut seg_boxes: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(n - 1);
-    for w in pts.windows(2) {
+    let mut seg_boxes: Vec<(f32, f32, f32, f32, usize)> = Vec::with_capacity(n - 1);
+    for (idx, w) in pts.windows(2).enumerate() {
         let x0 = w[0].0.min(w[1].0) - r;
         let x1 = w[0].0.max(w[1].0) + r;
         let y0 = w[0].1.min(w[1].1) - r;
         let y1 = w[0].1.max(w[1].1) + r;
-        seg_boxes.push((x0, y0, x1, y1));
+        seg_boxes.push((x0, y0, x1, y1, idx));
     }
+    // 按 y_min 排序（保留原始段索引，距离计算必须用原始 pts 段）
     seg_boxes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     // 顶点圆帽：首尾 Full，中间 half；按 y_min(p.y - vr) 排序做行范围过滤
     let mut vcaps: Vec<(f32, f32, f32)> = pts
@@ -773,14 +774,16 @@ fn draw_polyline(
             let mut d = f32::MAX;
             // 只检查 y_min <= py 的段（二分），反向遍历时 y_max < py 提前结束
             let seg_lo = seg_boxes.partition_point(|b| b.1 <= py);
-            for (i, w) in pts.windows(2).take(seg_lo).enumerate().rev() {
-                let (bx0, _by0, bx1, by1) = seg_boxes[i];
+            for k in (0..seg_lo).rev() {
+                let (bx0, _by0, bx1, by1, seg_idx) = seg_boxes[k];
                 if by1 < py {
                     break;
                 }
                 if px < bx0 || px > bx1 {
                     continue;
                 }
+                // 用原始段（seg_idx）算距离——排序只用于范围过滤
+                let w = &pts[seg_idx..seg_idx + 2];
                 let sd = point_to_segment_distance(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
                 d = d.min(sd);
             }
