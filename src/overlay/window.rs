@@ -120,8 +120,13 @@ pub struct OverlayView {
 
     /// 已提交形状的离屏光栅化缓存（见 `ShapeLayerCache`）
     shape_layer_cache: Option<ShapeLayerCache>,
-    /// Freehand 当前笔画增量状态（拖动中与松手后同一来源，杜绝双线条）
+    /// Freehand 当前笔画增量状态（拖动中显示当前笔画的层）
     in_progress_incr: Option<IncrFreehand>,
+    /// 已完成 Freehand 的统一显示层（松手/撤销时一次重建，含所有已画 Freehand）。
+    /// committed 不再渲染 Freehand——单一来源，杜绝重叠抖动/消失/宽度差异。
+    freehand_layer: Option<(Arc<RenderImage>, ub::Bounds)>,
+    /// freehand_layer 需要重建（新 Freehand 提交/撤销/重做后置位）
+    freehand_layer_dirty: bool,
 
 
     /// Text 工具：是否正在编辑一段文字
@@ -316,6 +321,8 @@ impl OverlayView {
             in_progress: None,
             shape_layer_cache: None,
             in_progress_incr: None,
+            freehand_layer: None,
+            freehand_layer_dirty: true,
             text_input: None,
             text_input_anchor: BoundsPoint::ZERO,
             text_input_rect: ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO),
@@ -373,6 +380,8 @@ impl OverlayView {
         self.in_progress = None;
         self.shape_layer_cache = None;
         self.in_progress_incr = None;
+        self.freehand_layer = None;
+        self.freehand_layer_dirty = true;
         self.text_input = None;
         self.text_input_anchor = BoundsPoint::ZERO;
         self.text_input_rect = ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO);
@@ -620,7 +629,11 @@ impl OverlayView {
             }
             other => other,
         };
+        let was_freehand = matches!(normalized, DrawCommand::Freehand { .. });
         self.drawing.push(normalized);
+        if was_freehand {
+            self.freehand_layer_dirty = true;
+        }
         // 绘制完成后自动选中，方便用户二次编辑（Mosaic 画笔不支持拖拽编辑）
         match self.drawing.commands.last().map(|a| &**a) {
             Some(DrawCommand::Rectangle { .. })
@@ -1230,11 +1243,13 @@ fn render_simple_button(
                 match btn {
                     ToolButton::Undo => {
                         this.drawing.undo();
+                        this.freehand_layer_dirty = true;
                         this.check_selected_visible();
                         cx.notify();
                     }
                     ToolButton::Redo => {
                         this.drawing.redo();
+                        this.freehand_layer_dirty = true;
                         this.check_selected_visible();
                         cx.notify();
                     }
@@ -2301,6 +2316,23 @@ fn update_in_progress_incr(
     }
 }
 
+/// 重建已完成 Freehand 层：把所有可见 Freehand 命令全量光栅化到联合 buffer。
+/// 松手（finish_draw）与撤销/重做后调用（经 dirty 标志在 render 时执行）。
+fn rebuild_freehand_layer(self_: &mut OverlayView, window: &Window) {
+    self_.freehand_layer_dirty = false;
+    let freehands: Vec<&DrawCommand> = self_
+        .drawing
+        .visible_commands()
+        .filter(|c| matches!(&***c, DrawCommand::Freehand { .. }))
+        .map(|c| &**c)
+        .collect();
+    if freehands.is_empty() {
+        self_.freehand_layer = None;
+        return;
+    }
+    self_.freehand_layer = rasterize_shapes(&freehands, self_.scale_factor, window, 1);
+}
+
 fn rasterize_shapes(
     shapes: &[&DrawCommand],
     scale_factor: f32,
@@ -2656,13 +2688,12 @@ impl Render for OverlayView {
             Some(c) => c.revision != drawing_revision || c.scale_factor != scale_factor,
         };
         if cache_stale {
-            // committed 完整渲染所有形状（含全部 Freehand）：增量层只作
-            //「最后一条 Freehand」的即时显示，committed 是它的持久后备——
-            // 增量层清空（画下一条）时旧线由 committed 继续显示，不消失
+            // committed 只渲染非 Freehand 形状（矩形/椭圆/箭头）；
+            // Freehand 统一由 freehand_layer 显示（松手时重建），单一来源
             let committed: Vec<&DrawCommand> = self
                 .drawing
                 .visible_commands()
-                .filter(|c| is_shape_command(c))
+                .filter(|c| is_shape_command(c) && !matches!(&***c, DrawCommand::Freehand { .. }))
                 .map(|c| &**c)
                 .collect();
             self.shape_layer_cache =
@@ -2680,22 +2711,25 @@ impl Render for OverlayView {
             .as_ref()
             .map(|c| (c.image.clone(), c.bounds));
 
-        // 当前笔画：Freehand 走增量渲染（逻辑坐标系 + Exact 线身）。
-        // in_progress 已清空但 in_progress_incr 还在（刚松手的 Freehand）→
-        // 继续显示同一张图——松手后线条不变、无第二条线。
+        // Freehand 已完成层：dirty 时重建（新 Freehand 提交/撤销/重做）
+        if self.freehand_layer_dirty {
+            rebuild_freehand_layer(self, window);
+        }
+        // 当前笔画：Freehand 用 freehand_layer（已完成）+ in_progress_incr（当前笔画），
+        // 互不重叠单一来源；其他形状全量 rasterize_shapes
         let in_progress_shape_layer = match &self.in_progress {
             Some(ip) if matches!(&**ip, DrawCommand::Freehand { .. }) => {
-                update_in_progress_incr(self, window)
+                // 已完成层 + 当前笔画层合并为显示列表（paint 时两个都画）
+                let cur = update_in_progress_incr(self, window);
+                let done = self.freehand_layer.clone();
+                (done, cur)
             }
             Some(ip) if is_shape_command(ip) => {
-                rasterize_shapes(&[&**ip], scale_factor, window, 1)
+                (None, rasterize_shapes(&[&**ip], scale_factor, window, 1))
             }
-            None if self.in_progress_incr.is_some() => {
-                self.in_progress_incr
-                    .as_ref()
-                    .and_then(|st| st.image.clone())
-            }
-            _ => None,
+            None => (self.freehand_layer.clone(), None),
+            // Text/Mosaic 等非形状命令：不在此层绘制（Text 走元素层、Mosaic 走 paint_command）
+            _ => (self.freehand_layer.clone(), None),
         };
 
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
@@ -2898,7 +2932,11 @@ impl Render for OverlayView {
                     if let Some((img, b)) = &committed_shape_layer {
                         paint_raster(window, img, *b);
                     }
-                    if let Some((img, b)) = &in_progress_shape_layer {
+                    // Freehand 层：先画已完成层（done），再画当前笔画（cur）
+                    if let Some((img, b)) = &in_progress_shape_layer.0 {
+                        paint_raster(window, img, *b);
+                    }
+                    if let Some((img, b)) = &in_progress_shape_layer.1 {
                         paint_raster(window, img, *b);
                     }
 
@@ -3761,6 +3799,7 @@ impl Render for OverlayView {
                     } else {
                         this.drawing.undo();
                     }
+                    this.freehand_layer_dirty = true;
                     this.check_selected_visible();
                     cx.notify();
                 }
