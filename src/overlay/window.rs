@@ -2515,8 +2515,9 @@ impl Render for OverlayView {
 
         // 当前笔画：每帧增量重绘（只含 in_progress 那一笔，量小）
         let in_progress_shape_layer = match &self.in_progress {
-            // 预览（拖动中）：2x 降采样光栅化，加快逐帧重绘；提交后 1x 精确
-            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[&**ip], scale_factor, window, 2),
+            // 预览与提交完全一致（step=1）：拖动所见即最终成图。
+            // 性能由 draw_polyline 的段/顶点包围盒过滤保证（不再降采样）。
+            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[&**ip], scale_factor, window, 1),
             _ => None,
         };
 
