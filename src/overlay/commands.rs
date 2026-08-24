@@ -353,7 +353,7 @@ pub fn apply_commands_step(
                     .iter()
                     .map(|p| translate(*p, region_origin_x, region_origin_y))
                     .collect();
-                draw_polyline(frame, &pts, *line_width, *color, step)?;
+                draw_polyline(frame, &pts, *line_width, *color, step, Cap::Full, Cap::Full)?;
             }
             DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
@@ -394,8 +394,10 @@ pub fn draw_polyline_pub(
     lw: f32,
     color: RGBA,
     step: u32,
+    cap_start: Cap,
+    cap_end: Cap,
 ) -> AppResult<()> {
-    draw_polyline(frame, pts, lw, color, step)
+    draw_polyline(frame, pts, lw, color, step, cap_start, cap_end)
 }
 
 /// 测试用：光栅化整条折线（暴露 draw_polyline）
@@ -403,7 +405,7 @@ pub fn test_draw_polyline(frame: &mut CapturedFrame, pts: &[(f32, f32)], lw: f32
     let _ = draw_polyline(
         frame, pts, lw,
         RGBA { r: 255, g: 0, b: 0, a: 255 },
-        1,
+        1, Cap::Full, Cap::Full,
     );
 }
 
@@ -411,7 +413,7 @@ pub fn test_draw_polyline_step(frame: &mut CapturedFrame, pts: &[(f32, f32)], lw
     let _ = draw_polyline(
         frame, pts, lw,
         RGBA { r: 255, g: 0, b: 0, a: 255 },
-        step,
+        step, Cap::Full, Cap::Full,
     );
 }
 
@@ -457,9 +459,9 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// 线段端点圆帽：Full=全圆帽（半径含 AA 外扩，线端圆头）；
 /// Exact=精确圆帽（半径=线半宽，覆盖折线连接缺口、不超出线宽——不产生珠串鼓包）。
 #[derive(Clone, Copy, PartialEq)]
-enum Cap {
+pub enum Cap {
     Full,
-
+    Exact,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -506,7 +508,10 @@ fn draw_thick_line(
 
         // 端点圆帽：Full=含AA外扩圆头；Exact=精确线宽圆帽（折线连接补缺口，
         // 不超出线宽故无珠串）；None=平头（闭合曲线段间）
-        let cap_r = |_c: Cap| Some(r);
+        let cap_r = |c: Cap| match c {
+            Cap::Full => Some(r),
+            Cap::Exact => Some(half),
+        };
         // 端点 A 的圆帽
         let dya = py - y1;
         if let Some(cr) = cap_r(cap_a) {
@@ -721,6 +726,8 @@ fn draw_polyline(
     lw: f32,
     color: RGBA,
     step: u32,
+    cap_start: Cap,
+    cap_end: Cap,
 ) -> AppResult<()> {
     let n = pts.len();
     if n < 2 {
@@ -769,7 +776,13 @@ fn draw_polyline(
     type Vcap = (f32, f32, f32);
     let mut vcap_cells: HashMap<(i32, i32), Vec<Vcap>> = HashMap::new();
     for (i, p) in pts.iter().enumerate() {
-        let vr = if i == 0 || i == n - 1 { r } else { half };
+        let vr = if i == 0 {
+            match cap_start { Cap::Full => r, Cap::Exact => half }
+        } else if i == n - 1 {
+            match cap_end { Cap::Full => r, Cap::Exact => half }
+        } else {
+            half
+        };
         let cx0 = (p.0 - vr).floor() as i32 / cs;
         let cx1 = (p.0 + vr).ceil() as i32 / cs;
         let cy0 = (p.1 - vr).floor() as i32 / cs;
@@ -903,7 +916,7 @@ fn draw_ellipse_outline(
         let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
         pts.push((cx + rx * theta.cos(), cy + ry * theta.sin()));
     }
-    draw_polyline(frame, &pts, lw, color, step)?;
+    draw_polyline(frame, &pts, lw, color, step, Cap::Full, Cap::Full)?;
     Ok(())
 }
 

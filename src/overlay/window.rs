@@ -2221,8 +2221,10 @@ fn update_in_progress_incr(
             for p in &points[start..now] {
                 newpts.push((p.x - phys_ox as f32, p.y - phys_oy as f32));
             }
+            // Exact 圆帽：子段连接与全量中间顶点一致（无重复 Full 大圆帽，
+            // 消除增量渲染的抖动；真正首尾在首次/提交时画 Full 圆头）
             let _ = crate::overlay::commands::draw_polyline_pub(
-                &mut st.frame, &newpts, lw, *color, 1,
+                &mut st.frame, &newpts, lw, *color, 1, crate::overlay::commands::Cap::Exact, crate::overlay::commands::Cap::Exact,
             );
             st.rendered = now;
             let img = build_render_image_from_pixels(phys_w, phys_h, st.frame.pixels.clone());
@@ -2264,7 +2266,7 @@ fn update_in_progress_incr(
                     newpts.push((p.x - phys_ox as f32, p.y - phys_oy as f32));
                 }
                 let _ = crate::overlay::commands::draw_polyline_pub(
-                    &mut frame, &newpts, lw, *color, 1,
+                    &mut frame, &newpts, lw, *color, 1, crate::overlay::commands::Cap::Exact, crate::overlay::commands::Cap::Exact,
                 );
             }
             let img = build_render_image_from_pixels(phys_w, phys_h, frame.pixels.clone());
@@ -2291,7 +2293,7 @@ fn update_in_progress_incr(
             allpts.push((p.x - phys_ox as f32, p.y - phys_oy as f32));
         }
         let _ = crate::overlay::commands::draw_polyline_pub(
-            &mut frame, &allpts, lw, *color, 1,
+            &mut frame, &allpts, lw, *color, 1, crate::overlay::commands::Cap::Full, crate::overlay::commands::Cap::Full,
         );
         let img = build_render_image_from_pixels(phys_w, phys_h, frame.pixels.clone());
         self_.in_progress_incr = Some(IncrFreehand {
