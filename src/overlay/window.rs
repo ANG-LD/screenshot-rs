@@ -2188,10 +2188,14 @@ fn update_in_progress_incr(
     min_y -= pad;
     max_x += pad;
     max_y += pad;
-    let phys_ox = (min_x * scale).floor() as i32;
-    let phys_oy = (min_y * scale).floor() as i32;
-    let phys_w = (((max_x - min_x) * scale).ceil() as i32 + 1).max(1) as u32;
-    let phys_h = (((max_y - min_y) * scale).ceil() as i32 + 1).max(1) as u32;
+    // buffer 原点/尺寸对齐到网格（16 物理像素）：笔画延伸时 bbox 不再每帧
+    // 变化 → 大部分帧走稳定的增量路径（不重建、paint 位置不跳变），
+    // 消除"抖动变化的动画"
+    const GRID: i32 = 16;
+    let phys_ox = ((min_x * scale).floor() as i32 / GRID) * GRID;
+    let phys_oy = ((min_y * scale).floor() as i32 / GRID) * GRID;
+    let phys_w = ((((max_x * scale).ceil() as i32 - phys_ox) / GRID + 1) * GRID).max(GRID) as u32;
+    let phys_h = ((((max_y * scale).ceil() as i32 - phys_oy) / GRID + 1) * GRID).max(GRID) as u32;
     let now = points.len();
 
     // 状态是否可复用（同 bbox、同线宽）
@@ -2205,9 +2209,13 @@ fn update_in_progress_incr(
         None => false,
     };
 
+    // paint 的 bounds 用网格对齐后的稳定原点（物理 floor → 逻辑），
+    // 避免每帧小数原点被 GPUI snap 导致线条位置抖动
+    let logical_ox = phys_ox as f32 / scale;
+    let logical_oy = phys_oy as f32 / scale;
     let phys_bounds = ub::Bounds {
-        origin: ub::Point::new(min_x, min_y),
-        size: ub::Point::new(max_x - min_x, max_y - min_y),
+        origin: ub::Point::new(logical_ox, logical_oy),
+        size: ub::Point::new((max_x - min_x).max(1.0), (max_y - min_y).max(1.0)),
     };
 
     if reusable {
