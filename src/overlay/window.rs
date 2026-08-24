@@ -637,6 +637,11 @@ impl OverlayView {
             }
             other => other,
         };
+        // Freehand 松手：清空增量层（曲线已进 committed，与矩形等单层显示，
+        // 避免多层叠加在重渲染时抖动/消失又出现）
+        if matches!(normalized, DrawCommand::Freehand { .. }) {
+            self.freehand_incr = None;
+        }
         self.drawing.push(normalized);
         // 绘制完成后自动选中，方便用户二次编辑（Mosaic 画笔不支持拖拽编辑）
         match self.drawing.commands.last().map(|a| &**a) {
@@ -1257,13 +1262,11 @@ fn render_simple_button(
                 match btn {
                     ToolButton::Undo => {
                         this.drawing.undo();
-                        rebuild_freehand_incr(this, window);
                         this.check_selected_visible();
                         cx.notify();
                     }
                     ToolButton::Redo => {
                         this.drawing.redo();
-                        rebuild_freehand_incr(this, window);
                         this.check_selected_visible();
                         cx.notify();
                     }
@@ -2330,6 +2333,10 @@ fn update_in_progress_incr(
             );
         }
         let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
+        tracing::info!(
+            "freehand_incr: rebuild bbox=({:.0},{:.0} {}x{}) pts={}",
+            ox, oy, bw, bh, now
+        );
         self_.freehand_incr = Some(IncrFreehand {
             frame,
             origin: (ox, oy),
@@ -2339,68 +2346,6 @@ fn update_in_progress_incr(
         });
         Some((img, bounds))
     }
-}
-
-/// 全量重建 freehand_incr（撤销/重做后）：从可见 Freehand 命令重新光栅化。
-fn rebuild_freehand_incr(self_: &mut OverlayView, _window: &Window) {
-    let freehands: Vec<&DrawCommand> = self_
-        .drawing
-        .visible_commands()
-        .filter(|c| matches!(&***c, DrawCommand::Freehand { .. }))
-        .map(|c| &**c)
-        .collect();
-    if freehands.is_empty() {
-        self_.freehand_incr = None;
-        return;
-    }
-    // 联合 bbox（与 rasterize_shapes 相同 pad）
-    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    let mut max_lw = 0.0f32;
-    for cmd in &freehands {
-        if let DrawCommand::Freehand { points, line_width, .. } = cmd {
-            for p in points {
-                min_x = min_x.min(p.x);
-                min_y = min_y.min(p.y);
-                max_x = max_x.max(p.x);
-                max_y = max_y.max(p.y);
-            }
-            max_lw = max_lw.max(*line_width);
-        }
-    }
-    let pad = max_lw / 2.0 + 1.0;
-    let ox = (min_x - pad).floor();
-    let oy = (min_y - pad).floor();
-    let bw = ((max_x + pad).ceil() - ox).max(1.0) as u32;
-    let bh = ((max_y + pad).ceil() - oy).max(1.0) as u32;
-    let mut frame = CapturedFrame {
-        width: bw,
-        height: bh,
-        pixels: vec![0; (bw * bh * 4) as usize],
-    };
-    for cmd in &freehands {
-        if let DrawCommand::Freehand { points, color, line_width } = cmd {
-            let mut pts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
-            for p in points {
-                pts.push((p.x - ox, p.y - oy));
-            }
-            let _ = crate::overlay::commands::draw_polyline_pub(
-                &mut frame, &pts, *line_width, *color, 1,
-                crate::overlay::commands::Cap::Full,
-                crate::overlay::commands::Cap::Full,
-            );
-        }
-    }
-    let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
-    self_.freehand_incr = Some(IncrFreehand {
-        frame,
-        origin: (ox, oy),
-        rendered: 0,
-        lw: max_lw,
-        image: Some((img, ub::Bounds {
-            origin: ub::Point::new(ox, oy),
-            size: ub::Point::new(bw as f32, bh as f32),
-        })),
-    });
 }
 
 fn rasterize_shapes(
@@ -2758,12 +2703,11 @@ impl Render for OverlayView {
             Some(c) => c.revision != drawing_revision || c.scale_factor != scale_factor,
         };
         if cache_stale {
-            // committed 只渲染非 Freehand 形状（矩形/椭圆/箭头）；
-            // Freehand 统一由 freehand_incr 增量层显示（单一来源，杜绝双线）
+            // committed 渲染所有形状（含已固化的 Freehand）——单层显示
             let committed: Vec<&DrawCommand> = self
                 .drawing
                 .visible_commands()
-                .filter(|c| is_shape_command(c) && !matches!(&***c, DrawCommand::Freehand { .. }))
+                .filter(|c| is_shape_command(c))
                 .map(|c| &**c)
                 .collect();
             self.shape_layer_cache =
@@ -2796,10 +2740,8 @@ impl Render for OverlayView {
                     let done = self.freehand_incr.as_ref().and_then(|st| st.image.clone());
                     (done, rasterize_shapes(&[&**ip], scale_factor, window, 1))
                 }
-                _ => {
-                    let done = self.freehand_incr.as_ref().and_then(|st| st.image.clone());
-                    (done, None)
-                }
+                // 松手后 Freehand 已在 committed（单层），不再用 freehand_incr
+                _ => (None, None),
             };
 
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
@@ -3580,6 +3522,11 @@ impl Render for OverlayView {
                         // 点其他任何区域（内部空白/外部/选区手柄）都取消选中。
                         if this.selected_cmd_actual_idx.is_some() {
                             this.selected_cmd_actual_idx = None;
+                            tracing::info!(
+                                "mouse_down: deselect. freehand_incr={} committed_cache={}",
+                                this.freehand_incr.is_some(),
+                                this.shape_layer_cache.is_some()
+                            );
                             cx.notify();
                         }
                     }
@@ -3884,7 +3831,6 @@ impl Render for OverlayView {
                     } else {
                         this.drawing.undo();
                     }
-                    rebuild_freehand_incr(this, window);
                     this.check_selected_visible();
                     cx.notify();
                 }
