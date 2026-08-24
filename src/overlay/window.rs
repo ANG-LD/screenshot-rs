@@ -400,6 +400,7 @@ impl OverlayView {
         self.cmd_drag = None;
         self.hover_shape = false;
         self.scale_factor = scale_factor;
+        tracing::info!("[overlay] start_session scale_factor={scale_factor} frame={}x{}", self.frame_width, self.frame_height);
         self.dim_opacity = 1.0;
         cx.notify();
     }
@@ -2035,23 +2036,24 @@ fn scale_draw_command(cmd: &DrawCommand, sx: f32, sy: f32) -> DrawCommand {
         DrawCommand::Rectangle { rect, color, line_width } => DrawCommand::Rectangle {
             rect: (sp(&rect.0), sp(&rect.1)),
             color: *color,
-            line_width: *line_width,
+            // 线宽随坐标系缩放：物理 buffer 里 = lw×scale，paint 缩回逻辑显示 = lw
+            line_width: *line_width * sx,
         },
         DrawCommand::Ellipse { rect, color, line_width } => DrawCommand::Ellipse {
             rect: (sp(&rect.0), sp(&rect.1)),
             color: *color,
-            line_width: *line_width,
+            line_width: *line_width * sx,
         },
         DrawCommand::Arrow { from, to, color, line_width } => DrawCommand::Arrow {
             from: sp(from),
             to: sp(to),
             color: *color,
-            line_width: *line_width,
+            line_width: *line_width * sx,
         },
         DrawCommand::Freehand { points, color, line_width } => DrawCommand::Freehand {
             points: points.iter().map(sp).collect(),
             color: *color,
-            line_width: *line_width,
+            line_width: *line_width * sx,
         },
         DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
             DrawCommand::Text {
