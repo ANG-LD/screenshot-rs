@@ -734,75 +734,72 @@ fn draw_polyline(
 
     let w_px = frame.width as i32;
     let h_px = frame.height as i32;
+
+    // —— 二维网格分桶：段/顶点注册到其包围盒覆盖的 cell（cell 大小随线宽），
+    //    像素查询 O(1) 定位所在 cell，只检查该 cell 内的段/顶点 ——
+    //    避免 O(像素 × 顶点数)（大笔画 + 大包围盒时每帧数百毫秒）
+    let cs = ((lw * 2.0 + 4.0).max(8.0)) as i32; // cell 边长
+    use std::collections::HashMap;
+    let mut seg_cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (i, w) in pts.windows(2).enumerate() {
+        let x0 = (w[0].0.min(w[1].0) - r).floor() as i32 / cs;
+        let x1 = (w[0].0.max(w[1].0) + r).ceil() as i32 / cs;
+        let y0 = (w[0].1.min(w[1].1) - r).floor() as i32 / cs;
+        let y1 = (w[0].1.max(w[1].1) + r).ceil() as i32 / cs;
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                seg_cells.entry((cx, cy)).or_default().push(i);
+            }
+        }
+    }
+    // 顶点圆帽：首尾 Full，中间 half；每个顶点注册到其覆盖的 cell
+    // cell → 顶点圆帽列表：(vx, vy, vr)
+    type Vcap = (f32, f32, f32);
+    let mut vcap_cells: HashMap<(i32, i32), Vec<Vcap>> = HashMap::new();
+    for (i, p) in pts.iter().enumerate() {
+        let vr = if i == 0 || i == n - 1 { r } else { half };
+        let cx0 = (p.0 - vr).floor() as i32 / cs;
+        let cx1 = (p.0 + vr).ceil() as i32 / cs;
+        let cy0 = (p.1 - vr).floor() as i32 / cs;
+        let cy1 = (p.1 + vr).ceil() as i32 / cs;
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                vcap_cells.entry((cx, cy)).or_default().push((p.0, p.1, vr));
+            }
+        }
+    }
+
     let scan_y0 = (min_y.floor() as i32).max(0);
     let scan_y1 = (max_y.ceil() as i32).min(h_px - 1);
     let scan_x0 = (min_x.floor() as i32).max(0);
     let scan_x1 = (max_x.ceil() as i32).min(w_px - 1);
 
-    // 预计算每段的 y 范围（含 AA 外扩）并按 y_min 排序——
-    // 扫描行二分定位 y 范围覆盖的段，避免 O(像素×总段数)
-    let mut seg_boxes: Vec<(f32, f32, f32, f32, usize)> = Vec::with_capacity(n - 1);
-    for (idx, w) in pts.windows(2).enumerate() {
-        let x0 = w[0].0.min(w[1].0) - r;
-        let x1 = w[0].0.max(w[1].0) + r;
-        let y0 = w[0].1.min(w[1].1) - r;
-        let y1 = w[0].1.max(w[1].1) + r;
-        seg_boxes.push((x0, y0, x1, y1, idx));
-    }
-    // 按 y_max(by1) 升序排序：行过滤时 y_max < py 的段可安全跳过
-    // （y_max 有序；若按 y_min 排序后 break，会漏掉 y_min 小但 y_max 大、
-    //  跨越当前行的竖直长段——长笔画前段变虚的根因）
-    seg_boxes.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
-    // 顶点圆帽：首尾 Full，中间 half；按 y_min(p.y - vr) 排序做行范围过滤
-    let mut vcaps: Vec<(f32, f32, f32)> = pts
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let vr = if i == 0 || i == n - 1 { r } else { half };
-            (p.0, p.1, vr)
-        })
-        .collect();
-    // 按 y_max(vy+vr) 升序：行过滤安全（y_max 有序，y_min 小的长竖直段不丢）
-    vcaps.sort_by(|a, b| (a.1 + a.2).partial_cmp(&(b.1 + b.2)).unwrap_or(std::cmp::Ordering::Equal));
-
     let step = step.max(1);
     let mut scan_y = scan_y0;
     while scan_y <= scan_y1 {
         let py = scan_y as f32 + 0.5;
+        let cell_y = scan_y / cs;
         let mut scan_x = scan_x0;
         // 用 while 手写步进：continue 前必须推进 scan_x（见下方）
         while scan_x <= scan_x1 {
             let px = scan_x as f32 + 0.5;
-            // 到整条折线的距离 = min(横穿该行的段, 覆盖该行的顶点圆帽)
+            let cell_x = scan_x / cs;
             let mut d = f32::MAX;
-            // 遍历 y_max >= py 的段（y_max 升序二分起点），continue 跳过 y_min > py
-            let seg_hi = seg_boxes.partition_point(|b| b.3 < py);
-            for &(bx0, by0, bx1, _by1, seg_idx) in &seg_boxes[seg_hi..] {
-                if by0 > py {
-                    continue; // 段起点在 py 之下（该行还没进入段）
+            // 查所在 cell 的段
+            if let Some(sids) = seg_cells.get(&(cell_x, cell_y)) {
+                for &si in sids {
+                    let w = &pts[si..si + 2];
+                    let sd = point_to_segment_distance(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
+                    d = d.min(sd);
                 }
-                if px < bx0 || px > bx1 {
-                    continue;
-                }
-                // 用原始段（seg_idx）算距离——排序只用于范围过滤
-                let w = &pts[seg_idx..seg_idx + 2];
-                let sd = point_to_segment_distance(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
-                d = d.min(sd);
             }
-            // 顶点圆帽：遍历 y_max(vy+vr) >= py 的顶点（y_max 升序二分起点），
-            // continue 跳过 y_min(vy-vr) > py 的——长笔画不丢前段
-            let hi = vcaps
-                .partition_point(|v| v.1 + v.2 < py);
-            for (vx, vy, vr) in vcaps[hi..].iter() {
-                if vy - vr > py {
-                    continue;
-                }
-                if px < vx - vr || px > vx + vr {
-                    continue;
-                }
-                let vd = ((px - vx).powi(2) + (py - vy).powi(2)).sqrt();
-                if vd <= *vr {
-                    d = d.min(vd);
+            // 查所在 cell 的顶点圆帽
+            if let Some(vs) = vcap_cells.get(&(cell_x, cell_y)) {
+                for &(vx, vy, vr) in vs {
+                    let vd = ((px - vx).powi(2) + (py - vy).powi(2)).sqrt();
+                    if vd <= vr {
+                        d = d.min(vd);
+                    }
                 }
             }
             if d > r {
