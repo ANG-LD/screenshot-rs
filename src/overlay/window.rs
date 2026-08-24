@@ -468,7 +468,6 @@ impl OverlayView {
         let color = self.toolbar.current_color;
         let lw = self.toolbar.line_width;
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
-        tracing::info!("begin_draw: tool={:?} p=({},{}) color={:?} lw={}", tool, p.x, p.y, color, lw);
         self.in_progress = Some(std::sync::Arc::new(match tool {
             ToolButton::Rectangle => DrawCommand::Rectangle {
                 rect: (dp, dp),
@@ -562,7 +561,6 @@ impl OverlayView {
         let Some(cmd) = self.in_progress.take() else { return };
         // 解 Arc：唯一持有者直接取出，否则克隆内容
         let cmd = std::sync::Arc::try_unwrap(cmd).unwrap_or_else(|a| (*a).clone());
-        tracing::info!("finish_draw: cmd={:?}", cmd);
         let valid = match &cmd {
             DrawCommand::Rectangle { rect, .. }
             | DrawCommand::Ellipse { rect, .. } => {
