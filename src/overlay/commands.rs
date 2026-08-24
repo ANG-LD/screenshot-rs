@@ -280,6 +280,18 @@ pub fn apply_commands(
     region_origin_y: f32,
     commands: &[DrawCommand],
 ) -> AppResult<()> {
+    apply_commands_step(frame, region_origin_x, region_origin_y, commands, 1)
+}
+
+/// apply_commands 的采样步长版本：`step`>1 时折线降采样光栅化
+/// （预览用，加快拖动绘制；提交成图用 step=1 精确）。
+pub fn apply_commands_step(
+    frame: &mut CapturedFrame,
+    region_origin_x: f32,
+    region_origin_y: f32,
+    commands: &[DrawCommand],
+    step: u32,
+) -> AppResult<()> {
     // 第一步：马赛克命令 — 只作用于原始截图像素，
     // 保证矩形/箭头/文字等标注叠加在马赛克之上。
     for cmd in commands {
@@ -306,7 +318,7 @@ pub fn apply_commands(
                 let a = translate(rect.0, region_origin_x, region_origin_y);
                 let b = translate(rect.1, region_origin_x, region_origin_y);
                 let (x1, y1, x2, y2) = normalize_rect(a, b);
-                draw_ellipse_outline(frame, x1, y1, x2, y2, *line_width, *color)?;
+                draw_ellipse_outline(frame, x1, y1, x2, y2, *line_width, *color, step)?;
             }
             DrawCommand::Arrow { from, to, color, line_width } => {
                 let f = translate(*from, region_origin_x, region_origin_y);
@@ -341,7 +353,7 @@ pub fn apply_commands(
                     .iter()
                     .map(|p| translate(*p, region_origin_x, region_origin_y))
                     .collect();
-                draw_polyline(frame, &pts, *line_width, *color)?;
+                draw_polyline(frame, &pts, *line_width, *color, step)?;
             }
             DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
@@ -379,6 +391,15 @@ pub fn test_draw_polyline(frame: &mut CapturedFrame, pts: &[(f32, f32)], lw: f32
     let _ = draw_polyline(
         frame, pts, lw,
         RGBA { r: 255, g: 0, b: 0, a: 255 },
+        1,
+    );
+}
+
+pub fn test_draw_polyline_step(frame: &mut CapturedFrame, pts: &[(f32, f32)], lw: f32, step: u32) {
+    let _ = draw_polyline(
+        frame, pts, lw,
+        RGBA { r: 255, g: 0, b: 0, a: 255 },
+        step,
     );
 }
 
@@ -687,6 +708,7 @@ fn draw_polyline(
     pts: &[(f32, f32)],
     lw: f32,
     color: RGBA,
+    step: u32,
 ) -> AppResult<()> {
     let n = pts.len();
     if n < 2 {
@@ -717,25 +739,55 @@ fn draw_polyline(
     let scan_x0 = (min_x.floor() as i32).max(0);
     let scan_x1 = (max_x.ceil() as i32).min(w_px - 1);
 
-    for scan_y in scan_y0..=scan_y1 {
+    // 预计算每段的 y 范围（含 AA 外扩），扫描行只检查横穿该行的段——
+    // 避免 O(像素×总段数)（Freehand 数百~数千点时每帧卡顿）
+    let mut seg_boxes: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(n - 1);
+    for w in pts.windows(2) {
+        let x0 = w[0].0.min(w[1].0) - r;
+        let x1 = w[0].0.max(w[1].0) + r;
+        let y0 = w[0].1.min(w[1].1) - r;
+        let y1 = w[0].1.max(w[1].1) + r;
+        seg_boxes.push((x0, y0, x1, y1));
+    }
+    // 顶点圆帽：首尾 Full，中间 half；只存 y 范围
+    let vcaps: Vec<(f32, f32, f32)> = pts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let vr = if i == 0 || i == n - 1 { r } else { half };
+            (p.0, p.1, vr)
+        })
+        .collect();
+
+    let step = step.max(1);
+    let mut scan_y = scan_y0;
+    while scan_y <= scan_y1 {
         let py = scan_y as f32 + 0.5;
-        for scan_x in scan_x0..=scan_x1 {
+        let mut scan_x = scan_x0;
+        // 用 while 手写步进：continue 前必须推进 scan_x（见下方）
+        while scan_x <= scan_x1 {
             let px = scan_x as f32 + 0.5;
-            // 到整条折线的距离 = min(所有段, 所有顶点)
+            // 到整条折线的距离 = min(横穿该行的段, 覆盖该行的顶点圆帽)
             let mut d = f32::MAX;
-            for w in pts.windows(2) {
+            for (i, w) in pts.windows(2).enumerate() {
+                let (bx0, by0, bx1, by1) = seg_boxes[i];
+                if px < bx0 || px > bx1 || py < by0 || py > by1 {
+                    continue;
+                }
                 let sd = point_to_segment_distance(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
                 d = d.min(sd);
             }
-            // 顶点圆帽：首尾 Full（圆头），中间 half（补凹角外侧缺口，不鼓包）
-            for (i, p) in pts.iter().enumerate() {
-                let vr = if i == 0 || i == n - 1 { r } else { half };
-                let vd = ((px - p.0).powi(2) + (py - p.1).powi(2)).sqrt();
-                if vd <= vr {
+            for (vx, vy, vr) in &vcaps {
+                if px < vx - vr || px > vx + vr || py < vy - vr || py > vy + vr {
+                    continue;
+                }
+                let vd = ((px - vx).powi(2) + (py - vy).powi(2)).sqrt();
+                if vd <= *vr {
                     d = d.min(vd);
                 }
             }
             if d > r {
+                scan_x += step as i32;
                 continue;
             }
             let coverage = if d <= half {
@@ -745,12 +797,15 @@ fn draw_polyline(
             };
             let alpha = ((color.a as f32) * coverage).round() as u32;
             if alpha == 0 {
+                scan_x += step as i32;
                 continue;
             }
             let soft = RGBA { r: color.r, g: color.g, b: color.b, a: alpha.min(255) as u8 };
             let idx = ((scan_y * w_px + scan_x) as usize) * 4;
             blend_pixel(&mut frame.pixels[idx..idx + 4], soft);
+            scan_x += step as i32;
         }
+        scan_y += step as i32;
     }
     Ok(())
 }
@@ -797,7 +852,8 @@ fn fill_round_dot(
     Ok(())
 }
 
-/// 画空心椭圆边框（用 64 段折线近似椭圆轮廓）
+/// 画空心椭圆边框（用 128 段折线近似椭圆轮廓）
+#[allow(clippy::too_many_arguments)]
 fn draw_ellipse_outline(
     frame: &mut CapturedFrame,
     x1: f32,
@@ -806,6 +862,7 @@ fn draw_ellipse_outline(
     y2: f32,
     lw: f32,
     color: RGBA,
+    step: u32,
 ) -> AppResult<()> {
     let cx = (x1 + x2) / 2.0;
     let cy = (y1 + y2) / 2.0;
@@ -818,7 +875,7 @@ fn draw_ellipse_outline(
         let theta = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
         pts.push((cx + rx * theta.cos(), cy + ry * theta.sin()));
     }
-    draw_polyline(frame, &pts, lw, color)?;
+    draw_polyline(frame, &pts, lw, color, step)?;
     Ok(())
 }
 

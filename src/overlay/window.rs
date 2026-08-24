@@ -2141,6 +2141,7 @@ fn rasterize_shapes(
     shapes: &[&DrawCommand],
     scale_factor: f32,
     window: &Window,
+    step: u32,
 ) -> Option<(Arc<RenderImage>, ub::Bounds)> {
     if shapes.is_empty() {
         return None;
@@ -2223,11 +2224,12 @@ fn rasterize_shapes(
         .copied()
         .map(|c| scale_draw_command(c, raster_scale, raster_scale))
         .collect();
-    let _ = crate::overlay::commands::apply_commands(
+    let _ = crate::overlay::commands::apply_commands_step(
         &mut frame,
         phys_origin_x,
         phys_origin_y,
         &scaled,
+        step,
     );
 
     let img = build_render_image_from_pixels(frame.width, frame.height, frame.pixels);
@@ -2497,7 +2499,7 @@ impl Render for OverlayView {
                 .map(|c| &**c)
                 .collect();
             self.shape_layer_cache =
-                rasterize_shapes(&committed, scale_factor, window).map(|(image, bounds)| {
+                rasterize_shapes(&committed, scale_factor, window, 1).map(|(image, bounds)| {
                     ShapeLayerCache {
                         revision: drawing_revision,
                         scale_factor,
@@ -2513,7 +2515,8 @@ impl Render for OverlayView {
 
         // 当前笔画：每帧增量重绘（只含 in_progress 那一笔，量小）
         let in_progress_shape_layer = match &self.in_progress {
-            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[&**ip], scale_factor, window),
+            // 预览（拖动中）：2x 降采样光栅化，加快逐帧重绘；提交后 1x 精确
+            Some(ip) if is_shape_command(ip) => rasterize_shapes(&[&**ip], scale_factor, window, 2),
             _ => None,
         };
 
