@@ -512,6 +512,17 @@ impl OverlayView {
                 *to = dp;
             }
             DrawCommand::Freehand { points, .. } => {
+                // 点简化：与上一点距离 < 0.75px 的过近点不记录——
+                // 上万点（长线）时渲染/提交点数减少约 10 倍，光栅化大幅加速；
+                // 渲染与提交共用同一份简化点 → 一致性不变，线形保留（0.75px 精度）
+                const MIN_D: f32 = 0.75;
+                if let Some(last) = points.last() {
+                    let dx = dp.x - last.x;
+                    let dy = dp.y - last.y;
+                    if dx * dx + dy * dy < MIN_D * MIN_D {
+                        return;
+                    }
+                }
                 points.push(dp);
             }
             DrawCommand::Mosaic { regions, block_size, .. } => {
