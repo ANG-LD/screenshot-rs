@@ -622,6 +622,16 @@ impl OverlayView {
         }
     }
 
+    /// 把修改应用到当前选中的已绘制命令（改宽/改色），并标记重渲染。
+    fn apply_style_to_selected(&mut self, update: impl FnOnce(&mut DrawCommand)) {
+        if let Some(idx) = self.selected_cmd_actual_idx {
+            if let Some(cmd) = self.drawing.get_visible_mut(idx) {
+                update(cmd);
+                self.drawing.revision += 1;
+            }
+        }
+    }
+
     /// undo/redo 后检查选中命令是否仍可见，不可见则清除选中
     fn check_selected_visible(&mut self) {
         if let Some(idx) = self.selected_cmd_actual_idx {
@@ -1455,6 +1465,14 @@ fn render_stroke_popover_content(
                 let _ = weak_lw.update(cx, |this, cx| {
                     this.finalize_text_input_if_active(cx);
                     this.toolbar.line_width = lw;
+                    // 应用到选中命令（改宽），下次可二次编辑
+                    this.apply_style_to_selected(|cmd| match cmd {
+                        DrawCommand::Rectangle { line_width, .. }
+                        | DrawCommand::Ellipse { line_width, .. }
+                        | DrawCommand::Arrow { line_width, .. }
+                        | DrawCommand::Freehand { line_width, .. } => *line_width = lw,
+                        _ => {}
+                    });
                     cx.notify();
                 });
             });
@@ -1492,6 +1510,14 @@ fn render_color_swatch_row(cur_color: RGBA, weak: gpui::WeakEntity<OverlayView>)
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                     let _ = weak_c.update(cx, |this, cx| {
                         this.toolbar.current_color = c;
+                        // 应用到选中命令（改色）
+                        this.apply_style_to_selected(|cmd| match cmd {
+                            DrawCommand::Rectangle { color, .. }
+                            | DrawCommand::Ellipse { color, .. }
+                            | DrawCommand::Arrow { color, .. }
+                            | DrawCommand::Freehand { color, .. } => *color = c,
+                            _ => {}
+                        });
                         cx.notify();
                     });
                 }),
@@ -3280,6 +3306,21 @@ impl Render for OverlayView {
                             for (idx, cmd) in visible.iter().rev() {
                                 if let Some(mode) = hit_test_cmd_drag(cmd, p) {
                                     this.selected_cmd_actual_idx = Some(*idx);
+                                    // 同步工具栏显示该命令的线宽/颜色（便于二次编辑）
+                                    this.toolbar.line_width = match cmd {
+                                        DrawCommand::Rectangle { line_width, .. }
+                                        | DrawCommand::Ellipse { line_width, .. }
+                                        | DrawCommand::Arrow { line_width, .. }
+                                        | DrawCommand::Freehand { line_width, .. } => *line_width,
+                                        _ => this.toolbar.line_width,
+                                    };
+                                    this.toolbar.current_color = match cmd {
+                                        DrawCommand::Rectangle { color, .. }
+                                        | DrawCommand::Ellipse { color, .. }
+                                        | DrawCommand::Arrow { color, .. }
+                                        | DrawCommand::Freehand { color, .. } => *color,
+                                        _ => this.toolbar.current_color,
+                                    };
                                     this.cmd_drag = Some(CmdDragState {
                                         mode,
                                         start_mouse: p,
