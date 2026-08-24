@@ -2301,20 +2301,6 @@ fn update_in_progress_incr(
     }
 }
 
-/// 判断命令 c 是否是 drawing 可见命令中的最后一条 Freehand
-/// （in_progress_incr 正在显示它，committed 应跳过以免重渲染出第二条线）。
-fn is_last_freehand(self_: &OverlayView, c: &DrawCommand) -> bool {
-    let last = self_
-        .drawing
-        .visible_commands()
-        .filter(|cmd| matches!(&***cmd, DrawCommand::Freehand { .. }))
-        .last();
-    match last {
-        Some(l) => std::ptr::eq(&**l, c),
-        None => false,
-    }
-}
-
 fn rasterize_shapes(
     shapes: &[&DrawCommand],
     scale_factor: f32,
@@ -2670,19 +2656,14 @@ impl Render for OverlayView {
             Some(c) => c.revision != drawing_revision || c.scale_factor != scale_factor,
         };
         if cache_stale {
-            // 跳过最后一条 Freehand：它由 in_progress_incr 增量层显示
-            //（松手后继续用同一张图），committed 不再重渲染它 → 无第二根线
+            // committed 完整渲染所有形状（含全部 Freehand）：增量层只作
+            //「最后一条 Freehand」的即时显示，committed 是它的持久后备——
+            // 增量层清空（画下一条）时旧线由 committed 继续显示，不消失
             let committed: Vec<&DrawCommand> = self
                 .drawing
                 .visible_commands()
                 .filter(|c| is_shape_command(c))
                 .map(|c| &**c)
-                .filter(|c| {
-                    // 仅当 in_progress_incr 正在显示某条 Freehand 时跳过它
-                    !(self.in_progress_incr.is_some()
-                        && matches!(c, DrawCommand::Freehand { .. })
-                        && is_last_freehand(self, c))
-                })
                 .collect();
             self.shape_layer_cache =
                 rasterize_shapes(&committed, scale_factor, window, 1).map(|(image, bounds)| {
