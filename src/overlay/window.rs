@@ -74,6 +74,23 @@ struct ShapeLayerCache {
 }
 
 
+/// Freehand 增量渲染状态（累积所有已画 Freehand）：
+/// 拖动时每帧只画新增段(O(新增))；buffer 覆盖所有 Freehand 的联合 bbox，
+/// bbox 超界时重建(拷贝旧像素+画新段)。bbox 计算与 rasterize_shapes 完全
+/// 一致(pad=lw/2+1, origin=floor, size=ceil)→ 与提交成图像素级一致。
+struct IncrFreehand {
+    /// CPU buffer（RGBA，透明底，逻辑像素）
+    frame: CapturedFrame,
+    /// buffer 逻辑原点
+    origin: (f32, f32),
+    /// 当前笔画已渲染点数（新笔画开始归零；buffer 保留旧 Freehand 像素）
+    rendered: usize,
+    /// 当前笔画线宽（变化时全量重建）
+    lw: f32,
+    /// 渲染结果（图 + 逻辑 bounds）
+    image: Option<(Arc<RenderImage>, ub::Bounds)>,
+}
+
 /// GPUI 视图：覆盖窗口内容
 pub struct OverlayView {
     /// 捕获帧的 GPUI 渲染图（已转 BGRA）
@@ -104,6 +121,8 @@ pub struct OverlayView {
 
     /// 已提交形状的离屏光栅化缓存（见 `ShapeLayerCache`）
     shape_layer_cache: Option<ShapeLayerCache>,
+    /// Freehand 统一增量层（累积所有已画 Freehand；committed 不渲染 Freehand）
+    freehand_incr: Option<IncrFreehand>,
 
 
 
@@ -298,6 +317,7 @@ impl OverlayView {
             drawing: DrawingState::new(),
             in_progress: None,
             shape_layer_cache: None,
+            freehand_incr: None,
             text_input: None,
             text_input_anchor: BoundsPoint::ZERO,
             text_input_rect: ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO),
@@ -354,6 +374,7 @@ impl OverlayView {
         self.drawing = DrawingState::new();
         self.in_progress = None;
         self.shape_layer_cache = None;
+        self.freehand_incr = None;
         self.text_input = None;
         self.text_input_anchor = BoundsPoint::ZERO;
         self.text_input_rect = ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO);
@@ -453,6 +474,12 @@ impl OverlayView {
         let color = self.toolbar.current_color;
         let lw = self.toolbar.line_width;
         let dp = crate::overlay::drawing::Point::new(p.x, p.y);
+        // 新 Freehand 开始：rendered 归零（该笔画的增量从 0 起），buffer 保留旧
+        if tool == ToolButton::Freehand {
+            if let Some(st) = self.freehand_incr.as_mut() {
+                st.rendered = 0;
+            }
+        }
         self.in_progress = Some(std::sync::Arc::new(match tool {
             ToolButton::Rectangle => DrawCommand::Rectangle {
                 rect: (dp, dp),
@@ -1230,11 +1257,13 @@ fn render_simple_button(
                 match btn {
                     ToolButton::Undo => {
                         this.drawing.undo();
+                        rebuild_freehand_incr(this, window);
                         this.check_selected_visible();
                         cx.notify();
                     }
                     ToolButton::Redo => {
                         this.drawing.redo();
+                        rebuild_freehand_incr(this, window);
                         this.check_selected_visible();
                         cx.notify();
                     }
@@ -2177,6 +2206,203 @@ fn is_shape_command(c: &DrawCommand) -> bool {
 /// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感，所以这里
 /// 复用 commit 路径的 `commands::apply_commands` 逐像素解析式 AA，得到与最终成图
 /// 一致的平滑线条。返回 `None` 若无形状。
+/// 增量画 Freehand 当前笔画到 freehand_incr（累积层）：
+/// 每帧只画新增段；bbox 计算与 rasterize_shapes 一致（pad=lw/2+1，
+/// origin=floor，size=ceil）→ 与提交成图像素级一致。
+/// 返回 (图, bounds) 供 paint。
+fn update_in_progress_incr(
+    self_: &mut OverlayView,
+    _window: &Window,
+) -> Option<(Arc<RenderImage>, ub::Bounds)> {
+    let Some(ip) = &self_.in_progress else {
+        return self_.freehand_incr.as_ref().and_then(|st| st.image.clone());
+    };
+    let DrawCommand::Freehand { points, color, line_width } = &**ip else {
+        return self_.freehand_incr.as_ref().and_then(|st| st.image.clone());
+    };
+    if points.len() < 2 {
+        return None;
+    }
+    let lw = *line_width;
+    let now = points.len();
+
+    // 当前笔画逻辑 bbox（含 pad，与 rasterize_shapes 相同外扩）
+    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in points {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    let pad = lw / 2.0 + 1.0;
+    let cur_min_x = min_x - pad;
+    let cur_min_y = min_y - pad;
+    let cur_max_x = max_x + pad;
+    let cur_max_y = max_y + pad;
+
+    // 联合 bbox = 旧 buffer + 当前笔画（累积所有 Freehand）
+    let (mut all_min_x, mut all_min_y, mut all_max_x, mut all_max_y) =
+        (cur_min_x, cur_min_y, cur_max_x, cur_max_y);
+    if let Some(old) = &self_.freehand_incr {
+        all_min_x = all_min_x.min(old.origin.0);
+        all_min_y = all_min_y.min(old.origin.1);
+        all_max_x = all_max_x.max(old.origin.0 + old.frame.width as f32);
+        all_max_y = all_max_y.max(old.origin.1 + old.frame.height as f32);
+    }
+    let ox = all_min_x.floor();
+    let oy = all_min_y.floor();
+    let bw = (all_max_x.ceil() - ox).max(1.0) as u32;
+    let bh = (all_max_y.ceil() - oy).max(1.0) as u32;
+
+    // bounds（逻辑，与 rasterize_shapes 的 floor origin + ceil size 一致）
+    let bounds = ub::Bounds {
+        origin: ub::Point::new(ox, oy),
+        size: ub::Point::new(bw as f32, bh as f32),
+    };
+
+    // buffer 是否可复用（同原点同尺寸同线宽）
+    let reusable = match &self_.freehand_incr {
+        Some(st) => st.origin == (ox, oy) && st.frame.width == bw && st.frame.height == bh && st.lw == lw,
+        None => false,
+    };
+
+    if reusable {
+        let st = self_.freehand_incr.as_mut().unwrap();
+        if now > st.rendered {
+            // 增量：画新段（rendered-1 起重叠点连接），Exact 两端（与全量中间顶点一致）
+            let start = st.rendered.saturating_sub(1);
+            let mut newpts: Vec<(f32, f32)> = Vec::with_capacity(now - start);
+            for p in &points[start..now] {
+                newpts.push((p.x - ox, p.y - oy));
+            }
+            let _ = crate::overlay::commands::draw_polyline_pub(
+                &mut st.frame, &newpts, lw, *color, 1,
+                crate::overlay::commands::Cap::Exact,
+                crate::overlay::commands::Cap::Exact,
+            );
+            st.rendered = now;
+            let img = build_render_image_from_pixels(bw, bh, st.frame.pixels.clone());
+            st.image = Some((img, bounds));
+        }
+        st.image.clone()
+    } else {
+        // 重建：拷贝旧 buffer + 画当前笔画（含旧 Freehand 由拷贝保留）
+        let mut frame = CapturedFrame {
+            width: bw,
+            height: bh,
+            pixels: vec![0; (bw * bh * 4) as usize],
+        };
+        if let Some(old) = &self_.freehand_incr {
+            // 交集拷贝
+            let ox0 = old.origin.0.max(ox);
+            let oy0 = old.origin.1.max(oy);
+            let ox1 = (old.origin.0 + old.frame.width as f32).min(ox + bw as f32);
+            let oy1 = (old.origin.1 + old.frame.height as f32).min(oy + bh as f32);
+            if ox1 > ox0 && oy1 > oy0 {
+                for yy in 0..((oy1 - oy0) as u32) {
+                    let sy = (oy0 + yy as f32 - old.origin.1) as usize;
+                    let dy = (oy0 + yy as f32 - oy) as usize;
+                    let sx = (ox0 - old.origin.0) as usize;
+                    let dx = (ox0 - ox) as usize;
+                    let len = ((ox1 - ox0) as usize) * 4;
+                    let src = sy * old.frame.width as usize * 4 + sx * 4;
+                    let dst = dy * bw as usize * 4 + dx * 4;
+                    if dst + len <= frame.pixels.len() && src + len <= old.frame.pixels.len() {
+                        frame.pixels[dst..dst + len]
+                            .copy_from_slice(&old.frame.pixels[src..src + len]);
+                    }
+                }
+            }
+        }
+        // 画当前笔画全部（重建时：整条一次画，Exact 内部 + 首尾 Full 由首帧处理）
+        let start = self_.freehand_incr.as_ref().map(|s| s.rendered.saturating_sub(1)).unwrap_or(0);
+        let s0 = if self_.freehand_incr.is_some() { start } else { 0 };
+        if now > s0 {
+            let mut newpts: Vec<(f32, f32)> = Vec::with_capacity(now - s0);
+            for p in &points[s0..now] {
+                newpts.push((p.x - ox, p.y - oy));
+            }
+            let _ = crate::overlay::commands::draw_polyline_pub(
+                &mut frame, &newpts, lw, *color, 1,
+                crate::overlay::commands::Cap::Exact,
+                crate::overlay::commands::Cap::Exact,
+            );
+        }
+        let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
+        self_.freehand_incr = Some(IncrFreehand {
+            frame,
+            origin: (ox, oy),
+            rendered: now,
+            lw,
+            image: Some((img.clone(), bounds)),
+        });
+        Some((img, bounds))
+    }
+}
+
+/// 全量重建 freehand_incr（撤销/重做后）：从可见 Freehand 命令重新光栅化。
+fn rebuild_freehand_incr(self_: &mut OverlayView, _window: &Window) {
+    let freehands: Vec<&DrawCommand> = self_
+        .drawing
+        .visible_commands()
+        .filter(|c| matches!(&***c, DrawCommand::Freehand { .. }))
+        .map(|c| &**c)
+        .collect();
+    if freehands.is_empty() {
+        self_.freehand_incr = None;
+        return;
+    }
+    // 联合 bbox（与 rasterize_shapes 相同 pad）
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut max_lw = 0.0f32;
+    for cmd in &freehands {
+        if let DrawCommand::Freehand { points, line_width, .. } = cmd {
+            for p in points {
+                min_x = min_x.min(p.x);
+                min_y = min_y.min(p.y);
+                max_x = max_x.max(p.x);
+                max_y = max_y.max(p.y);
+            }
+            max_lw = max_lw.max(*line_width);
+        }
+    }
+    let pad = max_lw / 2.0 + 1.0;
+    let ox = (min_x - pad).floor();
+    let oy = (min_y - pad).floor();
+    let bw = ((max_x + pad).ceil() - ox).max(1.0) as u32;
+    let bh = ((max_y + pad).ceil() - oy).max(1.0) as u32;
+    let mut frame = CapturedFrame {
+        width: bw,
+        height: bh,
+        pixels: vec![0; (bw * bh * 4) as usize],
+    };
+    for cmd in &freehands {
+        if let DrawCommand::Freehand { points, color, line_width } = cmd {
+            let mut pts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
+            for p in points {
+                pts.push((p.x - ox, p.y - oy));
+            }
+            let _ = crate::overlay::commands::draw_polyline_pub(
+                &mut frame, &pts, *line_width, *color, 1,
+                crate::overlay::commands::Cap::Full,
+                crate::overlay::commands::Cap::Full,
+            );
+        }
+    }
+    let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
+    self_.freehand_incr = Some(IncrFreehand {
+        frame,
+        origin: (ox, oy),
+        rendered: 0,
+        lw: max_lw,
+        image: Some((img, ub::Bounds {
+            origin: ub::Point::new(ox, oy),
+            size: ub::Point::new(bw as f32, bh as f32),
+        })),
+    });
+}
+
 fn rasterize_shapes(
     shapes: &[&DrawCommand],
     scale_factor: f32,
@@ -2532,11 +2758,12 @@ impl Render for OverlayView {
             Some(c) => c.revision != drawing_revision || c.scale_factor != scale_factor,
         };
         if cache_stale {
-            // committed 完整渲染所有形状（含 Freehand）——与 in_progress 同一光栅化
+            // committed 只渲染非 Freehand 形状（矩形/椭圆/箭头）；
+            // Freehand 统一由 freehand_incr 增量层显示（单一来源，杜绝双线）
             let committed: Vec<&DrawCommand> = self
                 .drawing
                 .visible_commands()
-                .filter(|c| is_shape_command(c))
+                .filter(|c| is_shape_command(c) && !matches!(&***c, DrawCommand::Freehand { .. }))
                 .map(|c| &**c)
                 .collect();
             self.shape_layer_cache =
@@ -2554,14 +2781,17 @@ impl Render for OverlayView {
             .as_ref()
             .map(|c| (c.image.clone(), c.bounds));
 
-        // 当前笔画：所有形状（含 Freehand）统一走 rasterize_shapes 全量光栅化——
-        // 与提交成图同一函数同一参数，像素级一致（无增量/全量两套 bounds 差异）。
-        // 性能由 draw_polyline 网格分桶保证（3000 点约 24ms）。
+        // 当前笔画：Freehand 走增量层（freehand_incr，O(新增)）；其他形状全量。
+        // 无 in_progress 时也返回 freehand_incr（已画 Freehand 持续显示）
         let in_progress_shape_layer = match &self.in_progress {
+            Some(ip) if matches!(&**ip, DrawCommand::Freehand { .. }) => {
+                update_in_progress_incr(self, window)
+            }
             Some(ip) if is_shape_command(ip) => {
                 rasterize_shapes(&[&**ip], scale_factor, window, 1)
             }
-            _ => None,
+            None => self.freehand_incr.as_ref().and_then(|st| st.image.clone()),
+            _ => self.freehand_incr.as_ref().and_then(|st| st.image.clone()),
         };
 
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
@@ -3642,6 +3872,7 @@ impl Render for OverlayView {
                     } else {
                         this.drawing.undo();
                     }
+                    rebuild_freehand_incr(this, window);
                     this.check_selected_visible();
                     cx.notify();
                 }
