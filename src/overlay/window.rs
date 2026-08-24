@@ -2781,18 +2781,26 @@ impl Render for OverlayView {
             .as_ref()
             .map(|c| (c.image.clone(), c.bounds));
 
-        // 当前笔画：Freehand 走增量层（freehand_incr，O(新增)）；其他形状全量。
-        // 无 in_progress 时也返回 freehand_incr（已画 Freehand 持续显示）
-        let in_progress_shape_layer = match &self.in_progress {
-            Some(ip) if matches!(&**ip, DrawCommand::Freehand { .. }) => {
-                update_in_progress_incr(self, window)
-            }
-            Some(ip) if is_shape_command(ip) => {
-                rasterize_shapes(&[&**ip], scale_factor, window, 1)
-            }
-            None => self.freehand_incr.as_ref().and_then(|st| st.image.clone()),
-            _ => self.freehand_incr.as_ref().and_then(|st| st.image.clone()),
-        };
+        // 显示层叠加：(freehand_incr 已画 Freehand, 当前工具形状)。
+        // Freehand 由增量层显示（committed 不渲染），其他工具形状全量——
+        // 切到箭头/矩形等时已画线条不消失
+        // 类型别名：显示层 = (已画 Freehand 层, 当前工具层)
+        type ShapeLayer = Option<(Arc<RenderImage>, ub::Bounds)>;
+        let in_progress_shape_layer: (ShapeLayer, ShapeLayer) =
+            match &self.in_progress {
+                Some(ip) if matches!(&**ip, DrawCommand::Freehand { .. }) => {
+                    let cur = update_in_progress_incr(self, window);
+                    (cur, None)
+                }
+                Some(ip) if is_shape_command(ip) => {
+                    let done = self.freehand_incr.as_ref().and_then(|st| st.image.clone());
+                    (done, rasterize_shapes(&[&**ip], scale_factor, window, 1))
+                }
+                _ => {
+                    let done = self.freehand_incr.as_ref().and_then(|st| st.image.clone());
+                    (done, None)
+                }
+            };
 
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
         // （已提交文字由元素层 Input 绘制）。
@@ -2994,7 +3002,11 @@ impl Render for OverlayView {
                     if let Some((img, b)) = &committed_shape_layer {
                         paint_raster(window, img, *b);
                     }
-                    if let Some((img, b)) = &in_progress_shape_layer {
+                    // 先画已画 Freehand（freehand_incr），再画当前工具形状
+                    if let Some((img, b)) = &in_progress_shape_layer.0 {
+                        paint_raster(window, img, *b);
+                    }
+                    if let Some((img, b)) = &in_progress_shape_layer.1 {
                         paint_raster(window, img, *b);
                     }
 
