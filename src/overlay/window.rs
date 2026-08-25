@@ -1075,12 +1075,17 @@ fn compute_toolbar_bounds(
     sel: ub::Bounds,
     screen_bounds: ub::Bounds,
 ) -> (f32, f32, f32, f32) {
-    let screen_h = screen_bounds.origin.y + screen_bounds.size.y;
+    let screen_y0 = screen_bounds.origin.y;
+    let screen_h = screen_y0 + screen_bounds.size.y;
     let toolbar_h = TOOLBAR_BTN_SIZE + TOOLBAR_PAD * 2.0;
     let toolbar_y_below = sel.origin.y + sel.size.y + TOOLBAR_OFFSET_Y;
-    // 选区下方放得下 → 放在选区下方；否则 → 固定屏幕底部
+    // 优先级：选区下方 → 选区上方 → 屏幕底部。
+    // 选区贴屏幕底部时放下方会与选区重叠，选区的鼠标处理截获点击
+    // 导致工具栏按钮点不到（用户报"点不到箭头/椭圆等按钮"）。
     let toolbar_y = if toolbar_y_below + toolbar_h + TOOLBAR_OFFSET_Y <= screen_h {
         toolbar_y_below
+    } else if sel.origin.y - toolbar_h - TOOLBAR_OFFSET_Y >= screen_y0 {
+        sel.origin.y - toolbar_h - TOOLBAR_OFFSET_Y
     } else {
         screen_h - toolbar_h - TOOLBAR_OFFSET_Y
     };
