@@ -1201,6 +1201,10 @@ fn render_tool_button_with_popover(
 
     let weak_content = weak.clone();
     Popover::new(("tool-popover", btn as usize))
+        // 弹层在按钮上方展开（BottomLeft：弹层底边贴按钮顶边）——
+        // 默认 TopLeft 会让弹层向下覆盖按钮行，按钮被弹层盖住后点击
+        // 不响应（用户报"浮层弹不出来/点按钮看到弹层矩形框"）。
+        .anchor(gpui::Anchor::BottomLeft)
         .trigger(trigger)
         .open(is_open)
         .on_open_change(cx.listener(move |this, open, _w, cx| {
