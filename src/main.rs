@@ -1,3 +1,8 @@
+// Windows 下把二进制标记为 GUI 子系统（而非默认的控制台子系统）：
+// 否则打包后双击运行时 Windows 会给它创建一个黑色终端窗口。
+// 从已有终端 `cargo run` 启动时 stdout/stderr 仍继承父控制台，开发日志不受影响。
+#![windows_subsystem = "windows"]
+
 use screenshot_rs::app::AppState;
 use screenshot_rs::error::AppResult;
 use tracing_subscriber::EnvFilter;
