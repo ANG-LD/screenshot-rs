@@ -1201,10 +1201,11 @@ fn render_tool_button_with_popover(
 
     let weak_content = weak.clone();
     Popover::new(("tool-popover", btn as usize))
-        // 弹层在按钮上方展开（BottomLeft：弹层底边贴按钮顶边）——
-        // 默认 TopLeft 会让弹层向下覆盖按钮行，按钮被弹层盖住后点击
-        // 不响应（用户报"浮层弹不出来/点按钮看到弹层矩形框"）。
-        .anchor(gpui::Anchor::BottomLeft)
+        // 向下展开（默认 TopLeft 锚定）。
+        // overlay_closable(false)：弹层打开后不因「鼠标还在按钮上/未移入
+        // 弹层」的点击外部判定而立即消失——用户报"弹层弹出后鼠标没移动到
+        // 弹层上就消失"。关闭靠：再点按钮 toggle / 切工具 / Esc。
+        .overlay_closable(false)
         .trigger(trigger)
         .open(is_open)
         .on_open_change(cx.listener(move |this, open, _w, cx| {
