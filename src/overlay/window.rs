@@ -1182,20 +1182,18 @@ fn render_tool_button_with_popover(
         .child(icon_label(btn, false))
         .on_click(move |_, _, cx| {
             let _ = weak_for_trigger.update(cx, |this, cx| {
-                if this.toolbar.active_tool == Some(btn) {
-                    // 已 active：toggle popover
-                    this.toolbar.popup = if this.toolbar.popup == Some(popup_kind) {
-                        None
-                    } else {
-                        Some(popup_kind)
-                    };
-                } else {
-                    // 切到新工具：先提交活跃的 Text 输入，避免文字丢失
+                if this.toolbar.active_tool != Some(btn) {
+                    // 切到新工具：先提交活跃的 Text 输入，避免文字丢失，关旧弹层
                     this.finalize_text_input_if_active(cx);
                     this.toolbar.active_tool = Some(btn);
                     this.toolbar.popup = None;
+                    cx.notify();
                 }
-                cx.notify();
+                // 已 active：弹层开/关完全由 GPUI popover 状态驱动
+                //（trigger 的 toggle → on_open_change 回调同步 toolbar.popup）。
+                // 此前 on_click 再 toggle 会与 GPUI 双重竞争——
+                // 弹层刚被 GPUI 打开(open_change→popup=Some)又立刻被我们关掉，
+                // 表现为"弹出即消失"。
             });
         });
 
@@ -1210,7 +1208,14 @@ fn render_tool_button_with_popover(
         .open(is_open)
         .on_open_change(cx.listener(move |this, open, _w, cx| {
             if *open {
-                this.toolbar.popup = Some(popup_kind);
+                // 仅当该按钮就是当前 active 工具时才记录弹层打开。
+                // 点击「新工具」时 GPUI trigger 在 mouse_down 阶段也会
+                // toggle 打开（on_open_change(true)），此时 active_tool
+                // 尚未切换；若无条件设 popup=Some(kind)，旧 active 按钮
+                // 若同为该 kind 会误判 is_open → 闪现兄弟按钮的弹层。
+                if this.toolbar.active_tool == Some(btn) {
+                    this.toolbar.popup = Some(popup_kind);
+                }
             } else if this.toolbar.popup == Some(popup_kind) {
                 this.toolbar.popup = None;
             }
