@@ -4832,6 +4832,12 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
             is_movable: false,
             is_resizable: false,
             focus: false,
+            // Windows：创建即隐藏（show:false），首个会话由 reuse 的
+            // activate_window → set_window_placement 显示，避免启动时残留一个
+            // 全屏灰色遮罩窗口（之前只有 Linux 在创建后 unmap；Windows 一直没
+            // 隐藏，且 Transparent 背景未合成 alpha → 显示成灰色全屏窗，点掉才消失）。
+            #[cfg(target_os = "windows")]
+            show: false,
             ..Default::default()
         },
         |window, cx| {
