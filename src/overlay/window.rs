@@ -4897,6 +4897,9 @@ fn reuse_overlay_window(
     cx: &mut App,
 ) {
     // —— 与 open_overlay_in_app 相同的窗口/裁剪参数计算 ——
+    // 帧尺寸在下方 move 进 (display, original) 前先取出，供对齐诊断使用
+    let frame_w = frame.width;
+    let frame_h = frame.height;
     let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
         origin: point(px(0.), px(0.)),
         size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
@@ -4956,6 +4959,23 @@ fn reuse_overlay_window(
         //    平台 park 时缩成了 1×1，需要恢复。
         #[cfg(not(target_os = "linux"))]
         window.resize(Size::new(px(actual_w), px(actual_h)));
+        // Windows：把遮罩窗口客户端顶对齐到帧捕获原点（主屏物理 0,0）。
+        // 帧图像从物理(0,0)捕获、绘制在 client (0,0)；若客户端被放高数 px
+        // （GPUI calculate_window_rect 假设边框对称，部分窗口实际顶部边框为 0，
+        // 见 adjust_window_client_top 注释），遮罩会相对实屏整幅上移——即用户
+        // 看到的「屏幕偏移 N px」。Pin 窗口已校正过，这里给遮罩窗口同样校正；
+        // 下方日志打印实测偏移，dy=0 时幂等不动窗口。
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = window_hwnd(window) {
+            schedule_overlay_client_align(
+                hwnd as usize,
+                (client_origin.y * window.scale_factor()) as i32,
+                window.scale_factor(),
+                client_origin,
+                frame_w,
+                frame_h,
+            );
+        }
         // 3) 唤醒：map + 置顶
         #[cfg(target_os = "linux")]
         unpark_overlay_window(window);
@@ -6187,6 +6207,43 @@ fn window_hwnd(window: &mut Window) -> Option<*mut core::ffi::c_void> {
         }
     }
     None
+}
+
+/// 校正遮罩窗口的客户端顶到 `desired_client_top`（物理px），校正前打印实测几何。
+///
+/// 用独立线程 sleep 一帧后调 Win32（App 借期外），避免 `SetWindowPos` 触发
+/// `WM_MOVE` 重入 App 报 "RefCell already borrowed"（与 `schedule_client_top_adjustment`
+/// 同理；那边走 foreground executor，这里遮罩复用路径拿不到 `&mut App`）。
+/// `desired_client_top` = 帧捕获原点（主屏物理 0,0）= 显示原点×scale；dy=0 时不动窗口。
+#[cfg(target_os = "windows")]
+fn schedule_overlay_client_align(
+    hwnd: usize,
+    desired_client_top: i32,
+    scale: f32,
+    display_origin: ub::Point,
+    frame_w: u32,
+    frame_h: u32,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        let hwnd_ptr = hwnd as *mut core::ffi::c_void;
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        unsafe {
+            let mut pt: POINT = std::mem::zeroed();
+            ClientToScreen(hwnd_ptr, &mut pt);
+            let client_origin = ub::Point::new(pt.x as f32 / scale, pt.y as f32 / scale);
+            tracing::info!(
+                "[overlay-align] frame={}x{} scale={:.3} display_origin=({:.1},{:.1}) \
+                 client_origin=({:.2},{:.2}) dy={:+.1}px",
+                frame_w, frame_h, scale,
+                display_origin.x, display_origin.y,
+                client_origin.x, client_origin.y,
+                client_origin.y - display_origin.y
+            );
+        }
+        adjust_window_client_top(hwnd_ptr, desired_client_top);
+    });
 }
 
 /// 把窗口客户端区的屏幕 Y 校正到 `desired_client_top`，延迟到 App 借期外执行（Windows）。
