@@ -7031,6 +7031,7 @@ dependencies = [
  "arboard",
  "cosmic-text",
  "dirs",
+ "embed-resource",
  "global-hotkey",
  "gpui",
  "gpui-component",

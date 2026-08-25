@@ -1,0 +1,3 @@
+// Windows 资源脚本：将应用图标嵌入 exe 资源段（IDI_APP_ICON）。
+// 由 build.rs 通过 embed-resource 编译，路径相对本文件所在目录。
+IDI_APP_ICON ICON "screenshot-rs.ico"

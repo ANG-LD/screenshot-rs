@@ -81,6 +81,13 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code", "xtest", "shm"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Ole", "Win32_System_Memory"] }
 
+# 构建期把 assets/icons/screenshot-rs.ico 嵌入 exe 资源段（见 build.rs），
+# 否则 Windows 资源管理器/任务栏显示通用图标。
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# 用 3.x：compile() 返回 Result（2.x 返回 ()，无法 .expect）。
+# 且 3.0.11 已在依赖树中（gpui 也在用），可去重、少编译一份。
+embed-resource = "3"
+
 # gpui-component 的本地修补版：把 Root::tooltip_overlay 与 TooltipOverlay::hide
 # 从 pub(crate) 改为 pub，供项目在窗口复用会话开始时清除跨会话残留的 tooltip
 # 浮层（third_party/gpui-component 是 951e3de 的最小副本，仅 ui/macros/assets 三个 crate）。
