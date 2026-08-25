@@ -726,8 +726,9 @@ impl OverlayView {
         let w = max_w_override.unwrap_or(64.0);
         // 空框行高由窗口 line_height 决定；输字后 auto_grow 测量里会再按
         // max(窗口行高, 1.4×字号) 补足，避免大字号溢出。
+        // 默认高度提高：行高加成 14→22、下限 40→50，初始框更明显
         let line_h = window.line_height().as_f32();
-        let init_h = (line_h + 14.0).max(40.0);
+        let init_h = (line_h + 22.0).max(50.0);
         self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + w, p.y + init_h))
             .clamp_inside(limits);
         tracing::debug!("open_text_input: anchor=({:.1}, {:.1}) initial={}", p.x, p.y, initial.is_some());
