@@ -329,9 +329,13 @@ pub fn apply_commands_step(
                 if len >= 1.0 {
                     let ux = dx / len;
                     let uy = dy / len;
-                    // 箭头头随线宽缩放：细线（0.5/1）用短小箭头，粗线用大箭头
-                    let head_len = (line_width * 7.0).max(4.0);
-                    let head_w = (line_width * 2.0).max(1.0);
+                    // 箭头头随线宽缩放，但细线保底尺寸：1px 线宽下箭头头也要
+                    // 清晰可见（原 head_len=7/head_w=2 的三角形太小 + 尖端被
+                    // AA 削平，看起来"没有箭头"）。底线 10/3 让 1px 箭头的
+                    // 头足够醒目，粗线仍按比例放大；且头长不超过线长 70%，
+                    // 避免短箭头底边越过起点导致主线反向延伸。
+                    let head_len = ((line_width * 7.0).max(10.0)).min(len * 0.7);
+                    let head_w = (line_width * 2.0).max(3.0);
                     let bx = t.0 - ux * head_len;
                     let by = t.1 - uy * head_len;
                     // 主线：均匀宽度，直达箭头底部
@@ -341,7 +345,11 @@ pub fn apply_commands_step(
                     let py = ux;
                     let p1 = (bx + px * head_w, by + py * head_w);
                     let p2 = (bx - px * head_w, by - py * head_w);
-                    draw_filled_triangle(frame, t.0, t.1, p1.0, p1.1, p2.0, p2.1, *color)?;
+                    // 尖端沿箭头方向外扩半个 AA 带宽：尖端像素中心落在三角形内，
+                    // 避免尖角被 AA 削成"钝头"（细线下看起来没有箭头尖）。
+                    let tx = t.0 + ux * 0.5;
+                    let ty = t.1 + uy * 0.5;
+                    draw_filled_triangle(frame, tx, ty, p1.0, p1.1, p2.0, p2.1, *color)?;
                 } else {
                     // 极短线：至少画一个点
                     draw_thick_line(frame, f.0, f.1, t.0, t.1, *line_width, *color, Cap::Full, Cap::Full)?;
@@ -1173,6 +1181,62 @@ mod tests {
             "r at (5,5) should be dark (gray tint over black), got {}",
             f.pixels[idx]
         );
+    }
+
+    #[test]
+    fn arrow_lw1_head_visible_and_large_enough() {
+        // 回归：1px 线宽的箭头头必须清晰可见（曾因 head_len=7/head_w=2
+        // 太小 + 尖端被 AA 削平，看起来"没有箭头"）。
+        let mut f = empty_frame(80, 40);
+        let cmd = DrawCommand::Arrow {
+            from: DrawPoint::new(4.0, 20.0),
+            to: DrawPoint::new(64.0, 20.0),
+            color: RGBA::new(0xFF, 0x00, 0x00, 0xFF),
+            line_width: 1.0,
+        };
+        apply_commands(&mut f, 0.0, 0.0, &[cmd]).unwrap();
+        // 尖端附近 (63,20) 至少部分覆盖（外扩后尖角不再全透明）
+        let idx = (20 * 80 + 63) * 4;
+        assert!(f.pixels[idx + 3] > 50, "near-tip alpha = {}", f.pixels[idx + 3]);
+        // 三角形内部 (60,20) 实心
+        let idx = (20 * 80 + 60) * 4;
+        assert!(f.pixels[idx + 3] > 200, "head interior alpha = {}", f.pixels[idx + 3]);
+        // 头底边区域 (56,18)/(56,22) 应被三角形覆盖
+        let idx = (18 * 80 + 56) * 4;
+        assert!(f.pixels[idx + 3] > 150, "head base upper alpha = {}", f.pixels[idx + 3]);
+        // 头尺寸：沿 x 的头跨度 >= 8px（head_len 下限 10 减去 AA 边距），
+        // 保证 1px 线箭头头醒目
+        let mut tip_x = 0;
+        for x in (50..67).rev() {
+            let idx = (20 * 80 + x) * 4;
+            if f.pixels[idx + 3] > 50 { tip_x = x; break; }
+        }
+        let mut base_x = 0;
+        for x in 50..67 {
+            let idx = (20 * 80 + x) * 4;
+            if f.pixels[idx + 3] > 50 { base_x = x; break; }
+        }
+        assert!(tip_x - base_x >= 8, "head length too small: {}px", tip_x - base_x);
+    }
+
+    #[test]
+    fn arrow_short_head_does_not_reverse_past_start() {
+        // 短箭头：head_len 上限 = 线长 70%，底边不得越过起点（主线不反向）
+        let mut f = empty_frame(40, 24);
+        let cmd = DrawCommand::Arrow {
+            from: DrawPoint::new(4.0, 12.0),
+            to: DrawPoint::new(16.0, 12.0), // 线长 12
+            color: RGBA::new(0xFF, 0x00, 0x00, 0xFF),
+            line_width: 1.0,
+        };
+        apply_commands(&mut f, 0.0, 0.0, &[cmd]).unwrap();
+        // 起点 (4,12) 附近不应有反向延伸的主线像素：起点左侧 2px 透明
+        //（起点 Full 圆帽半径 0.5 + AA 带 1.0 只覆盖到 1.5px，2px 处应无像素）
+        let idx = (12 * 40 + 2) * 4;
+        assert_eq!(f.pixels[idx + 3], 0, "pixels left of start: alpha = {}", f.pixels[idx + 3]);
+        // 起点处主线仍存在
+        let idx = (12 * 40 + 4) * 4;
+        assert!(f.pixels[idx + 3] > 100, "start alpha = {}", f.pixels[idx + 3]);
     }
 
     #[test]

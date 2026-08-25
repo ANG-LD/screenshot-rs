@@ -2378,7 +2378,7 @@ fn rasterize_shapes(
     let (mut min_x, mut min_y, mut max_x, mut max_y) =
         (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let mut max_lw = 0.0_f32;
-    // 箭头头的底边半宽（head_w = 2*line_width），垂直方向超出箭杆中线，需计入外扩
+    // 箭头头的底边半宽（head_w = max(2*line_width, 3)），垂直方向超出箭杆中线，需计入外扩
     let mut max_arrow_head_w = 0.0_f32;
     for cmd in shapes.iter().copied() {
         match cmd {
@@ -2397,7 +2397,8 @@ fn rasterize_shapes(
                 max_x = max_x.max(from.x.max(to.x));
                 max_y = max_y.max(from.y.max(to.y));
                 max_lw = max_lw.max(*line_width);
-                max_arrow_head_w = max_arrow_head_w.max((*line_width * 2.0).max(1.0));
+                // 与 commands.rs 箭头头公式保持一致（细线保底半宽 3px）
+                max_arrow_head_w = max_arrow_head_w.max((*line_width * 2.0).max(3.0));
             }
             DrawCommand::Freehand { points, line_width, .. } => {
                 for p in points {
