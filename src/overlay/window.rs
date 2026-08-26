@@ -5590,6 +5590,8 @@ impl Render for OcrModelsView {
             let tier = t.tier.clone();
             let selected = t.selected;
             let note = t.note.clone();
+            // 内置档（small）：模型随应用包分发，不提供下载（无单文件/整档下载按钮）
+            let bundled = t.bundled;
             // 只有「本档整档下载中」才置按钮为下载中；其他档位按钮保持可点
             let busy = downloading
                 && batch_download
@@ -5598,6 +5600,7 @@ impl Render for OcrModelsView {
             let all_ready = t.files.iter().all(|f| matches!(f.status, FileStatus::Ready));
             // file_rows 闭包持有档位名/弱引用/下载状态的独立副本，避免与外层借用冲突
             let file_rows_tier = tier.clone();
+            let file_rows_bundled = bundled;
             let file_rows_weak = self.weak.clone();
             let file_rows_current_file = current_file.clone();
             let file_rows_downloading_tier = downloading_tier.clone();
@@ -5629,7 +5632,7 @@ impl Render for OcrModelsView {
                 let tier_for_btn = file_rows_tier.clone();
                 let name_for_btn = f.name.to_string();
                 // 单文件按钮状态：只有正在下载的这个按钮变「下载中…」，其他保持原样。
-                // 未下载=「下载」；已存在=「重新下载」。
+                // 未下载=「下载」；已存在=「重新下载」。内置档（small）无下载按钮。
                 let file_busy = downloading
                     && !file_rows_batch
                     && file_rows_downloading_tier.as_deref() == Some(file_rows_tier.as_str())
@@ -5660,7 +5663,14 @@ impl Render for OcrModelsView {
                             .child(div().text_color(mark_color).text_sm().child(gpui::SharedString::from(mark)))
                             .child(div().flex_1().text_sm().child(gpui::SharedString::from(f.name)))
                             .child(div().text_color(gpui::rgba(0x9E9E9EFF)).text_xs().child(gpui::SharedString::from(size_text)))
-                            .child(
+                            .child(if file_rows_bundled {
+                                // 内置档（small）：随应用包分发，无单文件下载按钮
+                                div()
+                                    .text_color(gpui::rgba(0x8BC34AFF))
+                                    .text_xs()
+                                    .child("内置")
+                                    .into_any_element()
+                            } else {
                                 Button::new(format!("dl-file-{file_rows_tier}-{name_for_btn}"))
                                     .label(file_label)
                                     .with_variant(file_variant)
@@ -5692,8 +5702,9 @@ impl Render for OcrModelsView {
                                                 cx.notify();
                                             });
                                         }
-                                    }))
-                            )
+                                    })
+                                    .into_any_element()
+                            })                            )
                     .child(
                         div()
                             .text_color(gpui::rgba(0x808080FF))
@@ -5781,9 +5792,14 @@ impl Render for OcrModelsView {
                                 })
                             }
                         })
-                        // 整档按钮：全部存在=「重新下载」(全部重下)；有缺失=「批量下载」(只补缺失)；
-                        // 本档整档下载中才变「下载中…」
-                        .child(
+                        // 整档按钮：仅非内置档（medium）显示下载；内置档（small）随应用包分发
+                        .child(if bundled {
+                            div()
+                                .text_color(gpui::rgba(0x8BC34AFF))
+                                .text_xs()
+                                .child("已随应用内置")
+                                .into_any_element()
+                        } else {
                             Button::new(format!("dl-{tier}"))
                                 .label(if busy {
                                     "下载中…"
@@ -5823,8 +5839,9 @@ impl Render for OcrModelsView {
                                             cx.notify();
                                         });
                                     }
-                                }),
-                        ),
+                                })
+                                .into_any_element()
+                        }),
                 )
                 .child(div().flex_col().gap(px(4.0)).children(file_rows))
         });

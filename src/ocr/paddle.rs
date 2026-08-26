@@ -53,6 +53,9 @@ pub struct TierStatus {
     pub note: String,
     /// 是否为当前生效档位（内存切换 > config）
     pub selected: bool,
+    /// 模型是否随应用包内置（small：cargo-packager resources 打包，无需下载；
+    /// medium：需联网下载）。UI 据此隐藏内置档位的下载按钮。
+    pub bundled: bool,
     /// 三件套文件状态（检测 / 识别 / 词典）
     pub files: Vec<ModelFileInfo>,
 }
@@ -130,6 +133,7 @@ pub fn tier_ready(tier: &str) -> Result<(), Vec<String>> {
         let mut exists = false;
         for dir in crate::config::ocr_model_dir()
             .into_iter()
+            .chain(bundled_resource_dirs())
             .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
             .chain(std::iter::once(cache_dir.clone()))
         {
@@ -147,6 +151,61 @@ pub fn tier_ready(tier: &str) -> Result<(), Vec<String>> {
     } else {
         Err(missing)
     }
+}
+
+/// 应用包内资源目录（cargo-packager `resources` 打包的文件所在目录）。
+///
+/// 打包时把 small 模型三件套随应用分发（用户无需下载即可用 small 档），
+/// 目录位置随打包格式而异（见 cargo-packager-resource-resolver 的约定）：
+/// - Linux deb/pacman: `/usr/lib/<exe名>/`
+/// - AppImage: `$APPDIR/usr/lib/<exe名>/`
+/// - Windows: exe 同目录
+/// - macOS .app: `Contents/Resources`
+///
+/// 返回**存在**的候选目录（可能多个：deb 安装 + AppImage 同时存在时，
+/// 返回所有，调用方按查找顺序命中）。未打包（开发态）时为空。
+fn bundled_resource_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // 1) AppImage：APPDIR 环境变量指向挂载的 AppDir
+    if let Ok(appdir) = std::env::var("APPDIR") {
+        if let Ok(exe_name) = std::env::current_exe().map(|e| e.file_name().unwrap_or_default().to_string_lossy().to_string()) {
+            let p = PathBuf::from(appdir).join("usr").join("lib").join(&exe_name);
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    // 2) Linux deb/pacman 安装：/usr/lib/<exe名>/（current_exe 在 /usr/bin 下）
+    if cfg!(target_os = "linux") {
+        if let Ok(exe_name) = std::env::current_exe().map(|e| e.file_name().unwrap_or_default().to_string_lossy().to_string()) {
+            let p = PathBuf::from("/usr/lib").join(&exe_name);
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    // 3) Windows / 开发态：exe 同目录（打包后资源与 exe 同目录）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if dir.join("pp-ocrv6_small_det.onnx").exists() {
+                out.push(dir.to_path_buf());
+            }
+        }
+    }
+    // 4) macOS .app：exe 在 Contents/MacOS，资源在 Contents/Resources
+    if cfg!(target_os = "macos") {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(macos) = exe.parent() {
+                if let Some(contents) = macos.parent() {
+                    let p = contents.join("Resources");
+                    if p.is_dir() {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 手动切换档位：先校验模型齐全（缺失不允许激活），再写入内存覆盖并复位引擎。
@@ -231,8 +290,8 @@ fn model_names_for_tier(tier: &str) -> [&'static str; 3] {
 /// 档位说明（供窗口展示）
 fn tier_note(tier: &str) -> String {
     match tier {
-        "medium" => "≈132MB：准确率更高，但 CPU 上多行场景慢（~14s）".into(),
-        _ => "≈30MB：CPU 快（代码区 ~0.8s），准确率 ~95%".into(),
+        "medium" => "≈132MB：准确率更高，但 CPU 上多行场景慢（~14s），需联网下载".into(),
+        _ => "≈30MB：CPU 快（代码区 ~0.8s），准确率 ~95%，已随应用内置".into(),
     }
 }
 
@@ -251,10 +310,11 @@ fn locate_tier_files(tier: &str, cache_dir: &Path) -> Vec<ModelFileInfo> {
     names
         .iter()
         .map(|name| {
-            // 查找顺序：显式目录 → 项目 models/PP-OCRv6 → 缓存
+            // 查找顺序：显式目录 → 应用包内置（打包资源）→ 项目 models/PP-OCRv6 → 缓存
             let mut local = None;
             for dir in crate::config::ocr_model_dir()
                 .into_iter()
+                .chain(bundled_resource_dirs())
                 .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
                 .chain(std::iter::once(cache_dir.to_path_buf()))
             {
@@ -296,6 +356,7 @@ pub fn model_snapshot() -> ModelSnapshot {
                 tier: (*tier).to_string(),
                 note: tier_note(tier),
                 selected: *tier == current,
+                bundled: *tier == "small", // small 随应用包内置，无需下载
                 files: locate_tier_files(tier, &cache_dir),
             })
             .collect(),
@@ -316,10 +377,11 @@ fn update_progress(name: &str, downloaded: u64, total: Option<u64>) {
     }
 }
 
-/// 模型文件是否在任意查找目录存在（OCR_MODEL_DIR / 项目 models/PP-OCRv6 / 缓存）。
+/// 模型文件是否在任意查找目录存在（OCR_MODEL_DIR / 应用包内置 / 项目 models/PP-OCRv6 / 缓存）。
 fn file_located(name: &str, cache_dir: &Path) -> bool {
     crate::config::ocr_model_dir()
         .into_iter()
+        .chain(bundled_resource_dirs())
         .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
         .chain(std::iter::once(cache_dir.to_path_buf()))
         .any(|d| d.join(name).exists())
@@ -548,8 +610,9 @@ pub fn start_download_file(tier: &str, name: &str) -> Result<(), String> {
 ///
 /// 查找顺序：
 /// 1. 用户显式指定目录（`OCR_MODEL_DIR` 环境变量或配置 `ocr.model_dir`）；
-/// 2. 项目内 `models/PP-OCRv6`（开发者放置，相对当前工作目录）；
-/// 3. 缓存目录：文件存在则用，否则从 GitHub 自动下载（engine 优先：
+/// 2. 应用包内置资源（cargo-packager `resources` 打包的 small 模型，随应用分发）；
+/// 3. 项目内 `models/PP-OCRv6`（开发者放置，相对当前工作目录）；
+/// 4. 缓存目录：文件存在则用，否则从 GitHub 自动下载（engine 优先：
 ///    先取消后台下载任务，再持锁下载缺失文件）。
 pub fn ensure_models(cache_dir: &Path) -> Result<[PathBuf; 3], String> {
     ensure_models_impl(cache_dir, None)
@@ -564,6 +627,7 @@ fn ensure_models_impl(
     let tier = effective_tier();
     for dir in crate::config::ocr_model_dir()
         .into_iter()
+        .chain(bundled_resource_dirs())
         .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
     {
         let paths = [dir.join(det), dir.join(rec), dir.join(dict)];
@@ -1090,5 +1154,38 @@ pub fn reset_engine() {
         if let Ok(mut guard) = mtx.lock() {
             *guard = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模拟 AppImage 打包环境：APPDIR 指向含 usr/lib/<exe>/ 的临时目录，
+    /// bundled_resource_dirs 应探测到该目录（small 模型随应用内置）。
+    #[test]
+    fn bundled_resource_dirs_finds_appimage_dir() {
+        let td = std::env::temp_dir().join(format!("srs-appimage-test-{}", std::process::id()));
+        let exe_name = std::env::current_exe()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let dir = td.join("usr").join("lib").join(&exe_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 放入 small det 模型文件模拟打包资源
+        std::fs::write(dir.join("pp-ocrv6_small_det.onnx"), b"fake").unwrap();
+        // 防止其他测试并行污染 APPDIR
+        std::env::set_var("APPDIR", &td);
+        let dirs = bundled_resource_dirs();
+        std::env::remove_var("APPDIR");
+        // 断言须在删除临时目录前执行（remove_dir_all 会清掉资源文件）
+        let found = dirs.iter().any(|d| d.join("pp-ocrv6_small_det.onnx").exists());
+        std::fs::remove_dir_all(&td).ok();
+        assert!(
+            found,
+            "bundled_resource_dirs 应探测到 APPDIR 下的资源目录: {dirs:?}"
+        );
     }
 }

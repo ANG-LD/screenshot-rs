@@ -22,6 +22,17 @@ before-packaging-command = "cargo build --release"
 binaries = [{ path = "screenshot-rs", main = true }]
 binaries-dir = "target/release"
 
+# small 档 OCR 模型随应用包内置（用户无需联网下载即可用 small 档）：
+# 三件套放入安装包的资源目录（deb/appimage: /usr/lib/<exe>/，
+# Windows: exe 同目录，macOS: Contents/Resources），运行时在
+# `bundled_resource_dirs()` 中按同一约定查找。medium 档模型较大（~132MB）
+# 不内置，仍由 OCR 模型管理窗口联网下载。
+resources = [
+    { src = "models/paddle/pp-ocrv6_small_det.onnx", target = "pp-ocrv6_small_det.onnx" },
+    { src = "models/paddle/pp-ocrv6_small_rec.onnx", target = "pp-ocrv6_small_rec.onnx" },
+    { src = "models/paddle/ppocrv6_dict.txt", target = "ppocrv6_dict.txt" },
+]
+
 [linux]
 generate-desktop-entry = true
 
