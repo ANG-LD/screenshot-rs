@@ -18,3 +18,8 @@ PP-OCRv6_medium/
 
 # PP-OCRv6 medium ONNX 模型（用户本地放置；推理直接使用，不随应用分发——其他机器首次自动下载）
 models/PP-OCRv6/
+
+# PP-OCRv6 medium ONNX 模型（约 138MB，不随仓库分发——用户/运行时按需下载）
+models/paddle/pp-ocrv6_medium_*.onnx
+# 下载残留（.part 临时文件）
+models/paddle/*.part
