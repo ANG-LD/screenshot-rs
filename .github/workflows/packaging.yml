@@ -54,6 +54,16 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Inject CUDA stub libs for linuxdeploy
+        # linuxdeploy 扫描 libonnxruntime_providers_cuda.so 的 NEEDED 依赖
+        # （libcublas/libcudart 等 CUDA 运行库），构建机无 NVIDIA 找不到会报
+        # "Could not find dependency" 中止。build.rs 生成的 0 字节 stub 注入
+        # 宿主机 /usr/lib/x86_64-linux-gnu/ 后 linuxdeploy 能解析到；配合
+        # packager.toml 的 excluded-libraries 不会部署进 AppImage，运行时由
+        # 客户机 NVIDIA 驱动提供真库。
+        run: |
+          sudo cp target/release/cuda-stubs/* /usr/lib/x86_64-linux-gnu/
+
       - name: Package deb + appimage
         run: cargo packager -c packager.toml -f deb,appimage
 

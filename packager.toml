@@ -35,19 +35,14 @@ binaries-dir = "target/release"
 # 库）glob 无匹配自动跳过。
 # 注意：只打包 cuda + shared（TensorRT 库不打包：需专用推理卡且会让
 # linuxdeploy 扫描额外依赖）；CUDA 运行库（libcublas/libcudart 等）不打包，
-# 由客户机的 NVIDIA 驱动提供（AppImage 构建时用 excluded-libraries 跳过）。
+# 由客户机的 NVIDIA 驱动提供（AppImage 构建见 packaging.yml 的 stub 注入 +
+# 下方 excluded-libraries）。
 resources = [
     { src = "models/paddle/pp-ocrv6_small_det.onnx", target = "pp-ocrv6_small_det.onnx" },
     { src = "models/paddle/pp-ocrv6_small_rec.onnx", target = "pp-ocrv6_small_rec.onnx" },
     { src = "models/paddle/ppocrv6_dict.txt", target = "ppocrv6_dict.txt" },
     "target/release/libonnxruntime_providers_cuda.so",
     "target/release/libonnxruntime_providers_shared.so",
-    # CUDA 运行库 0 字节 stub（build.rs Linux 生成）：让 linuxdeploy 扫描
-    # provider .so 依赖时能找到（构建机无 NVIDIA），不影响运行时（真库由
-    # 客户机驱动提供）。仅 Linux 存在，其他平台 glob 无匹配自动跳过。
-    # 注意：stub 文件名形如 libcublas.so.13（后缀 .so.13），`*.so` 匹配不到，
-    # 必须用 `*` 或 `*.so*`。
-    "target/release/cuda-stubs/*",
     "target/release/onnxruntime_providers_*.dll",
     "target/release/onnxruntime.dll",
 ]
@@ -66,6 +61,18 @@ priority = "optional"
 # 托盘 dlopen 加载 libayatana-appindicator，linuxdeploy 按 ldd 依赖扫描不会自动打包，
 # 需要显式指定，否则 AppImage 里托盘不显示。
 libs = ["libayatana-appindicator3.so.1"]
+# libonnxruntime_providers_cuda.so 依赖 CUDA 运行库（libcublas 等，构建机无
+# NVIDIA 缺失）。CI 先把 build.rs 生成的 0 字节 stub 注入宿主机
+# /usr/lib/x86_64-linux-gnu/（见 packaging.yml），linuxdeploy 解析依赖时找到；
+# 这里排除它们**不部署进 AppImage**——AppImage 里不含 stub，运行时 CUDA 库
+# 由客户机 NVIDIA 驱动提供（有卡 GPU 推理、无卡 CPU）。
+excluded-libraries = [
+    "libcublas.so.13",
+    "libcublasLt.so.13",
+    "libcurand.so.10",
+    "libcudart.so.13",
+    "libcuda.so.1",
+]
 
 [appimage.linuxdeploy-plugins]
 gtk = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"

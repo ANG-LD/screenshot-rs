@@ -15,18 +15,20 @@ fn main() {
     // libonnxruntime_providers_cuda.so，而 dlopen 会参与 DT_RUNPATH 搜索——
     // 不设则安装版找不到 provider 库，有 NVIDIA 显卡也无法用 GPU 推理。
     //
-    // 同时生成 CUDA 运行库的 0 字节 stub 到 target/release/cuda-stubs/：
-    // linuxdeploy 构建 AppImage 时会扫描 provider .so 的 NEEDED 依赖，构建机
-    // 无 NVIDIA 导致 libcublas/libcudart 等缺失而中止（--exclude-library 对
-    // 缺失库无效）；stub 让依赖在资源目录"找到"，AppImage 得以构建。运行时
-    // 这些 stub 不会遮蔽客户机 NVIDIA 驱动提供的真库（AppRun 的
-    // LD_LIBRARY_PATH 只含 usr/lib，不含 usr/lib/screenshot-rs 子目录）。
-    // 0 字节非 ELF，linuxdeploy 部署时只复制不校验，无副作用。
+    // 同时生成 CUDA 运行库的**最小 ELF stub** 到 target/release/cuda-stubs/：
+    // linuxdeploy 构建 AppImage 时扫描 provider .so 的 NEEDED 依赖，构建机无
+    // NVIDIA 导致 libcublas/libcudart 等缺失而中止（--exclude-library 对缺失
+    // 库无效）。CI 把 stub 注入宿主机 /usr/lib/x86_64-linux-gnu/（见
+    // packaging.yml）让依赖解析通过，配合 excluded-libraries 不部署进
+    // AppImage；运行时 CUDA 库由客户机 NVIDIA 驱动提供。stub 必须是合法 ELF
+    // 共享库（0 字节文件 ldd 报 "file too short"），内容为空壳即可。
     #[cfg(target_os = "linux")]
     {
         println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/../lib/screenshot-rs");
         let stub_dir = std::path::Path::new("target/release/cuda-stubs");
         let _ = std::fs::create_dir_all(stub_dir);
+        let src_file = stub_dir.join("_stub.c");
+        let _ = std::fs::write(&src_file, "int ort_cuda_stub_placeholder;\n");
         for name in [
             "libcublas.so.13",
             "libcublasLt.so.13",
@@ -34,10 +36,15 @@ fn main() {
             "libcudart.so.13",
             "libcuda.so.1",
         ] {
-            let p = stub_dir.join(name);
-            if !p.exists() {
-                let _ = std::fs::write(&p, b"");
-            }
+            let out = stub_dir.join(name);
+            let _ = std::process::Command::new("cc")
+                .args(["-shared", "-fPIC", "-x", "c"])
+                .arg(&src_file)
+                .arg("-o")
+                .arg(&out)
+                .arg(format!("-Wl,-soname,{name}"))
+                .status();
         }
+        let _ = std::fs::remove_file(&src_file);
     }
 }
