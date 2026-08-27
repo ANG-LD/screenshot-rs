@@ -27,10 +27,18 @@ binaries-dir = "target/release"
 # Windows: exe 同目录，macOS: Contents/Resources），运行时在
 # `bundled_resource_dirs()` 中按同一约定查找。medium 档模型较大（~132MB）
 # 不内置，仍由 OCR 模型管理窗口联网下载。
+#
+# ONNX Runtime 的 CUDA provider 动态库（libonnxruntime_providers_cuda.so 等，
+# 由 ort-sys 构建时下载并复制到 target/release/）也随包分发——ORT 运行时
+# dlopen 加载它们（二进制 RUNPATH 指向本资源目录，见 build.rs）。无对应文件
+# 的平台（macOS CoreML 无 provider 库）glob 无匹配自动跳过。
 resources = [
     { src = "models/paddle/pp-ocrv6_small_det.onnx", target = "pp-ocrv6_small_det.onnx" },
     { src = "models/paddle/pp-ocrv6_small_rec.onnx", target = "pp-ocrv6_small_rec.onnx" },
     { src = "models/paddle/ppocrv6_dict.txt", target = "ppocrv6_dict.txt" },
+    "target/release/libonnxruntime_providers_*.so",
+    "target/release/onnxruntime_providers_*.dll",
+    "target/release/onnxruntime.dll",
 ]
 
 [linux]
