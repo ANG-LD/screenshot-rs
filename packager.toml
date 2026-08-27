@@ -42,6 +42,12 @@ resources = [
     { src = "models/paddle/ppocrv6_dict.txt", target = "ppocrv6_dict.txt" },
     "target/release/libonnxruntime_providers_cuda.so",
     "target/release/libonnxruntime_providers_shared.so",
+    # CUDA 运行库 0 字节 stub（build.rs Linux 生成）：让 linuxdeploy 扫描
+    # provider .so 依赖时能找到（构建机无 NVIDIA），不影响运行时（真库由
+    # 客户机驱动提供）。仅 Linux 存在，其他平台 glob 无匹配自动跳过。
+    # 注意：stub 文件名形如 libcublas.so.13（后缀 .so.13），`*.so` 匹配不到，
+    # 必须用 `*` 或 `*.so*`。
+    "target/release/cuda-stubs/*",
     "target/release/onnxruntime_providers_*.dll",
     "target/release/onnxruntime.dll",
 ]
@@ -60,16 +66,6 @@ priority = "optional"
 # 托盘 dlopen 加载 libayatana-appindicator，linuxdeploy 按 ldd 依赖扫描不会自动打包，
 # 需要显式指定，否则 AppImage 里托盘不显示。
 libs = ["libayatana-appindicator3.so.1"]
-# libonnxruntime_providers_cuda.so 依赖 CUDA 运行库（驱动提供），linuxdeploy 在
-# 构建机（无 NVIDIA）扫描不到会报 "Could not find dependency" 中止打包；
-# 排除后不打包进 AppImage，运行时由客户机 NVIDIA 驱动提供。
-excluded-libraries = [
-    "libcublas.so.13",
-    "libcublasLt.so.13",
-    "libcurand.so.10",
-    "libcudart.so.13",
-    "libcuda.so.1",
-]
 
 [appimage.linuxdeploy-plugins]
 gtk = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"
