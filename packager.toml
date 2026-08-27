@@ -28,15 +28,20 @@ binaries-dir = "target/release"
 # `bundled_resource_dirs()` 中按同一约定查找。medium 档模型较大（~132MB）
 # 不内置，仍由 OCR 模型管理窗口联网下载。
 #
-# ONNX Runtime 的 CUDA provider 动态库（libonnxruntime_providers_cuda.so 等，
-# 由 ort-sys 构建时下载并复制到 target/release/）也随包分发——ORT 运行时
-# dlopen 加载它们（二进制 RUNPATH 指向本资源目录，见 build.rs）。无对应文件
-# 的平台（macOS CoreML 无 provider 库）glob 无匹配自动跳过。
+# ONNX Runtime 的 CUDA provider 动态库（libonnxruntime_providers_cuda.so +
+# libonnxruntime_providers_shared.so，由 ort-sys 构建时下载并复制到
+# target/release/）随包分发——ORT 运行时 dlopen 加载它们（二进制 RUNPATH
+# 指向本资源目录，见 build.rs）。无对应文件的平台（macOS CoreML 无 provider
+# 库）glob 无匹配自动跳过。
+# 注意：只打包 cuda + shared（TensorRT 库不打包：需专用推理卡且会让
+# linuxdeploy 扫描额外依赖）；CUDA 运行库（libcublas/libcudart 等）不打包，
+# 由客户机的 NVIDIA 驱动提供（AppImage 构建时用 excluded-libraries 跳过）。
 resources = [
     { src = "models/paddle/pp-ocrv6_small_det.onnx", target = "pp-ocrv6_small_det.onnx" },
     { src = "models/paddle/pp-ocrv6_small_rec.onnx", target = "pp-ocrv6_small_rec.onnx" },
     { src = "models/paddle/ppocrv6_dict.txt", target = "ppocrv6_dict.txt" },
-    "target/release/libonnxruntime_providers_*.so",
+    "target/release/libonnxruntime_providers_cuda.so",
+    "target/release/libonnxruntime_providers_shared.so",
     "target/release/onnxruntime_providers_*.dll",
     "target/release/onnxruntime.dll",
 ]
@@ -55,6 +60,16 @@ priority = "optional"
 # 托盘 dlopen 加载 libayatana-appindicator，linuxdeploy 按 ldd 依赖扫描不会自动打包，
 # 需要显式指定，否则 AppImage 里托盘不显示。
 libs = ["libayatana-appindicator3.so.1"]
+# libonnxruntime_providers_cuda.so 依赖 CUDA 运行库（驱动提供），linuxdeploy 在
+# 构建机（无 NVIDIA）扫描不到会报 "Could not find dependency" 中止打包；
+# 排除后不打包进 AppImage，运行时由客户机 NVIDIA 驱动提供。
+excluded-libraries = [
+    "libcublas.so.13",
+    "libcublasLt.so.13",
+    "libcurand.so.10",
+    "libcudart.so.13",
+    "libcuda.so.1",
+]
 
 [appimage.linuxdeploy-plugins]
 gtk = "https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh"

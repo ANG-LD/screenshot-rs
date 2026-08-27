@@ -6066,10 +6066,13 @@ impl Render for OcrPinView {
                         .child(gpui::SharedString::from("OCR 识别中…")),
                 ),
             Some(text) => {
-                // 覆盖代码块配色：黑底白字（默认 muted 灰底），文字顶到标题栏下
+                // 覆盖代码块配色：黑底白字（默认 muted 灰底），文字顶到标题栏下。
+                // 同时覆盖代码块默认内边距（p-3 ≈12px）——上下只留 2px，
+                // 否则识别结果与黑底上边缘间隔太大（用户反馈）。
                 let code_style = gpui::StyleRefinement::default()
                     .bg(gpui::rgba(0x000000FF))
-                    .text_color(gpui::rgba(0xFFFFFFFF));
+                    .text_color(gpui::rgba(0xFFFFFFFF))
+                    .py(px(2.0));
                 let tv_style = gpui_component::text::TextViewStyle {
                     code_block: code_style,
                     ..Default::default()
@@ -6089,7 +6092,11 @@ impl Render for OcrPinView {
                     .text_color(gpui::rgba(0xFFFFFFFF))
                     .child(
                         div()
-                            .p(px(10.0))
+                            // 顶部紧凑（文字贴近标题栏下缘），左右下保留滚动留白
+                            .pt(px(2.0))
+                            .pr(px(10.0))
+                            .pb(px(10.0))
+                            .pl(px(10.0))
                             .overflow_y_scrollbar()
                             .child(text_view),
                     )
