@@ -129,13 +129,22 @@ const MOVING_DEBOUNCE: u32 = 4;
 /// 滚动（稀疏页面 maxdiff 偏小，过高的阈值会把真实滚动量也拒掉 → 拼接缺失）。
 const CREDIBLE_DIFF: u8 = 16;
 /// 整帧**未对齐**平均每像素差（同坐标 a vs b）低于此值 → 判「几乎没变」（静止/闪烁，
-/// b≈a），拒绝拼接。这是区分「静止帧被误取周期大偏移重复拼接」（mean 接近 0）与
-/// 「真实滚动」的判据说明：`frames_differ`（行匹配比例）对 vxe-table 自相似行失效，
-/// 改用 `mean_unaligned_diff`。但它也不能只看绝对值——**稀疏/低纹理内容**（如浅色文字
-/// 页面）真实滚动时 unaligned 天然很低（像素变化少），若设一个较高的 unaligned 门槛
-/// 会把它当静止丢掉。因此唯一可靠的「非静止」门槛是：unaligned 低到**几乎没动**才拒。
-/// 真正静止/纯闪烁帧 unaligned ≈ 0~1，真实滚动（哪怕稀疏）至少 ≥ 2。
-const TRULY_STATIC_MIN: u64 = 2;
+/// b≈a），拒绝拼接。这是区分「静止帧被误取偏移重复拼接」与「真实滚动」的判据说明：
+/// `frames_differ`（行匹配比例）对 vxe-table 自相似行失效，改用 `mean_unaligned_diff`。
+///
+/// 阈值经验值：真实滚动（内容下移，同位置像素换成下方内容）unaligned 明显偏高——
+/// 本页面实测 ≥21（iter 69 u=21、iter 78 u=23、iter 136 u=27、其余 26~55）；
+/// 而「滚到底后内容静止」被误判出的小偏移（拼接重复）unaligned 只有 ≤5
+/// （iter 70 u=5、iter 175 u=4、iter 182 u=2、iter 174 u=1）。故阈值定在 12——
+/// 拦下所有近静止假偏移，保留全部真实滚动（≥21），中间留足余量。
+const TRULY_STATIC_MIN: u64 = 12;
+/// 大偏移必须伴随大幅内容变化。周期性内容（表格行/列表）会给「几乎没动」的帧骗出一
+/// 个**整数倍大偏移 s**（> 半视口），而同一位置像素几乎相同（unaligned 很低）——此时
+/// 内容不可能滚了半屏，属于假偏移，拼接会把整条重叠带重复拼入（小块周期性重复）。
+/// 仅当 unaligned 低于此值才拒绝大 s；真实大滚动内容变化大，unaligned 明显偏高，不受影响。
+const LARGE_S_MAX_STATIC_UNALIGNED: u64 = 30;
+/// 判定「大偏移」的行数占比：s 超过半屏即视为大偏移（周期性内容容易在此出现假峰）。
+const LARGE_S_FRACTION: u64 = 2;
 /// 手动模式取首帧前的稳定等待：连续两帧 max_frame_diff ≤ 此值视为屏幕已静止。
 /// 遮罩关闭/进度窗出现的过渡期帧差异大，直接取首帧会让 find_scroll_delta 误报
 /// 大滚动量（空白自相似）→ 重复拼接。
@@ -1139,6 +1148,18 @@ fn try_append_scrolled(
         Some((exact, best_diff)) if best_diff < coarse_diff && best_diff <= 150 => exact,
         _ => s,
     };
+    // 大偏移 + 内容几乎没变 = 周期性假偏移（vxe-table 行整倍数 s≈500）→ 拒绝，
+    // 避免把重叠带重复拼入（小块周期性重复的根因）。真实大滚动内容变化大，
+    // unaligned 高，不触此关。
+    let half = (frame.height as u64 / LARGE_S_FRACTION).max(1);
+    if s as u64 > half && unaligned < LARGE_S_MAX_STATIC_UNALIGNED {
+        tracing::info!(
+            "[scroll-manual] try_append reject_periodic_overshoot s={s} unaligned={unaligned} h={} maxdiff={}",
+            frame.height,
+            max_frame_diff(anchor, frame)
+        );
+        return None;
+    }
     let append_off = (frame.height as usize - s) * frame_w as usize * 4;
     if s < MIN_SCROLL || append_off >= frame.pixels.len() {
         return None;
