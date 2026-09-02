@@ -503,8 +503,9 @@ impl OverlayView {
                 line_width: lw,
             },
             ToolButton::Mosaic => {
-                // 将工具栏线宽档位 (2/4/6/8) 映射为画笔大小 (8/16/24/32)
-                let bs = self.toolbar.line_width * 4.0;
+                // 将工具栏线宽档位映射为画笔大小：画笔越宽单次覆盖越大，
+                // block_size 也随之增大，彻底马赛克遮字（见 mosaic_geom）。
+                let (bs, block_size) = mosaic_geom(self.toolbar.line_width);
                 let half = bs / 2.0;
                 let stamp = (
                     crate::overlay::drawing::Point::new(dp.x - half, dp.y - half),
@@ -512,7 +513,7 @@ impl OverlayView {
                 );
                 DrawCommand::Mosaic {
                     regions: vec![stamp],
-                    block_size: (self.toolbar.line_width * 2.0).max(4.0) as u32,
+                    block_size,
                     color: self.toolbar.current_color,
                 }
             }
@@ -553,19 +554,34 @@ impl OverlayView {
                 points.push(dp);
             }
             DrawCommand::Mosaic { regions, block_size, .. } => {
-                // 画笔模式：仅在距上一个 stamp 足够远时才添加新 stamp（避免重叠过多）
-                let bs = self.toolbar.line_width * 4.0;
-                let spacing = bs * 0.5; // 50% 重叠保证覆盖连续
+                // 画笔模式：沿线段**间隔采样**补 stamp，填满快速拖拽留下的空隙。
+                // 旧实现只在「距上一个 stamp >= spacing」时才在终点加一个，快速拖动时
+                // 两个事件点距离可能远超 spacing，导致马赛克出现断点 → 要反复擦涂。
+                let (bs, _) = mosaic_geom(self.toolbar.line_width);
+                // 50% 重叠保证覆盖连续（配合 apply_mosaic 的全局对齐网格，
+                // 重叠不会交叉涂抹，块边界保持清晰可辨）。
+                let spacing = bs * 0.5;
                 let half = bs / 2.0;
-                let add = match regions.last() {
-                    Some(last) => {
-                        let cx = (last.0.x + last.1.x) / 2.0;
-                        let cy = (last.0.y + last.1.y) / 2.0;
-                        ((dp.x - cx).powi(2) + (dp.y - cy).powi(2)).sqrt() >= spacing
+                if let Some(last) = regions.last() {
+                    let cx = (last.0.x + last.1.x) / 2.0;
+                    let cy = (last.0.y + last.1.y) / 2.0;
+                    let dx = dp.x - cx;
+                    let dy = dp.y - cy;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist >= spacing {
+                        // 从上一个 stamp 到当前点，按 spacing 等分补 stamp，覆盖整段
+                        let steps = (dist / spacing).floor().max(1.0) as usize;
+                        for i in 1..=steps {
+                            let t = i as f32 / steps as f32;
+                            let ix = cx + dx * t;
+                            let iy = cy + dy * t;
+                            regions.push((
+                                crate::overlay::drawing::Point::new(ix - half, iy - half),
+                                crate::overlay::drawing::Point::new(ix + half, iy + half),
+                            ));
+                        }
                     }
-                    None => true,
-                };
-                if add {
+                } else {
                     let stamp = (
                         crate::overlay::drawing::Point::new(dp.x - half, dp.y - half),
                         crate::overlay::drawing::Point::new(dp.x + half, dp.y + half),
@@ -774,7 +790,11 @@ impl OverlayView {
                 // （Bold/字号/颜色），此时不应提交文字——保留输入框
                 // 让用户继续编辑。样式按钮 handler 会更新 toolbar 属性，
                 // Input 组件下次 render 时自然应用新样式。
-                if this.toolbar.popup.is_some() {
+                // 还要带上 toolbar_hovered：点工具栏按钮打开样式弹层时，mousedown
+                // 已先把 toolbar_hovered=true，而 popup 要等弹层打开(on_open_change)
+                // 才置 Some，存在 blur 在前、popup 未定的竞态——若只判 popup，
+                // 「点 Text 按钮开色板改颜色」会误把编辑态提交。
+                if this.toolbar.popup.is_some() || this.toolbar_hovered {
                     return;
                 }
                 // 兜底：其他失焦场景（点输入框外、点工具栏、切工具）
@@ -849,6 +869,9 @@ impl OverlayView {
                 color: self.toolbar.current_color,
                 max_width: Some(max_w),
                 weight: self.toolbar.current_weight,
+                background: self.toolbar.current_bg,
+                box_size: (self.text_input_rect.size.x, self.text_input_rect.size.y),
+                text_inset: crate::overlay::window::TEXT_BOX_INSET,
             });
             // 记录对应 DrawCommand 索引，便于重新编辑时移除。
             self.text_input_cmd_idx = Some(self.drawing.history_index - 1);
@@ -888,12 +911,21 @@ impl OverlayView {
         let can_undo = self.drawing.history_index > 0;
         let can_redo = self.drawing.history_index < self.drawing.commands.len();
 
-        let (toolbar_x, toolbar_y, _toolbar_w, _toolbar_h) =
+        let (toolbar_x, toolbar_y, _toolbar_w, toolbar_h) =
             compute_toolbar_bounds(sel, self.screen_bounds);
+
+        // 弹窗展开方向：工具栏在选区**上方**（截图框被拖到屏幕底部、工具栏翻上去）
+        // 时才考虑向上展开以避开截图框。
+        // 但仅当工具栏距屏幕顶部有足够空间（弹层向上展开不会被 snap 弹回窗口内、
+        // 盖到「完成/取消」等操作按钮）时才向上；否则仍向下展开（弹层在工具栏下方，
+        // 不遮操作按钮，只是可能盖到截图框顶部）。
+        let popover_open_up = (toolbar_y + toolbar_h <= sel.origin.y)
+            && (toolbar_y >= self.screen_bounds.origin.y + POPOVER_UP_MIN_ROOM);
 
         let weak = cx.weak_entity();
         let row = div()
             .flex()
+            .flex_wrap()
             .gap(px(TOOLBAR_GAP))
             .items_center()
             // 1) 绘图工具按钮组：6 个工具按钮，每个都是 Popover trigger
@@ -901,6 +933,7 @@ impl OverlayView {
             .child(render_tool_button_with_popover(
                 ToolButton::Rectangle,
                 active_tool == Some(ToolButton::Rectangle),
+                popover_open_up,
                 weak.clone(),
                 self,
                 cx,
@@ -908,6 +941,7 @@ impl OverlayView {
             .child(render_tool_button_with_popover(
                 ToolButton::Ellipse,
                 active_tool == Some(ToolButton::Ellipse),
+                popover_open_up,
                 weak.clone(),
                 self,
                 cx,
@@ -915,6 +949,7 @@ impl OverlayView {
             .child(render_tool_button_with_popover(
                 ToolButton::Arrow,
                 active_tool == Some(ToolButton::Arrow),
+                popover_open_up,
                 weak.clone(),
                 self,
                 cx,
@@ -922,6 +957,7 @@ impl OverlayView {
             .child(render_tool_button_with_popover(
                 ToolButton::Freehand,
                 active_tool == Some(ToolButton::Freehand),
+                popover_open_up,
                 weak.clone(),
                 self,
                 cx,
@@ -929,6 +965,7 @@ impl OverlayView {
             .child(render_tool_button_with_popover(
                 ToolButton::Text,
                 active_tool == Some(ToolButton::Text),
+                popover_open_up,
                 weak.clone(),
                 self,
                 cx,
@@ -957,6 +994,7 @@ impl OverlayView {
             .child(render_tool_button_with_popover(
                 ToolButton::Mosaic,
                 active_tool == Some(ToolButton::Mosaic),
+                popover_open_up,
                 weak.clone(),
                 self,
                 cx,
@@ -1011,6 +1049,9 @@ impl OverlayView {
             .absolute()
             .top(px(toolbar_y))
             .left(px(toolbar_x))
+            // 限制工具栏最大宽度为「从 toolbar_x 到屏幕右缘」，让按钮在窄截图区内
+            // 自动换行，保证「完成/取消」等右侧按钮始终可见。
+            .max_w(px(self.screen_bounds.origin.x + self.screen_bounds.size.x - toolbar_x))
             .bg(gpui::rgba(0x1E1E1EF5))
             .rounded_lg()
             .border_1()
@@ -1034,6 +1075,9 @@ const TOOLBAR_BTN_SIZE: f32 = 32.0;
 const TOOLBAR_GAP: f32 = 4.0;
 /// 工具栏整体内边距
 const TOOLBAR_PAD: f32 = 6.0;
+/// 弹窗向上展开所需的、距屏幕顶部的**最小**空间（px）。
+/// 小于该空间时向上展开会被 snap 弹回窗口内、盖到工具栏操作按钮，故改向下展开。
+const POPOVER_UP_MIN_ROOM: f32 = 260.0;
 /// 工具栏距离选区上沿的距离（px）
 const TOOLBAR_OFFSET_Y: f32 = 8.0;
 
@@ -1071,6 +1115,25 @@ fn icon_for(btn: ToolButton) -> IconName {
 /// 若估算偏小，root 会让点击穿透到 selection.mouse_down 打散选区，
 /// 触发后会通过按钮 on_click 收到 click —— 设计上我们通过 div + flexbox
 /// 测量真实 bounds 再吞掉冒泡，目前用估算偏宽避免吞掉事件。
+/// 估算工具栏实际渲染宽度（13 个「图标+中文标签」按钮）。
+/// 之前用 `TOOLBAR_BTN_SIZE(32) * 14` 严重低估（实际约 800px），截图框靠右时
+/// 工具栏被屏幕截断、「完成/取消」跑出屏外不可点。按图标(12)+间距(2)+标签
+/// (中文≈13px/字)+compact 内边距(≈16px) 估算，偏宽一点更安全。
+fn toolbar_width_estimate() -> f32 {
+    const LABELS: [&str; 13] = [
+        "矩形", "椭圆", "箭头", "画图", "文字", "OCR", "滚动截屏", "手动滚动", "马赛克",
+        "撤销", "重做", "完成", "取消",
+    ];
+    let buttons: f32 = LABELS
+        .iter()
+        .map(|s| {
+            let label_w = s.chars().count() as f32 * 13.0;
+            label_w + 12.0 + 2.0 + 16.0 // 标签 + 图标 + 间隙 + compact 内边距
+        })
+        .sum();
+    buttons + (LABELS.len() as f32 - 1.0) * TOOLBAR_GAP + TOOLBAR_PAD * 2.0 + 2.0
+}
+
 fn compute_toolbar_bounds(
     sel: ub::Bounds,
     screen_bounds: ub::Bounds,
@@ -1089,7 +1152,7 @@ fn compute_toolbar_bounds(
     } else {
         screen_h - toolbar_h - TOOLBAR_OFFSET_Y
     };
-    let toolbar_w = TOOLBAR_BTN_SIZE * 14.0 + TOOLBAR_GAP * 13.0 + TOOLBAR_PAD * 2.0;
+    let toolbar_w = toolbar_width_estimate();
     let toolbar_x = sel.origin.x.min(screen_bounds.origin.x + screen_bounds.size.x - toolbar_w - TOOLBAR_OFFSET_Y);
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
 }
@@ -1156,6 +1219,7 @@ fn toolbar_btn_style(cx: &App, kind: ToolbarBtnStyle) -> gpui_component::button:
 fn render_tool_button_with_popover(
     btn: ToolButton,
     is_active: bool,
+    popover_open_up: bool,
     weak: gpui::WeakEntity<OverlayView>,
     view: &OverlayView,
     cx: &mut Context<OverlayView>,
@@ -1199,6 +1263,13 @@ fn render_tool_button_with_popover(
 
     let weak_content = weak.clone();
     Popover::new(("tool-popover", btn as usize))
+        // 展开方向随工具栏位置切换：工具栏在选区上方→向上展开，避免
+        // 弹层向下盖住截图框；否则向下展开（默认 TopLeft）。
+        .anchor(if popover_open_up {
+            gpui::Anchor::BottomLeft
+        } else {
+            gpui::Anchor::TopLeft
+        })
         // 向下展开（默认 TopLeft 锚定）。
         // overlay_closable(false)：弹层打开后不因「鼠标还在按钮上/未移入
         // 弹层」的点击外部判定而立即消失——用户报"弹层弹出后鼠标没移动到
@@ -1225,18 +1296,19 @@ fn render_tool_button_with_popover(
             // content 闭包不能捕获 view 借用（要求 'static）。
             // 每次渲染通过 weak 读当前 OverlayView 状态，确保选中态紧跟最新 toolbar。
             let weak = weak_content.clone();
-            let (cur_color, cur_size, cur_weight, cur_lw) = weak
+            let (cur_color, cur_size, cur_weight, cur_bg, cur_lw) = weak
                 .read_with(cx, |this, _| {
                     (
                         this.toolbar.current_color,
                         this.toolbar.current_size,
                         this.toolbar.current_weight,
+                        this.toolbar.current_bg,
                         this.toolbar.line_width,
                     )
                 })
-                .unwrap_or((RGBA::new(0, 0, 0, 255), 24.0, FontWeight::Normal, 4.0));
+                .unwrap_or((RGBA::new(0, 0, 0, 255), 24.0, FontWeight::Normal, RGBA::TRANSPARENT, 4.0));
             match popup_kind {
-                ToolbarPopup::Text => render_text_popover_content(cur_color, cur_size, cur_weight, weak),
+                ToolbarPopup::Text => render_text_popover_content(cur_color, cur_size, cur_weight, cur_bg, weak),
                 ToolbarPopup::Stroke => render_stroke_popover_content(cur_color, cur_lw, weak),
             }
         })
@@ -1434,24 +1506,35 @@ fn render_simple_button(
     b
 }
 
-/// 渲染文字 popover 内容：字号档位 + Bold + 12 色色板
+/// 马赛克画笔几何 → (画笔边长, 像素化块边长)
+///
+/// - 画笔边长：单次涂抹覆盖的宽度。取默认线宽 3 → 12px，配合沿路径补 stamp
+///   保证连续覆盖。
+/// - 像素化块边长：越小像素越细密（"像素多"），马赛克更均匀、覆盖更实。
+///   默认线宽 3 → 4px，进一步加密。
+fn mosaic_geom(lw: f32) -> (f32, u32) {
+    let brush = (lw * 4.0).max(12.0);
+    let block = (lw * 1.5).max(3.0);
+    (brush, block.max(1.0) as u32)
+}
+
+/// 渲染文字 popover 内容：字号档位 + Bold + 文字颜色 + 背景色
 fn render_text_popover_content(
     cur_color: RGBA,
     cur_size: f32,
     cur_weight: FontWeight,
+    cur_bg: RGBA,
     weak: gpui::WeakEntity<OverlayView>,
 ) -> gpui::Div {
     use crate::overlay::toolbar::FONT_SIZES;
 
     let mut col = div().flex().flex_col().gap(px(6.0)).p(px(6.0)).min_w(px(220.0));
 
-    // 第一行：Bold + 字号档位
-    let mut top = div().flex().gap(px(4.0)).items_center();
+    // 第一行：Bold + 字号档位（自动换行，容纳更多字号）
+    let mut top = div().flex().flex_wrap().gap(px(4.0)).items_center();
     let weak_bold = weak.clone();
     let bold_btn = Button::new("font-bold")
-        .icon(IconName::CaseSensitive)
-        .label("B")
-        .tooltip("加粗")
+        .label("加粗")
         .compact()
         .selected(cur_weight == FontWeight::Bold)
         .on_click(move |_, _, cx| {
@@ -1483,10 +1566,132 @@ fn render_text_popover_content(
     }
     col = col.child(top);
 
-    // 第二行：颜色色板
-    col = col.child(render_color_swatch_row(cur_color, weak));
+    // 第二行：文字颜色（加「字体」标签，区分于背景色）
+    col = col.child(render_labeled_swatch_row("字体", cur_color, render_color_swatch_row, weak.clone()));
+
+    // 第三行：选框/高亮背景色（加「背景」标签，含「无背景」透明选项）
+    col = col.child(render_labeled_swatch_row("背景", cur_bg, render_bg_swatch_row, weak));
     col
 }
+
+/// 带名称标签的颜色行：label（「字体」/「背景」）+ 一套色板。
+///
+/// `swatch_fn` 决定该行单击时修改的是字体色还是背景色。
+/// 标签不设 text_color，继承 popover 的主题前景色（与白色弹层背景形成对比）。
+fn render_labeled_swatch_row(
+    label: &str,
+    cur: RGBA,
+    swatch_fn: fn(RGBA, gpui::WeakEntity<OverlayView>) -> gpui::Div,
+    weak: gpui::WeakEntity<OverlayView>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(
+            div().text_size(px(13.0)).font_weight(gpui::FontWeight::SEMIBOLD).child(gpui::SharedString::from(label)),
+        )
+        .child(swatch_fn(cur, weak))
+}
+
+/// 渲染「选框/高亮背景色」色板：一个「无背景」框 + 12 色。点选即设置当前文字背景色，
+/// 并应用到已选中命令的 `background`（支持后续再次改色）。
+fn render_bg_swatch_row(cur_bg: RGBA, weak: gpui::WeakEntity<OverlayView>) -> gpui::Div {
+    let swatch = palette::default_palette();
+    let mut row = div().flex().gap(px(4.0)).items_center().flex_wrap();
+
+    // 「无背景」选项：透明（用浅灰棋盘格表示，避免和纯白混成「两个白色」）
+    let weak_none = weak.clone();
+    let is_none = cur_bg.a == 0;
+    let none_box = div()
+        .id("bg-none")
+        .size(px(22.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(if is_none {
+            gpui::rgba(0xFF1890FF)
+        } else {
+            gpui::rgba(0xFFAAAAAA)
+        })
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        // 棋盘格（transparent 标记）：4×4 浅灰/白交替小格
+        .child({
+            let mut board = div().absolute().inset(px(0.0)).flex_wrap();
+            let mut idx = 0_u32;
+            for _ in 0..4 {
+                for _ in 0..4 {
+                    let cell_color = if idx % 2 == 0 {
+                        gpui::rgba(0xFFDDDDDD)
+                    } else {
+                        gpui::rgba(0xFFFFFFFF)
+                    };
+                    board = board.child(
+                        div().size(px(5.5)).bg(cell_color),
+                    );
+                    idx += 1;
+                }
+            }
+            board
+        })
+        // 「无」标签（深色，棋盘格上可读；作为后绘制子元素叠在棋盘格之上）
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(gpui::rgba(0xFF333333))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(gpui::SharedString::from("无")),
+        )
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            let _ = weak_none.update(cx, |this, cx| {
+                this.toolbar.current_bg = RGBA::TRANSPARENT;
+                this.apply_style_to_selected(|cmd| match cmd {
+                    DrawCommand::Text { background, .. } => *background = RGBA::TRANSPARENT,
+                    _ => {}
+                });
+                cx.notify();
+            });
+        });
+
+    for (i, &c) in swatch.iter().enumerate() {
+        let bg = gpui::rgba(rgba_u32(c));
+        let weak_c = weak.clone();
+        let is_current = c == cur_bg;
+        // 淡灰细边框区分白色/透明；选中蓝色高亮
+        let border_color = if is_current {
+            gpui::rgba(0xFF1890FF)
+        } else {
+            gpui::rgba(0xFFAAAAAA)
+        };
+        row = row.child(
+            div()
+                .id(("bg-swatch", i))
+                .size(px(22.0))
+                .rounded(px(4.0))
+                .bg(bg)
+                .border_1()
+                .border_color(border_color)
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let _ = weak_c.update(cx, |this, cx| {
+                        this.toolbar.current_bg = c;
+                        this.apply_style_to_selected(|cmd| match cmd {
+                            DrawCommand::Text { background, .. } => *background = c,
+                            _ => {}
+                        });
+                        cx.notify();
+                    });
+                }),
+        );
+    }
+    // 「无」框移到色板末尾（用户要求：文字色块「无」放到最后）
+    row = row.child(none_box);
+    row
+}
+
 
 /// 渲染画图类 popover 内容：粗细档位 + 12 色色板
 fn render_stroke_popover_content(
@@ -1541,10 +1746,11 @@ fn render_color_swatch_row(cur_color: RGBA, weak: gpui::WeakEntity<OverlayView>)
         let bg = gpui::rgba(rgba_u32(c));
         let weak_c = weak.clone();
         let is_current = c == cur_color;
+        // 淡灰细边框：区分白色/无色块；选中用蓝色高亮描边
         let border_color = if is_current {
-            gpui::rgba(0xFFFFFFFF)
+            gpui::rgba(0xFF1890FF)
         } else {
-            gpui::rgba(0xFFFFFF33)
+            gpui::rgba(0xFFAAAAAA)
         };
         row = row.child(
             div()
@@ -1552,7 +1758,7 @@ fn render_color_swatch_row(cur_color: RGBA, weak: gpui::WeakEntity<OverlayView>)
                 .size(px(22.0))
                 .rounded(px(4.0))
                 .bg(bg)
-                .border_2()
+                .border_1()
                 .border_color(border_color)
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
@@ -1906,6 +2112,14 @@ fn any_shape_stroke_hit(drawing: &DrawingState, p: BoundsPoint) -> bool {
 const TO_X: f32 = 8.0;
 const TO_Y: f32 = 8.0;
 
+/// 文本框「文字插入点距框左」的水平缩进逻辑像素 = box 左内边距(10) + Input 内边距(约8)。
+/// 编辑态文本由 Input 按此缩进绘制；成图(rasterize_text)需用同一值偏移，否则文字会贴到框左。
+const TEXT_BOX_INSET: f32 = 18.0;
+/// Text 输入框内 Input 自己的水平内边距（gpui-component custom size 的 input_px）。
+const TEXT_INPUT_PAD: f32 = 8.0;
+/// 文本框左内边距（box div pl）：TEXT_BOX_INSET - TEXT_INPUT_PAD。
+const TEXT_BOX_LPAD: f32 = TEXT_BOX_INSET - TEXT_INPUT_PAD;
+
 /// 检测点击是否落在已固化的 Text 命令区域内（用于"点击重新编辑"）
 ///
 /// anchor 是外层 box 原点，文字实际渲染位置偏移 (TO_X, TO_Y)。
@@ -2103,7 +2317,7 @@ fn scale_draw_command(cmd: &DrawCommand, sx: f32, sy: f32) -> DrawCommand {
             color: *color,
             line_width: *line_width * sx,
         },
-        DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+        DrawCommand::Text { anchor, content, font_size, color, max_width, weight, background, box_size, text_inset } => {
             DrawCommand::Text {
                 anchor: sp(anchor),
                 content: content.clone(),
@@ -2111,6 +2325,9 @@ fn scale_draw_command(cmd: &DrawCommand, sx: f32, sy: f32) -> DrawCommand {
                 color: *color,
                 max_width: max_width.map(|w| w * sx),
                 weight: *weight,
+                background: *background,
+                box_size: (box_size.0 * sx, box_size.1 * sy),
+                text_inset: *text_inset * sx,
             }
         }
         DrawCommand::Mosaic { regions, block_size, color } => DrawCommand::Mosaic {
@@ -2485,7 +2702,7 @@ fn paint_raster(window: &mut Window, image: &Arc<RenderImage>, bounds: ub::Bound
 }
 
 /// 把一个 DrawCommand 渲染到 window 上（Phase 3 preview，Phase 4 也会复用）
-fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_factor: f32) {
+fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_factor: f32, draw_glyphs: bool) {
     match cmd {
         DrawCommand::Rectangle { rect, color, line_width } => {
             let a = rect.0;
@@ -2510,7 +2727,7 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 paint_thick_line(w[0].x, w[0].y, w[1].x, w[1].y, *line_width, *color, window);
             }
         }
-        DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+        DrawCommand::Text { anchor, content, font_size, color, max_width, weight, background, box_size, text_inset } => {
                 let fs = *font_size / scale_factor;
                 // 行盒必须随字号缩放，避免 paint_layer 高度 < asc+descent 时字形被裁剪。
                 let line_height = px(fs * 1.5);
@@ -2519,7 +2736,10 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 // 行盒一致 → 补偿 (input_lh - line_height)/2 = 0，paint 起点 = 编辑态行盒顶。
                 // 用 window.line_height()（24）或 fs×1.4 都会让补偿非零，提交后文字上下漂移。
                 let input_lh = line_height;
-                let origin_fx = anchor.x + TO_X;
+                // 水平起点 = 框左 + text_inset（与编辑态 Input 的 `box pl + input_px` 一致），
+                // 保证提交预览与编辑/成图文字横坐标一致。旧 TO_X=8 仅等于 input_px，未含
+                // box 左内边距，会让提交预览文字比编辑态偏左。
+                let origin_fx = anchor.x + *text_inset;
                 // 编辑态文字行盒顶相对 box 的偏移：6px 顶部占位 spacer + 2px input_py
                 // 内边距 = +8（已用 range_to_bounds 实测，Linux 与 Windows 一致）。
                 // 旧实现 Linux 用 +7（当时编辑态 Input 带 1px 边框）；去掉边框后行盒顶
@@ -2547,6 +2767,49 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 // glyph_index*force_width 重排，文本宽于框时中间出现整段空隙（"文字分开"）。
                 let force_width = max_width.map(px);
 
+                // 背景：铺「实际编辑框」大小的矩形（与编辑态一致），带小圆角，画在字形之下。
+                // 尺寸来自 box_size；为 0（旧命令）时退回文字测量包围盒。
+                if background.a > 0 {
+                    let bg = Hsla::from(rgba(rgba_u32(*background)));
+                    let (bw, bh) = if box_size.0 > 0.0 && box_size.1 > 0.0 {
+                        (box_size.0, box_size.1)
+                    } else {
+                        // 兜底：测量最宽行 advance 与行数
+                        let mut bg_max_w = 0.0_f32;
+                        let mut bg_lines = 0usize;
+                        for lt in content.split('\n') {
+                            if lt.is_empty() {
+                                bg_lines += 1;
+                                continue;
+                            }
+                            let mut run = base_run.clone();
+                            run.len = lt.len();
+                            let shaped = window.text_system().shape_line(
+                                gpui::SharedString::from(lt),
+                                px(fs),
+                                &[run],
+                                None,
+                            );
+                            bg_max_w = bg_max_w.max(shaped.width().as_f32());
+                            bg_lines += 1;
+                        }
+                        (bg_max_w.max(fs * 0.5), bg_lines as f32 * fs * 1.5)
+                    };
+                    // 很小圆角：随字号缩放，但不超过框短边一半
+                    let radius = px((bw.min(bh) * 0.08).max(2.0).min(bw.min(bh) * 0.5));
+                    window.paint_quad(quad(
+                        Bounds {
+                            origin: point(px(anchor.x), px(anchor.y)),
+                            size: Size::new(px(bw), px(bh)),
+                        },
+                        radius,
+                        bg,
+                        px(0.),
+                        gpui::transparent_black(),
+                        Default::default(),
+                    ));
+                }
+
                 for line_text in content.split('\n') {
                     if line_text.is_empty() {
                         origin_y += line_height;
@@ -2561,6 +2824,11 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                         &[run],
                         None,
                     );
+
+                    if !draw_glyphs {
+                        origin_y += line_height;
+                        continue;
+                    }
 
                     let _ = shaped.paint(
                         point(origin_x, origin_y),
@@ -2798,14 +3066,16 @@ impl Render for OverlayView {
                             (adv_px, th_px)
                         }
                     };
-                    // Input 实际内边距：1px border + 8px padding，每侧 9px 共 18px；
-                    // 再留 10px 右缘（RIGHT_MARGIN），使 content = adv + 10 ≥ adv，不触发左滚。
-                    const INSET_X: f32 = 18.0;
-                    const RIGHT_MARGIN: f32 = 10.0;
+                    // 盒子宽度：左右对称留白（文本插入点距框左 = 距框右 = TEXT_BOX_INSET）。
+                    // 同时它显著宽于单字内容（输入视口 ≈ adv + 10），避免编辑器左滚、
+                    // 出现横向滚动条。
+                    // 注意：不能再用大 MIN_W 撑宽。文字/字符少时 adv+2×inset < MIN_W，
+                    // 若框强撑到 MIN_W，文字贴左、右侧空出大段背景 → 左右内边距不一致。
+                    // 改为「框宽 = 文字宽 + 2×inset」，文字在框内左右居中。
                     const MIN_W: f32 = 100.0;
                     const MIN_H: f32 = 40.0;
                     let new_w = if adv_px > 0.0 {
-                        (adv_px / sf + INSET_X + RIGHT_MARGIN).max(MIN_W)
+                        (adv_px / sf + TEXT_BOX_INSET * 2.0).max(TEXT_BOX_INSET * 2.0)
                     } else {
                         MIN_W
                     };
@@ -2842,10 +3112,16 @@ impl Render for OverlayView {
         // 元素层只留透明命中区，避免 div 渲染被裁剪/遮挡导致手柄缺失。
         let text_editing = self.text_input.is_some() && !self.text_input_finalized;
         let text_input_rect = self.text_input_rect;
+        // 编辑态背景：文字正在输入时若选了背景色，把整个编辑框铺上该色（背景=编辑框）。
+        let editing_bg = if text_editing {
+            self.toolbar.current_bg
+        } else {
+            RGBA::TRANSPARENT
+        };
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect, editing_bg),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect, editing_bg), window, cx| {
                 // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
                 // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
                 if hover_shape {
@@ -2945,16 +3221,23 @@ impl Render for OverlayView {
                     // Text（GPUI 文字）/ Mosaic（棋盘模拟）仍走 paint_command。
                     for (i, cmd) in visible_cmds.iter().map(|c| &**c).enumerate() {
                         if skip_canvas_idx == Some(i) {
+                            // 已提交文字由 Input 元素层绘制（glyphs），此处只在 canvas 补
+                            // 铺背景色带，使「选框/高亮背景色」在提交后仍可见。
+                            if let DrawCommand::Text { background, .. } = cmd {
+                                if background.a > 0 {
+                                    paint_command(cmd, window, cx, scale_factor, false);
+                                }
+                            }
                             continue;
                         }
                         if is_shape_command(cmd) {
                             continue;
                         }
-                        paint_command(cmd, window, cx, scale_factor);
+                        paint_command(cmd, window, cx, scale_factor, true);
                     }
                     if let Some(ref ip) = in_progress {
                         if !is_shape_command(ip) {
-                            paint_command(ip, window, cx, scale_factor);
+                            paint_command(ip, window, cx, scale_factor, true);
                         }
                     }
                     // 形状层：已提交形状（缓存）先画，in_progress 那一笔增量叠在其上
@@ -3117,6 +3400,22 @@ impl Render for OverlayView {
                     if text_editing {
                         let tr = text_input_rect;
                         let tx = px(tr.origin.x);
+                        // 编辑态背景：背景色 = 实际编辑框（有移动手柄的整个框），带小圆角。
+                        if editing_bg.a > 0 {
+                            let ebg = Hsla::from(rgba(rgba_u32(editing_bg)));
+                            let ed = tr.size.x.min(tr.size.y).max(1.0) * 0.08;
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(tx, px(tr.origin.y)),
+                                    size: Size::new(px(tr.size.x.max(1.0)), px(tr.size.y.max(1.0))),
+                                },
+                                px(ed.max(2.0)),
+                                ebg,
+                                px(0.),
+                                gpui::transparent_black(),
+                                Default::default(),
+                            ));
+                        }
                         let ty = px(tr.origin.y);
                         let tw = px(tr.size.x.max(1.0));
                         let th = px(tr.size.y.max(1.0));
@@ -3211,6 +3510,8 @@ impl Render for OverlayView {
                         .h(px(lh))
                         .flex()
                         .flex_col()
+                        // 左内边距（TEXT_BOX_LPAD）：与右侧 input_px 对称，使文本在框内居中
+                        .pl(px(TEXT_BOX_LPAD))
                         .child(
                             div()
                                 .w_full()
@@ -3259,6 +3560,8 @@ impl Render for OverlayView {
                         .h(px(lh))
                         .flex()
                         .flex_col()
+                        // 左内边距（TEXT_BOX_LPAD）：与右侧 input_px 对称，使文本在框内居中
+                        .pl(px(TEXT_BOX_LPAD))
                         .child(
                             // 顶部透明占位（6px）：保证 Input 位置与提交态一致。
                             // 边框线与移动由 text-move-top 覆盖层负责（单实线 + 小手拖动）。
@@ -3421,6 +3724,10 @@ impl Render for OverlayView {
                                     this.drawing.remove_visible(idx);
                                 }
                                 this.text_input_finalized = false;
+                                // 恢复编辑态时要把 Text 工具重新选中，否则工具栏
+                                // 按钮的"选中"态丢失（active_tool=None），二次点击
+                                // 文字时不会弹出样式二级面板，而是新建一个空输入。
+                                this.toolbar.active_tool = Some(ToolButton::Text);
                                 if let Some(ref input) = this.text_input {
                                     input.update(cx, |state, cx| {
                                         state.focus(window, cx);
@@ -3454,7 +3761,13 @@ impl Render for OverlayView {
                                 window.prevent_default();
                                 return;
                             }
-                            // 点在输入框外 → 先提交活跃 Text 输入，避免文字丢失
+                            // 点在输入框外 → 先提交活跃 Text 输入，避免文字丢失。
+                            // 但若点击落在弹出样式面板（改色/改字号）或工具栏上，
+                            // 不应提交——否则「点色板改颜色」会把文字退出编辑态，
+                            // 且点击会穿透到命令命中检测误选到其他命令。
+                            if this.toolbar.popup.is_some() || this.toolbar_hovered {
+                                return;
+                            }
                             this.finalize_text_input_if_active(cx);
                         }
                     }
@@ -3472,13 +3785,13 @@ impl Render for OverlayView {
                                 let mut edit = None;
                                 for (idx, cmd) in visible.iter().rev() {
                                     if hit_test_text_cmd(cmd, p) {
-                                        if let DrawCommand::Text { anchor, content, font_size, max_width, weight, color } = cmd {
-                                            edit = Some((*idx, BoundsPoint::new(anchor.x, anchor.y), content.clone(), *font_size, *max_width, *weight, *color));
+                                        if let DrawCommand::Text { anchor, content, font_size, max_width, weight, color, background, box_size, text_inset: _ } = cmd {
+                                            edit = Some((*idx, BoundsPoint::new(anchor.x, anchor.y), content.clone(), *font_size, *max_width, *weight, *color, *background, *box_size));
                                         }
                                         break;
                                     }
                                 }
-                                if let Some((idx, old_anchor, old_content, old_fs, old_mw, old_wt, old_clr)) = edit {
+                                if let Some((idx, old_anchor, old_content, old_fs, old_mw, old_wt, old_clr, old_bg, _old_box)) = edit {
                                     tracing::debug!("mouse_down: HIT text cmd idx={}", idx);
                                     this.drawing.remove_visible(idx);
                                     this.selected_cmd_actual_idx = None;
@@ -3487,6 +3800,7 @@ impl Render for OverlayView {
                                     this.toolbar.current_size = old_fs;
                                     this.toolbar.current_weight = old_wt;
                                     this.toolbar.current_color = old_clr;
+                                    this.toolbar.current_bg = old_bg;
                                     this.open_text_input_with_content(old_anchor, old_content, old_mw, window, cx);
                                     return;
                                 }
@@ -3816,12 +4130,30 @@ impl Render for OverlayView {
             )
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" {
-                    // popover 打开时：Esc 只收起 popover，不结束会话（避免误关）
-                    if this.toolbar.popup.is_some() {
+                    tracing::info!(
+                        "ESC in root on_key_down: mode={:?} active_tool={:?} popup={:?}",
+                        this.mode, this.toolbar.active_tool, this.toolbar.popup
+                    );
+                    // 只有「确实在显示的弹层」（弹层类型与 active_tool 匹配）才只收弹层。
+                    // 若按钮选中但无弹层（popup 与 active_tool 错位 / 弹层已关但 popup 残留，
+                    // 或 active_tool=None），一律放行 → 取消截图窗口，
+                    // 避免"选中了工具却没弹层时 Esc 无效关不掉窗口"。
+                    let popup_showing = matches!(
+                        (this.toolbar.active_tool, this.toolbar.popup),
+                        (Some(ToolButton::Text), Some(ToolbarPopup::Text))
+                            | (Some(ToolButton::Rectangle), Some(ToolbarPopup::Stroke))
+                            | (Some(ToolButton::Ellipse), Some(ToolbarPopup::Stroke))
+                            | (Some(ToolButton::Arrow), Some(ToolbarPopup::Stroke))
+                            | (Some(ToolButton::Freehand), Some(ToolbarPopup::Stroke))
+                            | (Some(ToolButton::Mosaic), Some(ToolbarPopup::Stroke))
+                    );
+                    if popup_showing {
+                        tracing::info!("ESC closes popover only (popup_showing=true)");
                         this.toolbar.popup = None;
                         cx.notify();
                         return;
                     }
+                    tracing::info!("ESC canceling overlay window (popup_showing=false)");
                     this.commit(OverlayResult { selection: None, commands: vec![], no_clipboard: false, pin: None, scroll_region_px: None, scroll_manual: false, frame: None }, window);
                 } else if ev.keystroke.key == "enter" {
                     // Enter 先尝试提交活跃的 Text 输入（如果 Text 工具正在输入）。
@@ -4026,7 +4358,7 @@ impl Render for PinWindowView {
                                           window: &mut Window,
                                           app: &mut App| {
                                         let new_state = !is_on_top;
-                                        #[cfg(target_os = "linux")]
+                                        #[cfg(any(target_os = "linux", target_os = "windows"))]
                                         send_wm_state_above(
                                             window, new_state,
                                         );
@@ -4149,7 +4481,7 @@ impl Render for PinWindowView {
                                         move |_ev: &MouseDownEvent,
                                               window: &mut Window,
                                               _app: &mut App| {
-                                            #[cfg(target_os = "linux")]
+                                            #[cfg(any(target_os = "linux", target_os = "windows"))]
                                             pin_minimize_window(window);
                                         },
                                     ),
@@ -4212,7 +4544,7 @@ impl Render for PinWindowView {
                                         move |_ev: &MouseDownEvent,
                                               window: &mut Window,
                                               _app: &mut App| {
-                                            #[cfg(target_os = "linux")]
+                                            #[cfg(any(target_os = "linux", target_os = "windows"))]
                                             pin_toggle_maximize(window);
                                         },
                                     ),
@@ -4451,6 +4783,52 @@ fn pin_toggle_maximize(window: &mut Window) {
 }
 
 
+// ── Windows 版 置顶 / 最小化 / 最大化（Pin 窗口标题栏按钮）。
+// GPUI 的 WindowKind::Normal + 自绘标题栏不会把这三个按钮接到 Win32，这里显式调用：
+// `window_hwnd` 取窗口令牌；SetWindowPos 置顶、ShowWindow 最小化/最大化。
+#[cfg(target_os = "windows")]
+fn send_wm_state_above(window: &mut Window, add: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    if let Some(h) = window_hwnd(window) {
+        unsafe {
+            SetWindowPos(
+                h,
+                if add { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn pin_minimize_window(window: &mut Window) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
+    if let Some(h) = window_hwnd(window) {
+        unsafe {
+            ShowWindow(h, SW_MINIMIZE);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn pin_toggle_maximize(window: &mut Window) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsZoomed, ShowWindow, SW_MAXIMIZE, SW_RESTORE,
+    };
+    if let Some(h) = window_hwnd(window) {
+        unsafe {
+            let zoomed = IsZoomed(h) != 0;
+            ShowWindow(h, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+        }
+    }
+}
+
 /// 在新线程中启动独立的 GPUI 窗口，展示标注后的截图
 
 /// 主线程 → GPUI 线程的命令
@@ -4542,16 +4920,21 @@ impl OverlayService {
     }
 
     /// 打开自动滚动截屏进度小窗（主线程调用，不阻塞）
+    ///
+    /// `done` 由用户点「完成」置 true：自动模式结束滚动并生成拼接内容到剪贴板；
+    /// `cancel` 置 true 则直接取消、不生成。自动模式引擎每轮自动滚动，故「完成」
+    /// 按钮始终可点（不按 `moving` 门控）。
     pub fn open_scroll_progress(
         &self,
         cancel: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
         region_px: ub::Bounds,
         screen_px: ub::Bounds,
     ) {
         let _ = self.cmd.send(OverlayCommand::ShowProgress {
             cancel,
-            done: Arc::new(AtomicBool::new(false)),
+            done,
             progress,
             moving: Arc::new(AtomicBool::new(false)),
             bottom_has_content: Arc::new(AtomicBool::new(false)),
@@ -4737,10 +5120,12 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                                 view.text = None;
                                                 view.text_state = None;
                                             } else {
-                                                view.text = Some(text.clone());
+                                                // 先由 `&text` 生成 markdown 字符串，再**移动** text 给
+                                                // view.text（原为 clone，避免整份 OCR 文本深拷贝）。
+                                                let md = format!("```text\n{}\n```", text);
+                                                view.text = Some(text);
                                                 // 重建 TextViewState（markdown 解析），支持选中/复制/全选
                                                 view.text_state = Some(cx.new(|cx| {
-                                                    let md = format!("```text\n{}\n```", text);
                                                     gpui_component::text::TextViewState::markdown(&md, cx)
                                                 }));
                                             }
@@ -5133,32 +5518,29 @@ impl Render for ProgressView {
                     )
                 }
             })
-            // 手动模式：内容静止时才显示「完成」按钮（滚动动画中途不可点，
-            // 避免最后一段还没拼进去就结束）。点「完成」时若最近一帧底部还有
-            // 内容，先弹确认——很可能页面还没滚到底，直接结束会拼接缺底。
-            .when(
-                self.manual && !confirming_now && !self.moving.load(Ordering::Relaxed),
-                {
-                    let done = self.done.clone();
-                    let confirming = self.confirming.clone();
-                    let bottom_has_content = self.bottom_has_content.clone();
-                    move |b| {
-                        b.child(
-                            Button::new("scroll-done")
-                                .label("完成")
-                                .compact()
-                                .with_size(gpui_component::Size::Small)
-                                .on_click(move |_, _, _| {
-                                    if bottom_has_content.load(Ordering::Relaxed) {
-                                        confirming.store(true, Ordering::Relaxed);
-                                    } else {
-                                        done.store(true, Ordering::Relaxed);
-                                    }
-                                }),
-                        )
-                    }
-                },
-            )
+            // 完成按钮：**始终显示**（不再随 moving 显隐，避免按钮忽隐忽现、行宽变化
+            // 导致「取消」跟着左右抖动）。内容在动时**置灰禁用**（手动滚动动画未落定
+            // 不可点，避免最后一段还没拼进去就结束）；静止时恢复可点。自动模式因引擎
+            // 每轮自动滚动、`moving` 恒为 false，完成按钮始终可点（随时可停止）。点
+            // 「完成」直接结束（不再弹「底部可能还有内容？」确认）：vxe-table 这类内容
+            // 始终填满视口的表格，`bottom_has_content` 几乎永远为 true，若以它作为确认
+            // 条件，用户明明滚到底了点「完成」还会被追问「继续滚动」。
+            .when(!confirming_now, {
+                let done = self.done.clone();
+                let moving_now = self.moving.load(Ordering::Relaxed);
+                move |b| {
+                    b.child(
+                        Button::new("scroll-done")
+                            .label("完成")
+                            .compact()
+                            .with_size(gpui_component::Size::Small)
+                            .disabled(moving_now)
+                            .on_click(move |_, _, _| {
+                                done.store(true, Ordering::Relaxed);
+                            }),
+                    )
+                }
+            })
             .child({
                 let cancel = self.cancel.clone();
                 Button::new("scroll-cancel")
@@ -5201,8 +5583,8 @@ fn open_progress_window(
     let sx = f32::from(dbounds.size.width) / screen_px.size.x.max(1.0);
     let sy = f32::from(dbounds.size.height) / screen_px.size.y.max(1.0);
 
-    // 手动模式多一个「完成」按钮，窗口加宽
-    let win_w = if manual { 360.0 } else { 280.0 };
+    // 自动/手动模式都显示「完成」+「取消」两个按钮，窗口统一加宽
+    let win_w = 360.0;
     const WIN_H: f32 = 44.0;
     let dw = f32::from(dbounds.size.width);
     let dh = f32::from(dbounds.size.height);
@@ -6096,7 +6478,7 @@ impl Render for OcrPinView {
                             .pt(px(2.0))
                             .pr(px(10.0))
                             .pb(px(10.0))
-                            .pl(px(10.0))
+                            .pl(px(8.0))
                             .overflow_y_scrollbar()
                             .child(text_view),
                     )

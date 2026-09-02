@@ -191,7 +191,7 @@ impl AppState {
         Ok(())
     }
 
-    /// 运行滚动截屏引擎并把拼接好的长图写入剪贴板
+    /// 运行滚动截屏引擎并把拼接好的长图写入剪贴板（取消则不写）
     fn run_scroll_capture(&self, region: &Bounds, screen_bounds: Bounds) -> AppResult<()> {
         let progress = ScrollProgressAdapter(&self.overlay);
         let stitched = crate::scroll::run_scroll_capture(
@@ -200,6 +200,10 @@ impl AppState {
             self.capture.as_ref(),
             &progress,
         )?;
+        let Some(stitched) = stitched else {
+            tracing::info!("滚动截屏已取消，不复制到剪贴板");
+            return Ok(());
+        };
         self.clipboard.write_frame(&stitched)?;
         tracing::info!(
             "滚动截屏完成并复制到剪贴板（{}x{}）",
@@ -209,7 +213,7 @@ impl AppState {
         Ok(())
     }
 
-    /// 运行手动滚动截屏引擎并把拼接好的长图写入剪贴板
+    /// 运行手动滚动截屏引擎并把拼接好的长图写入剪贴板（取消则不写）
     fn run_manual_scroll_capture(&self, region: &Bounds, screen_bounds: Bounds) -> AppResult<()> {
         let progress = ScrollProgressAdapter(&self.overlay);
         let stitched = crate::scroll::run_manual_scroll_capture(
@@ -218,6 +222,10 @@ impl AppState {
             self.capture.as_ref(),
             &progress,
         )?;
+        let Some(stitched) = stitched else {
+            tracing::info!("手动滚动截屏已取消，不复制到剪贴板");
+            return Ok(());
+        };
         self.clipboard.write_frame(&stitched)?;
         tracing::info!(
             "手动滚动截屏完成并复制到剪贴板（{}x{}）",
@@ -237,9 +245,10 @@ impl ScrollProgress for ScrollProgressAdapter<'_> {
         region: &Bounds,
         screen_bounds: &Bounds,
         cancel: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
         progress: Arc<AtomicU32>,
     ) {
-        self.0.open_scroll_progress(cancel, progress, *region, *screen_bounds);
+        self.0.open_scroll_progress(cancel, done, progress, *region, *screen_bounds);
     }
 
     fn show_manual(

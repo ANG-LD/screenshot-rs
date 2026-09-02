@@ -38,6 +38,8 @@ impl RGBA {
     pub const RED: Self = Self::new(255, 0, 0, 255);
     pub const BLACK: Self = Self::new(0, 0, 0, 255);
     pub const WHITE: Self = Self::new(255, 255, 255, 255);
+    /// 全透明（用作文字无背景的默认值）
+    pub const TRANSPARENT: Self = Self::new(0, 0, 0, 0);
 }
 
 /// 单个绘图元素
@@ -76,6 +78,14 @@ pub enum DrawCommand {
         color: RGBA,
         max_width: Option<f32>,
         weight: FontWeight,
+        /// 选框/高亮背景色（alpha=0 表示无背景，只画字）
+        background: RGBA,
+        /// 实际编辑框尺寸（width, height，逻辑像素）：成图/预览的背景框用这个，
+        /// 保证「渲染背景大小 == 编辑框」。
+        box_size: (f32, f32),
+        /// 文字在框内的水平缩进（box 左内边距 + Input 内边距，逻辑像素）。
+        /// 编辑态文本由 Input 按此缩进绘制；成图需用同一偏移，否则文字会贴到框左。
+        text_inset: f32,
     },
     /// 马赛克画笔：沿鼠标轨迹的多个方块，每个方块内像素被 block_size 像素化
     Mosaic {

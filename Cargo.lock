@@ -7029,6 +7029,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "core-graphics 0.24.0",
  "cosmic-text",
  "dirs",
  "embed-resource",

@@ -42,6 +42,9 @@ pub fn rasterize_text(
     max_width: Option<f32>,
     weight: FontWeight,
     rotation: f32,
+    background: RGBA,
+    box_size: (f32, f32),
+    text_inset: f32,
 ) -> AppResult<()> {
     if content.is_empty() || font_size <= 0.0 {
         return Ok(());
@@ -60,26 +63,32 @@ pub fn rasterize_text(
     // 行距必须与编辑态 Input 一致（1.5×字号，实测 range_to_bounds 的 lh = fs×1.5）：
     // 若用 1.4×字号，多行文字最终成图的行距比预览小 0.1×字号×行数，行数越多
     // 文字整体越往上收、与预览偏差越大（单行无差异）。
-    let physical_glyphs: Vec<(f32, f32, cosmic_text::CacheKey)> = with_font_system(|font_system| {
-        let metrics = Metrics::new(font_size, font_size * 1.5);
-        let mut buffer = Buffer::new(font_system, metrics);
-        let attrs = Attrs::new()
-            .family(Family::Name(TEXT_FONT_FAMILY))
-            .weight(weight_attr);
-        buffer.set_text(content, &attrs, Shaping::Advanced, None);
-        buffer.set_size(max_w, None);
-        buffer.shape_until_scroll(font_system, false);
+    let (physical_glyphs, max_line_w): (Vec<(f32, f32, cosmic_text::CacheKey)>, f32) =
+        with_font_system(|font_system| {
+            let metrics = Metrics::new(font_size, font_size * 1.5);
+            let mut buffer = Buffer::new(font_system, metrics);
+            let attrs = Attrs::new()
+                .family(Family::Name(TEXT_FONT_FAMILY))
+                .weight(weight_attr);
+            buffer.set_text(content, &attrs, Shaping::Advanced, None);
+            buffer.set_size(max_w, None);
+            buffer.shape_until_scroll(font_system, false);
 
-        let mut out = Vec::new();
-        for run in buffer.layout_runs() {
-            for glyph in run.glyphs.iter() {
-                // glyph.physical：offset 是 line 起点 (0, line_y)；scale=1
-                let phys = glyph.physical((0.0, run.line_y), 1.0);
-                out.push((phys.x as f32, phys.y as f32, phys.cache_key));
+            let mut out = Vec::new();
+            let mut max_line_w: f32 = 0.0;
+            for run in buffer.layout_runs() {
+                let mut run_max_x: f32 = 0.0;
+                for glyph in run.glyphs.iter() {
+                    // glyph.physical：offset 是 line 起点 (0, line_y)；scale=1
+                    let phys = glyph.physical((0.0, run.line_y), 1.0);
+                    let px = phys.x as f32;
+                    run_max_x = run_max_x.max(px);
+                    out.push((px, phys.y as f32, phys.cache_key));
+                }
+                max_line_w = max_line_w.max(run.line_w.max(run_max_x));
             }
-        }
-        out
-    });
+            (out, max_line_w)
+        });
 
     // 阶段 1.5：旋转中心 = 传入的 pivot（文本框中心），与旋转框保持一致
     let (cx, cy, cos, sin) = if rotation != 0.0 {
@@ -90,24 +99,52 @@ pub fn rasterize_text(
         (0.0, 0.0, 1.0, 0.0)
     };
 
+    // 背景（高亮/选框）：用「实际编辑框尺寸」铺一块带小圆角的整矩形，画在字形之下。
+    // 尺寸来自 box_size（逻辑像素，snapshot 时已换算到物理 px），保证与编辑框一致；
+    // 四角用小半径圆角柔化（不做尖锐方形）。
+    if background.a > 0 {
+        let (bw, bh) = if box_size.0 > 0.0 && box_size.1 > 0.0 {
+            box_size
+        } else {
+            // 兜底：无 box_size（旧命令）时退回字形包围盒
+            let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+            for (_, gy, _) in &physical_glyphs {
+                min_y = min_y.min(*gy);
+                max_y = max_y.max(*gy);
+            }
+            let pad = font_size * 0.22;
+            (max_line_w.max(1.0) + pad * 2.0, (max_y - min_y) + pad * 2.0)
+        };
+        if bw > 0.0 && bh > 0.0 {
+            let radius = (font_size * 0.15).min(bw.min(bh) * 0.5);
+            // 无旋转：直接锚点（编辑框左上角）；有旋转时背景只按未旋转框铺。
+            if rotation == 0.0 {
+                fill_rounded_rect_blend(frame, anchor_x, anchor_y, bw, bh, radius, background)?;
+            }
+        }
+    }
+
     // 阶段 2：rasterize。每个 glyph 单独进入 swash_cache；为避开
     // 同时借用 font_system + swash_cache 两个 RefCell 的问题，
     // swash_cache 闭包内再开一个 with_font_system（不同 thread_local，无重叠）。
+    // 性能：直接用 `get_image(...).as_ref()` 借用缓存里的 mask，**不再 `.cloned()`
+    // 深拷贝整张 SwashImage（其 `data: Vec<u8>` 是每字形一张 alpha 位图）**——
+    // 把 blend 移到闭包内完成。否则每个字形/每帧都要复制一张位图（几十~上百字形）。
     for (gx, gy, cache_key) in physical_glyphs {
-        let mask_opt = with_swash_cache(|swash| {
-            with_font_system(|fs| swash.get_image(fs, cache_key).as_ref().cloned())
-        });
-        let Some(mask) = mask_opt else {
-            continue;
-        };
         let (px, py) = if rotation != 0.0 {
-            let rx = anchor_x + gx - cx;
+            let rx = anchor_x + text_inset + gx - cx;
             let ry = anchor_y + gy - cy;
             (cx + rx * cos - ry * sin, cy + rx * sin + ry * cos)
         } else {
-            (anchor_x + gx, anchor_y + gy)
+            (anchor_x + text_inset + gx, anchor_y + gy)
         };
-        blend_mask_to_frame(frame, &mask, px, py, color);
+        with_swash_cache(|swash| {
+            with_font_system(|fs| {
+                if let Some(mask) = swash.get_image(fs, cache_key).as_ref() {
+                    blend_mask_to_frame(frame, mask, px, py, color);
+                }
+            });
+        });
     }
     Ok(())
 }
@@ -363,10 +400,10 @@ pub fn apply_commands_step(
                     .collect();
                 draw_polyline(frame, &pts, *line_width, *color, step, Cap::Full, Cap::Full)?;
             }
-            DrawCommand::Text { anchor, content, font_size, color, max_width, weight } => {
+            DrawCommand::Text { anchor, content, font_size, color, max_width, weight, background, box_size, text_inset } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
                 // 应用层暂不支持文字旋转，固定 0 度（pivot 传 anchor，旋转分支不生效）
-                rasterize_text(frame, a, a, content, *font_size, *color, *max_width, *weight, 0.0)?;
+                rasterize_text(frame, a, a, content, *font_size, *color, *max_width, *weight, 0.0, *background, *box_size, *text_inset)?;
             }
         }
     }
@@ -988,6 +1025,62 @@ fn fill_rect_blend(
     Ok(())
 }
 
+/// 带圆角的 SourceOver 填充：铺一个上下左右都留 `radius` 圆角的实心矩形。
+///
+/// 判定方式：像素若落在「内缩矩形」内，或无圆角中央区；
+/// 否则看是否落在 4 个角圆心（半径 radius）的圆内。圆角很小（≈0.15×字号）。
+fn fill_rounded_rect_blend(
+    frame: &mut CapturedFrame,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    color: RGBA,
+) -> AppResult<()> {
+    if w <= 0.0 || h <= 0.0 || radius <= 0.0 {
+        return fill_rect_blend(frame, x, y, w, h, color);
+    }
+    let x_start = x.max(0.0).ceil() as i32;
+    let y_start = y.max(0.0).ceil() as i32;
+    let x_end = (x + w).ceil() as i32;
+    let y_end = (y + h).ceil() as i32;
+    let r = radius.max(1.0);
+    let (wx, wy) = (x as f32, y as f32);
+    let x0 = wx + r;
+    let x1 = wx + w - r;
+    let y0 = wy + r;
+    let y1 = wy + h - r;
+    let w_px = frame.width as i32;
+    let h_px = frame.height as i32;
+    let r2 = r * r;
+    for py in y_start..y_end {
+        if py < 0 || py >= h_px {
+            continue;
+        }
+        let fpy = py as f32 + 0.5;
+        for px in x_start..x_end {
+            if px < 0 || px >= w_px {
+                continue;
+            }
+            let fpx = px as f32 + 0.5;
+            // SDF：到内缩矩形 [x0,x1]×[y0,y1] 的距离；<=r 即落在圆角矩形内。
+            // 边缘带（非角落）dx/dy 有一项为 0，dist 即到内缩边的距离，同样 <=r。
+            let dx = if fpx < x0 { x0 - fpx } else if fpx > x1 { fpx - x1 } else { 0.0 };
+            let dy = if fpy < y0 { y0 - fpy } else if fpy > y1 { fpy - y1 } else { 0.0 };
+            if dx * dx + dy * dy > r2 {
+                continue;
+            }
+            let idx = ((py * w_px + px) as usize) * 4;
+            if idx + 3 >= frame.pixels.len() {
+                return Err(AppError::Window("fill_rounded_rect_blend 索引越界".into()));
+            }
+            blend_pixel(&mut frame.pixels[idx..idx + 4], color);
+        }
+    }
+    Ok(())
+}
+
 /// SourceOver alpha 合成：dst = src + dst * (1 - src.a)
 fn blend_pixel(dst: &mut [u8], src: RGBA) {
     let sa = src.a as u32;
@@ -1028,12 +1121,17 @@ fn apply_mosaic(
     let small_w = (rw / bs).max(1);
     let small_h = (rh / bs).max(1);
 
+    // 全局对齐的块网格：所有 stamp 共用同一套 bs 网格（原点对齐到 bs 的整数倍）。
+    // 这样重叠的 stamp 不会各自用不同相位取样造成交叉涂抹——块边界清晰、马赛克块可辨。
+    let gx0 = rx.div_euclid(bs) * bs;
+    let gy0 = ry.div_euclid(bs) * bs;
+
     // 1) 提取原区域像素到 small buffer
     let mut small = vec![0u8; (small_w * small_h * 4) as usize];
     for sy in 0..small_h {
         for sx in 0..small_w {
-            let src_x = (rx + sx * bs).clamp(0, w_px - 1);
-            let src_y = (ry + sy * bs).clamp(0, h_px - 1);
+            let src_x = (gx0 + sx * bs).clamp(0, w_px - 1);
+            let src_y = (gy0 + sy * bs).clamp(0, h_px - 1);
             let src_idx = ((src_y * w_px + src_x) as usize) * 4;
             let dst_idx = ((sy * small_w + sx) as usize) * 4;
             small[dst_idx..dst_idx + 4].copy_from_slice(&frame.pixels[src_idx..src_idx + 4]);
@@ -1045,8 +1143,9 @@ fn apply_mosaic(
         .ok_or_else(|| AppError::Window("mosaic 创建 ImageBuffer 失败".into()))?;
     let img_big = image::imageops::resize(&img_small, rw as u32, rh as u32, FilterType::Nearest);
 
-    // 3) 写回 frame（像素化 + 颜色叠加）
-    let tint = RGBA::new(color.r, color.g, color.b, 0x48);
+    // 3) 写回 frame（像素化 + 颜色叠加）。叠加色用较高 alpha，让马赛克颜色更实、
+    //    不显浅；块边界由全局对齐网格保证清晰可辨。
+    let tint = RGBA::new(color.r, color.g, color.b, 0x60);
     for dy in 0..rh {
         let py = ry + dy;
         if py < 0 || py >= h_px {
@@ -1167,7 +1266,7 @@ mod tests {
         // mosaic with block_size=10 → small buffer 2x2
         // small[1,1] samples src (10, 10) → red；其余采样 (0,0)/(10,0)/(0,10) 都是 0
         // nearest upscale 到 20x20 → (10..20, 10..20) 区域全红
-        // apply_mosaic 叠加灰色 tint（alpha=0x48），红区变暗红，黑区变暗灰
+        // apply_mosaic 叠加灰色 tint（alpha=0x60），红区变暗红，黑区变暗灰
         let idx = (15 * 20 + 15) * 4;
         assert!(
             f.pixels[idx] > 180,
@@ -1309,7 +1408,7 @@ mod tests {
         for (label, content) in [("single", "文字蚊子"), ("double", "文字蚊子\n第二行字")] {
             let mut f = empty_frame(400, 200);
             rasterize_text(
-                &mut f, (0.0, 0.0), (0.0, 0.0), content, 24.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+                &mut f, (0.0, 0.0), (0.0, 0.0), content, 24.0, RGBA::RED, None, FontWeight::Normal, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
             )
             .unwrap();
             let mut min_x = u32::MAX;
@@ -1338,7 +1437,7 @@ mod tests {
         let mut f = empty_frame(50, 30);
         let baseline = f.pixels.clone();
         rasterize_text(
-            &mut f, (0.0, 0.0), (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            &mut f, (0.0, 0.0), (0.0, 0.0), "", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
         )
         .unwrap();
         assert_eq!(f.pixels, baseline, "空 content 不能改 frame");
@@ -1348,7 +1447,7 @@ mod tests {
     fn rasterize_text_out_of_frame_anchor_does_not_panic() {
         let mut f = empty_frame(20, 20);
         rasterize_text(
-            &mut f, (-100.0, -100.0), (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            &mut f, (-100.0, -100.0), (-100.0, -100.0), "test", 16.0, RGBA::RED, None, FontWeight::Normal, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
         )
         .unwrap();
         assert_eq!(f.width, 20);
@@ -1366,7 +1465,7 @@ mod tests {
             32.0,
             RGBA::new(0xFF, 0x00, 0x00, 0xFF),
             None,
-            FontWeight::Normal, 0.0,
+            FontWeight::Normal, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
         )
         .unwrap();
         let non_zero = f.pixels.iter().filter(|&&p| p != 0).count();
@@ -1389,7 +1488,7 @@ mod tests {
             24.0,
             RGBA::RED,
             Some(50.0),
-            FontWeight::Normal, 0.0,
+            FontWeight::Normal, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
         )
         .unwrap();
         // 60 字 / 50px 约每行 5-6 字 → 应至少跑出 3 行
@@ -1404,11 +1503,11 @@ mod tests {
         let mut normal = empty_frame(120, 60);
         let mut bold = empty_frame(120, 60);
         rasterize_text(
-            &mut normal, (10.0, 10.0), (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal, 0.0,
+            &mut normal, (10.0, 10.0), (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Normal, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
         )
         .unwrap();
         rasterize_text(
-            &mut bold, (10.0, 10.0), (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold, 0.0,
+            &mut bold, (10.0, 10.0), (10.0, 10.0), "字", 32.0, RGBA::RED, None, FontWeight::Bold, 0.0, RGBA::TRANSPARENT, (0.0, 0.0), 0.0,
         )
         .unwrap();
         let diff = normal

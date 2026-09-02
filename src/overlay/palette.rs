@@ -7,12 +7,36 @@
 use crate::overlay::drawing::RGBA;
 use crate::utils::color::hsv_to_rgb;
 
-/// 12 色预设（彩虹 12 等分，饱和度 0.85，亮度 0.9）
+/// 纯白打头 + 基础色系 + 彩虹 12 色 + 暗色变体
 ///
-/// 顺序按 hue 0/30/60/.../330 排列：红、橙、黄、黄绿、绿、青、青蓝、蓝、
-/// 蓝紫、紫、品红、玫红
+/// 顺序：白、黑、灰阶（浅/中/深）、12 色彩虹（饱和 0.85、亮度 0.9）、
+/// 暗色变体（暗红、棕、暗绿、暗青、暗蓝、暗紫）。
+/// 白色放首位（最常用/最易选）；补上黑色、灰色、暗色等重要色系，
+/// 否则文字/背景无法选黑字、灰底或深色调。
 pub fn default_palette() -> Vec<RGBA> {
-    hsv_swatch(12, 0.85, 0.9)
+    let mut p = Vec::with_capacity(23);
+    // 最重要基础色：白、黑
+    p.push(RGBA::WHITE);
+    p.push(RGBA::new(0x00, 0x00, 0x00, 0xFF)); // 黑
+    // 灰色阶（三档，浅→中→深）
+    p.push(RGBA::new(0xDC, 0xDC, 0xDC, 0xFF)); // 浅灰
+    p.push(RGBA::new(0x9E, 0x9E, 0x9E, 0xFF)); // 中灰
+    p.push(RGBA::new(0x5A, 0x5A, 0x5A, 0xFF)); // 深灰
+    // 12 色高饱和彩虹
+    p.extend(hsv_swatch(12, 0.85, 0.9));
+    // 暗色变体：暗红、棕、暗绿、暗青、暗蓝、暗紫
+    const DARKS: &[(u8, u8, u8)] = &[
+        (0x8B, 0x00, 0x00), // 暗红
+        (0x8B, 0x45, 0x13), // 棕/暗橙
+        (0x00, 0x64, 0x00), // 暗绿
+        (0x00, 0x6E, 0x6E), // 暗青
+        (0x00, 0x00, 0x8B), // 暗蓝
+        (0x4B, 0x00, 0x82), // 暗紫
+    ];
+    for &(r, g, b) in DARKS {
+        p.push(RGBA::new(r, g, b, 0xFF));
+    }
+    p
 }
 
 /// HSV 环均匀采样：hue 0..360 按 hue_steps 切分，固定 sat/val
@@ -31,16 +55,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_palette_returns_12_colors() {
+    fn default_palette_starts_with_black_gray_and_rainbow() {
         let p = default_palette();
-        assert_eq!(p.len(), 12);
-        // 第 0 个应该是红色（hue=0, sat=0.85, val=0.9）
-        let r = p[0].r;
-        let g = p[0].g;
-        let b = p[0].b;
+        // 第一个是纯白
+        assert_eq!(p[0], RGBA::WHITE);
+        // 第二个是纯黑
+        assert_eq!(p[1], RGBA::new(0x00, 0x00, 0x00, 0xFF));
+        // 第三个应有灰阶成份（浅灰：R=G=B 且接近但不纯白）
+        assert_eq!(p[2].r, p[2].g);
+        assert_eq!(p[2].g, p[2].b);
+        assert!(p[2].r < 0xFF, "gray should not be white");
+        // 彩虹红位于白/黑/灰之后（index=5）
+        let r = p[5].r;
+        let g = p[5].g;
+        let b = p[5].b;
         assert!(r > 200, "red should be bright, got r={r}");
         assert!(g < 100, "red should have low green, got g={g}");
         assert!(b < 100, "red should have low blue, got b={b}");
+        // 总数 = 1 白 + 1 黑 + 3 灰 + 12 彩虹 + 6 暗色
+        assert_eq!(p.len(), 23);
     }
 
     #[test]

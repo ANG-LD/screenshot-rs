@@ -249,12 +249,23 @@ impl PopoverState {
         }
     }
 
-    fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+    fn set_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.open;
         self.open = open;
         if self.open {
             GlobalState::global_mut(cx).register_deferred_popover(&self.focus_handle);
         } else {
             GlobalState::global_mut(cx).unregister_deferred_popover(&self.focus_handle);
+            // 受控 close（.open(false) 属性驱动）不会经过 toggle_open，因此这里
+            // 同样恢复焦点到弹层打开前聚焦的元素，避免焦点残留在已被卸载的
+            // 弹层 focus_handle 上，导致 Esc 等按键无处分发、窗口关不掉。
+            if was_open {
+                if let Some(prev) = self.previous_focus_handle.take() {
+                    if self.focus_handle.contains_focused(window, cx) {
+                        prev.focus(window, cx);
+                    }
+                }
+            }
         }
     }
 
@@ -264,7 +275,7 @@ impl PopoverState {
             // Save the focused element before opening, so we can restore it on close.
             self.previous_focus_handle = window.focused(cx);
         }
-        self.set_open(opening, cx);
+        self.set_open(opening, window, cx);
         if self.open {
             let state = cx.entity();
             let focus_handle = if let Some(tracked_focus_handle) = self.tracked_focus_handle.clone()
@@ -374,7 +385,7 @@ impl RenderOnce for Popover {
             }
             state.on_open_change = self.on_open_change.clone();
             if let Some(force_open) = force_open {
-                state.set_open(force_open, cx);
+                state.set_open(force_open, window, cx);
             }
         });
 
@@ -406,7 +417,7 @@ impl RenderOnce for Popover {
                     state.update(cx, |state, cx| {
                         // We force set open to false to toggle it correctly.
                         // Because if the mouse down out will toggle open first.
-                        state.set_open(open, cx);
+                        state.set_open(open, window, cx);
                         state.toggle_open(window, cx);
                     });
                     cx.notify(parent_view_id);

@@ -9,7 +9,7 @@ use crate::overlay::drawing::{FontWeight, RGBA};
 /// 字号档位（v0.2 工具栏下拉用）
 ///
 /// 单位：物理像素（与 font_size 字段一致，不随 scale_factor 倍乘）
-pub const FONT_SIZES: &[f32] = &[16.0, 20.0, 24.0, 32.0, 48.0];
+pub const FONT_SIZES: &[f32] = &[14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 40.0, 48.0, 56.0, 64.0];
 
 /// 画笔/边框粗细档位（px）
 ///
@@ -144,6 +144,8 @@ pub struct ToolbarState {
     ///
     /// 绘制文本标注时的粗细，Normal/Bold 切换由 Bold 按钮触发。
     pub current_weight: FontWeight,
+    /// 文字选框/高亮背景色（alpha=0 表示无背景）。Text 工具二级面板可改。
+    pub current_bg: RGBA,
     /// 当前展开的二级面板（None = 收起）
     pub popup: Option<ToolbarPopup>,
 }
@@ -153,9 +155,10 @@ impl Default for ToolbarState {
         Self {
             active_tool: None,
             current_color: RGBA::RED,
-            line_width: 1.0,
+            line_width: 3.0,
             current_size: 24.0,
             current_weight: FontWeight::Normal,
+            current_bg: RGBA::TRANSPARENT,
             popup: None,
         }
     }
@@ -170,7 +173,8 @@ mod tests {
         let s = ToolbarState::default();
         assert_eq!(s.current_size, 24.0);
         assert_eq!(s.current_weight, FontWeight::Normal);
-        assert_eq!(s.line_width, 1.0);
+        assert_eq!(s.line_width, 3.0);
+        assert_eq!(s.current_bg, RGBA::TRANSPARENT);
     }
 
     #[test]
@@ -183,6 +187,9 @@ mod tests {
     fn font_sizes_constant_includes_recommended_values() {
         assert!(FONT_SIZES.contains(&16.0));
         assert!(FONT_SIZES.contains(&48.0));
-        assert_eq!(FONT_SIZES.len(), 5);
+        // 含新增的小/大档位；用范围验证而非精确长度，便于后续调整档位
+        assert!(FONT_SIZES.len() >= 8);
+        assert!(FONT_SIZES.contains(&14.0));
+        assert!(FONT_SIZES.contains(&64.0));
     }
 }

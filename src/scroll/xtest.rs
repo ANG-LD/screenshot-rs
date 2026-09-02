@@ -29,6 +29,8 @@ mod imp {
     pub struct XtestInjector {
         conn: XCBConnection,
         root: xproto::Window,
+        /// `_NET_ACTIVE_WINDOW` atom（预取，避免每轮 intern_atom 往返）
+        net_active_atom: xproto::Atom,
     }
 
     impl XtestInjector {
@@ -49,10 +51,22 @@ mod imp {
             // 声明使用 XTEST 的意图，部分 server/WM 对此有不同的事件可信度策略
             let _ = conn.xtest_grab_control(true);
             conn.flush().ok();
-            Ok(Self { conn, root })
+            // 预取 `_NET_ACTIVE_WINDOW` atom：窗口激活要用，避免每轮查一次
+            let net_active_atom = conn
+                .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.atom)
+                .unwrap_or(x11rb::NONE);
+            Ok(Self { conn, root, net_active_atom })
         }
 
-        /// 把指针移到屏幕绝对坐标 (abs_x, abs_y)（滚轮事件投递给指针下窗口）
+        /// 把指针移到屏幕绝对坐标 (abs_x, abs_y)（滚轮事件投递给指针下窗口）。
+        ///
+        /// 用单次 `warp_pointer` 绝对跳变即可（实测：一次 warp + 激活目标窗口 +
+        /// 合成滚轮就能让 Chromium 滚动，无需平滑走位）。真正让合成滚轮生效的是
+        /// ——目标窗口必须是对应 WM 的**活动窗口**（见 `focus_under_pointer`），
+        /// 否则 Chromium/Electron 会丢弃投给「非活动窗口」的合成滚轮。
         pub fn warp_to(&self, abs_x: i16, abs_y: i16) {
             if let Err(e) = self.conn.warp_pointer(
                 x11rb::NONE,
@@ -72,10 +86,14 @@ mod imp {
             self.sync();
         }
 
-        /// 把 X 输入焦点设到指针下方的窗口。
+        /// 把 X 输入焦点设到指针下方的顶层窗口。
         ///
-        /// Chromium/Electron 会忽略投给「未聚焦/被遮挡窗口」的合成滚轮事件；
-        /// 滚动前先把焦点给目标窗口，它们才会响应 XTEST 注入。
+        /// Chromium/Electron 会忽略投给「未聚焦/被遮挡窗口」的合成滚轮事件。但仅靠
+        /// X 层的 `set_input_focus` 在很多 EWMH/WM（GNOME/KDE）下**不会**把窗口标示为
+        /// 「活动窗口」（WM 看的是 `_NET_ACTIVE_WINDOW`），Chrome 仍以为自己在后台而
+        /// 丢弃合成滚轮——这是自动滚动「只拼一页、relocate 全部 differ=false」的另一
+        /// 主因。因此先发送 `_NET_ACTIVE_WINDOW` 客户端消息到 WM（等价于 xdotool
+        /// `windowactivate`），再补一个 X 层焦点，确保窗口真正获得输入。
         pub fn focus_under_pointer(&self) {
             let Ok(cookie) = self.conn.query_pointer(self.root) else {
                 return;
@@ -86,15 +104,77 @@ mod imp {
             if reply.child == x11rb::NONE {
                 return;
             }
-            if let Err(e) = self.conn.set_input_focus(
-                xproto::InputFocus::POINTER_ROOT,
-                reply.child,
-                x11rb::CURRENT_TIME,
-            ) {
-                tracing::warn!("[scroll] set_input_focus failed: {e}");
+            let top = self.toplevel_of(reply.child);
+            // 每次注入前都强制发 `_NET_ACTIVE_WINDOW` 把目标窗口激活为 WM 的活动窗口：
+            //
+            // 不要用「已经是活动窗口就跳过」的优化。实测自动滚动起步时（热键按下、
+            // overlay 关闭后）mutter 往往**仍把 Chrome 标为活动窗口**，若此处提前
+            // return 跳过了 `_NET_ACTIVE_WINDOW`，就只剩 `set_input_focus`——而
+            // `set_input_focus` 单独**不能**让 Chromium 接受合成滚轮（只有 EWMH
+            // 激活才行），滚轮照旧被丢弃。所以每次滚动前都要显式 EWMH 激活。
+            self.activate_window(top);
+        }
+
+        /// 从窗口向上走到顶层（父为 root 或 NONE）。
+        fn toplevel_of(&self, child: xproto::Window) -> xproto::Window {
+            let mut win = child;
+            loop {
+                let Ok(cookie) = self.conn.query_tree(win) else {
+                    return win;
+                };
+                let Ok(reply) = cookie.reply() else {
+                    return win;
+                };
+                if reply.parent == self.root || reply.parent == x11rb::NONE {
+                    return win;
+                }
+                win = reply.parent;
             }
+        }
+
+        /// 发送 `_NET_ACTIVE_WINDOW` 客户端消息给 WM，把顶层窗口激活为活动窗口。
+        fn activate_window(&self, win: xproto::Window) {
+            let atom = self.net_active_atom;
+            if atom == x11rb::NONE {
+                // 拿不到 atom（异常环境）：退化为直接的 X 层焦点
+                let _ = self.conn.set_input_focus(
+                    xproto::InputFocus::NONE,
+                    win,
+                    x11rb::CURRENT_TIME,
+                );
+                self.conn.flush().ok();
+                self.sync();
+                return;
+            }
+            let event = xproto::ClientMessageEvent {
+                response_type: xproto::CLIENT_MESSAGE_EVENT,
+                format: 32,
+                sequence: 0,
+                // IMPORTANT: `window` 字段 = 要激活的**目标窗口**（Chrome）。
+                // 消息发送**到 root**（send_event 的 destination），但 event.window
+                // 必须是目标窗口——这点和 xdotool `windowactivate`（xdo_activate_window）
+                // 完全一致：`xev.xclient.window = wid`。之前写成 self.root 会让 WM
+                // 「去激活 root」，Chrome 从未成为活动窗口，合成滚轮被丢弃。
+                window: win,
+                type_: atom,
+                // data[0]=2 (source: pager/app)，data[1]=0 (CurrentTime)，其余 0
+                data: xproto::ClientMessageData::from([2, 0, 0, 0, 0]),
+            };
+            let _ = self.conn.send_event(
+                false,
+                self.root,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT
+                    | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            );
             self.conn.flush().ok();
-            // 等待 server 完成焦点转移，Chromium 需要确认焦点后才接受合成滚轮
+            // 再补一个直接的 X 层焦点（部分去 WM 的环境仍需要）
+            let _ = self.conn.set_input_focus(
+                xproto::InputFocus::NONE,
+                win,
+                x11rb::CURRENT_TIME,
+            );
+            self.conn.flush().ok();
             self.sync();
         }
 
@@ -187,10 +267,19 @@ mod imp {
         /// 投递到错误窗口。event type 使用 xproto 命名常量而非裸数字。
         /// 每次注入后做 XSync 往返确保 server 已完成事件递送，再等 TICK_DELAY。
         pub fn scroll_down(&self, ticks: u8) {
+            self.scroll_button(5, ticks);
+        }
+
+        /// 每 tick = ButtonPress + ButtonRelease for button 4（滚轮上）
+        pub fn scroll_up(&self, ticks: u8) {
+            self.scroll_button(4, ticks);
+        }
+
+        fn scroll_button(&self, button: u8, ticks: u8) {
             for _ in 0..ticks {
                 let press = self.conn.xtest_fake_input(
                     xproto::BUTTON_PRESS_EVENT,
-                    5, // button 5 = scroll down
+                    button,
                     0,
                     self.root,
                     0,
@@ -199,7 +288,7 @@ mod imp {
                 );
                 let release = self.conn.xtest_fake_input(
                     xproto::BUTTON_RELEASE_EVENT,
-                    5,
+                    button,
                     0,
                     self.root,
                     0,
@@ -333,9 +422,18 @@ mod imp {
         /// 在当前指针位置向下滚动：连续注入 `ticks` 个滚轮格。
         /// 每格 = MOUSEEVENTF_WHEEL 事件、dwData = -WHEEL_DELTA（向下）。
         pub fn scroll_down(&self, ticks: u8) {
+            self.scroll_wheel(-WHEEL_DELTA, ticks);
+        }
+
+        /// 在当前指针位置向上滚动：每格 = +WHEEL_DELTA（向上）
+        pub fn scroll_up(&self, ticks: u8) {
+            self.scroll_wheel(WHEEL_DELTA, ticks);
+        }
+
+        fn scroll_wheel(&self, delta: i32, ticks: u8) {
             for _ in 0..ticks {
                 unsafe {
-                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -WHEEL_DELTA, 0);
+                    mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
                 }
                 std::thread::sleep(TICK_DELAY);
             }
@@ -346,22 +444,142 @@ mod imp {
 #[cfg(target_os = "windows")]
 pub use imp::XtestInjector;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::time::Duration;
+
+    use core_graphics::display::CGDisplay;
+    use core_graphics::event::{CGEvent, CGEventTapLocation, ScrollEventUnit};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
+
+    use crate::error::AppResult;
+
+    const TICK_DELAY: Duration = Duration::from_millis(80);
+    const WARP_SETTLE: Duration = Duration::from_millis(16);
+    /// 每个滚轮 tick 的滚动量（kCGScrollEventUnitLine：3 行 ≈ 一次滚轮刻度，与 Linux/
+    /// Windows 的"一格"语义对齐）。引擎按实测 delta 校准，此值只影响每次滚动步长、
+    /// 不影响拼接正确性。若在某些 app 下 LINE 不响应，可改用 PIXEL(=0) 且加大 delta。
+    const LINES_PER_TICK: i32 = 3;
+
+    /// 主显示器 scale_factor。注入器拿到的坐标是物理像素，而 CGEvent/CGDisplay 用
+    /// 逻辑点（Retina 为 2×），必须换算；取不到时回退 1.0（非 Retina）。
+    fn scale() -> f32 {
+        screenshots::Screen::all()
+            .ok()
+            .and_then(|s| s.into_iter().find(|s| s.display_info.is_primary))
+            .map(|s| s.display_info.scale_factor.max(0.001))
+            .unwrap_or(1.0)
+    }
+
+    /// CoreGraphics 滚轮注入器（macOS）。
+    ///
+    /// 没有 XTest；用 `CGEvent::new_scroll_event` 合成滚轮事件并经 `CGEventPost`
+    /// 投递到当前会话——事件走系统输入队列，滚轮交给指针下窗口，无需手动设焦点
+    /// （与 Windows 用真实输入队列思路一致）。
+    pub struct XtestInjector;
+
+    impl XtestInjector {
+        /// 无需连接，直接可用。
+        pub fn open() -> AppResult<Self> {
+            Ok(Self)
+        }
+
+        /// 把指针移到屏幕绝对坐标（滚轮事件投递给该位置下窗口）。物理像素→逻辑点。
+        pub fn warp_to(&self, abs_x: i16, abs_y: i16) {
+            let s = scale() as f64;
+            let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(
+                abs_x as f64 / s,
+                abs_y as f64 / s,
+            ));
+            std::thread::sleep(WARP_SETTLE);
+        }
+
+        /// 合成滚轮走系统输入队列，投递给指针下窗口，无需手动设焦点。
+        pub fn focus_under_pointer(&self) {}
+
+        /// 当前指针到 (x, y) 的欧氏距离（物理像素）。查询失败返回 0.0。
+        pub fn pointer_distance_from(&self, x: i16, y: i16) -> f64 {
+            let Ok(src) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+                return 0.0;
+            };
+            let Ok(ev) = CGEvent::new(src) else {
+                return 0.0;
+            };
+            let s = scale() as f64;
+            let loc = ev.location();
+            let dx = loc.x * s - x as f64;
+            let dy = loc.y * s - y as f64;
+            (dx * dx + dy * dy).sqrt()
+        }
+
+        /// 诊断：指针下窗口标题（macOS 需 CGWindowListCopyWindowInfo 较繁琐，此处
+        /// 简化为说明文字；仅供日志诊断，不影响拼接）。
+        pub fn describe_focus(&self) -> String {
+            "macOS：滚轮按指针下窗口投递（无需设焦点）".into()
+        }
+
+        /// 诊断：指针位置（物理像素）。
+        pub fn describe_pointer(&self) -> String {
+            let Ok(src) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+                return "pos=(?,?)".into();
+            };
+            let Ok(ev) = CGEvent::new(src) else {
+                return "pos=(?,?)".into();
+            };
+            let s = scale() as f64;
+            let loc = ev.location();
+            format!("pos=({:.0},{:.0})", loc.x * s, loc.y * s)
+        }
+
+        /// 在当前指针位置向下滚动：连续注入 `ticks` 个滚轮格（每格 3 行）。
+        pub fn scroll_down(&self, ticks: u8) {
+            self.scroll(-LINES_PER_TICK, ticks);
+        }
+
+        /// 在当前指针位置向上滚动。
+        pub fn scroll_up(&self, ticks: u8) {
+            self.scroll(LINES_PER_TICK, ticks);
+        }
+
+        fn scroll(&self, delta_line: i32, ticks: u8) {
+            let Ok(src) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+                return;
+            };
+            for _ in 0..ticks {
+                if let Ok(ev) = CGEvent::new_scroll_event(
+                    src.clone(),
+                    ScrollEventUnit::LINE,
+                    1,
+                    delta_line,
+                    0,
+                    0,
+                ) {
+                    // Session tap（kCGSessionEventTap）：投递到当前会话输入流，模拟真实输入。
+                    ev.post(CGEventTapLocation::Session);
+                }
+                std::thread::sleep(TICK_DELAY);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use imp::XtestInjector;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 use crate::error::{AppError, AppResult};
 
-/// 非 Linux/Windows 平台桩：没有 X11/XTest、也没有 Win32，构造恒失败。
-///
-/// 保留同名方法与真实实现一致的接口，让 `scroll` 引擎在各平台统一编译；
-/// `new_injector()` 在 macOS 等平台返回错误，这些方法实际上永远不会被调用。
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+/// 其他平台桩（无 X11/XTest、Win32、CoreGraphics）：构造恒失败。
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub struct XtestInjector;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 impl XtestInjector {
-    /// 非 Linux/Windows 平台没有注入能力，恒返回错误。
+    /// 其他平台没有注入能力，恒返回错误。
     pub fn open() -> AppResult<Self> {
         Err(AppError::Window(
-            "滚动截屏仅支持 Linux/X11 或 Windows 会话".into(),
+            "滚动截屏仅支持 Linux/X11、Windows 或 macOS 会话".into(),
         ))
     }
 
@@ -382,4 +600,7 @@ impl XtestInjector {
     }
 
     pub fn scroll_down(&self, _ticks: u8) {}
+
+    pub fn scroll_up(&self, _ticks: u8) {}
 }
+

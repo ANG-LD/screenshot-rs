@@ -88,6 +88,9 @@ oar-ocr = { version = "0.9", features = ["cuda", "directml"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 oar-ocr = { version = "0.9", features = ["coreml"] }
+# 滚动截屏注入器：合成滚轮事件（CGEventCreateScrollWheelEvent），绑定 CoreGraphics
+# 系统框架；需要 highsierra feature 才有 `CGEvent::new_scroll_event`。
+core-graphics = { version = "0.24", features = ["highsierra"] }
 
 # GTK 初始化（Linux 托盘依赖）+ X11 窗口操作 / 滚动注入。
 # x11rb 的 xtest/xcb 特性会链接系统 libxcb（xcb.lib），只存在于 Linux，必须按平台隔离。
