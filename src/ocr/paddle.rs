@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use oar_ocr::domain::tasks::TextDetectionConfig;
@@ -16,6 +17,11 @@ use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
 /// 识别引擎的全局单例：懒初始化，线程安全（一次只允许一个识别任务）。
 /// 引擎通过 `Box::leak` 提升为 `'static`（程序生命周期内常驻，不释放）。
 static ENGINE: OnceLock<Mutex<Option<&'static OAROCR>>> = OnceLock::new();
+
+/// 一旦某个 GPU/加速 EP（DirectML/CUDA/CoreML/OpenVINO）在某次推理中真实失败，
+/// 置位此标志让后续引擎改为纯 CPU 构建并保持（避免每次失败都重试 GPU）。
+/// 触发见 `recognize_rgb` 的 CPU 回退逻辑。
+static FORCE_CPU: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // 模型管理：状态快照 + 进度感知下载（供托盘「OCR 模型管理」窗口展示/重下）
@@ -819,7 +825,13 @@ pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
         })
         .ort_session({
             use oar_ocr::core::config::OrtSessionConfig;
-            let provider_name = crate::config::ocr_execution_provider();
+            // 一旦 FORCE_CPU 被置位（GPU EP 曾真实失败），锁定纯 CPU 构建；
+            // 否则用配置/自动探测到的 EP。
+            let provider_name = if FORCE_CPU.load(Ordering::Relaxed) {
+                "cpu".to_string()
+            } else {
+                crate::config::ocr_execution_provider()
+            };
             let providers = execution_providers(&provider_name);
             tracing::info!(
                 "OCR: 推理后端配置 = {provider_name}（请求 provider: {}），CPU 线程 {}",
@@ -844,7 +856,7 @@ pub fn engine(cache_dir: &Path) -> Result<&'static OAROCR, String> {
         // batch4=15.8s, batch1=13.9s）→ 用 1 最小化 padding。
         .region_batch_size(1)
         .build()
-        .map_err(|e| format!("初始化 PaddleOCR 引擎失败: {e}"))?;
+        .map_err(|e| format!("初始化 PaddleOCR 引擎失败: {}", err_chain(&e)))?;
         *guard = Some(Box::leak(Box::new(ocr)));
     }
     Ok(*guard.as_ref().unwrap())
@@ -872,6 +884,32 @@ pub fn preload() {
     });
 }
 
+/// 展开一个 `Error` 的整条 source 链，返回 `"顶层 → 中间 → 根"` 的字符串。
+///
+/// `oar-ocr` 的 `OCRError::adapter_execution_error` 只把真实原因放进 `source()`
+/// 链，`Display` 首层只有误导性的 "failed to detect text(...)"。用本函数把根因
+/// （如 DirectML/CUDA 的算子不支持、模型加载失败等）拼出来，便于定位。
+fn err_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        s.push_str(" → ");
+        s.push_str(&c.to_string());
+        cur = c.source();
+    }
+    s
+}
+
+/// 用当前引擎做一次「build + 识别」；失败返回已展开完整根因的 String 错误。
+fn infer_once(
+    cache_dir: &Path,
+    img: image::RgbImage,
+) -> Result<Vec<oar_ocr::oarocr::OAROCRResult>, String> {
+    let ocr = engine(cache_dir)?;
+    ocr.predict(vec![img])
+        .map_err(|e| format!("PaddleOCR 识别失败: {}", err_chain(&e)))
+}
+
 /// 识别一块 RGB 图像（w×h×3 字节），返回按行拼接的文本。
 ///
 /// 结果尽可能保留原始排版（缩进/列对齐），便于表格、代码、列表的复制：
@@ -880,10 +918,27 @@ pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
     let img = oar_ocr::utils::create_rgb_image(w, h, rgb.to_vec())
         .ok_or_else(|| format!("RGB 数据长度不符: {w}x{h}"))?;
     let cache_dir = crate::config::ocr_cache_dir();
-    let ocr = engine(&cache_dir)?;
-    let results = ocr
-        .predict(vec![img])
-        .map_err(|e| format!("PaddleOCR 识别失败: {e}"))?;
+    let provider = crate::config::ocr_execution_provider();
+    let results = match infer_once(&cache_dir, img) {
+        Ok(r) => r,
+        Err(first_err) => {
+            // 加速 EP（DirectML/CUDA/CoreML/OpenVINO）在「建会话」或「推理」任一步
+            // 真实失败（算子不支持、图优化失败等）：置 FORCE_CPU 锁死纯 CPU 并重试一次，
+            // 让 OCR 在 Windows/GPU 不兼容的情况下仍可用。CPU 再失败则返回完整根因。
+            if provider != "cpu" && !FORCE_CPU.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    "OCR: 当前 EP（{provider}）失败（{first_err}），自动回退 CPU 重试"
+                );
+                FORCE_CPU.store(true, Ordering::Relaxed);
+                reset_engine();
+                let img2 = oar_ocr::utils::create_rgb_image(w, h, rgb.to_vec())
+                    .ok_or_else(|| format!("RGB 数据长度不符: {w}x{h}"))?;
+                infer_once(&cache_dir, img2)?
+            } else {
+                return Err(first_err);
+            }
+        }
+    };
     let words = collect_words(results.first().map(|r| &r.text_regions).into_iter().flatten());
     if words.is_empty() {
         return Ok(String::new());
