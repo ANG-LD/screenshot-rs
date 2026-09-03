@@ -23,3 +23,8 @@ models/PP-OCRv6/
 models/paddle/pp-ocrv6_medium_*.onnx
 # 下载残留（.part 临时文件）
 models/paddle/*.part
+
+# dev.sh 运行产物（进程 pid、运行日志），不随仓库分发
+.dev.log
+.dev.pid
+

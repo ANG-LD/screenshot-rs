@@ -6558,21 +6558,28 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
     let PinPayload { frame, sx, sy, .. } = payload;
     let img_w = frame.width as f32 / sx;
     let img_h = frame.height as f32 / sy;
-    // 限制显示尺寸（选区高度即默认窗口高度，左侧宽度即图片显示宽度）
-    let max_w = 900.0_f32;
-    let max_h = 700.0_f32;
-    let scale = (max_w / img_w).min(max_h / img_h).min(1.0).max(150.0 / img_w);
-    let disp_w = img_w * scale;
-    let disp_h = img_h * scale;
-    const RIGHT_W: f32 = 360.0;
-    let win_w = disp_w + RIGHT_W;
-    let win_h = disp_h;
+    // 显示尺寸约束：
+    // - MAX_PIN_W：左侧图片显示宽度**下限**。识别区实际宽 >=720 保持自然宽（不强制缩小，
+    //   用户要求）；<720 则强制放大到 720。
+    // - MIN_PIN_H：窗口/左侧画布最低高度 120，图片按宽高比居中留白（不强制铺满）。
+    const MIN_PIN_H: f32 = 120.0;
+    const MAX_PIN_W: f32 = 720.0;
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
             size: Size::new(px(1280.0), px(800.0)),
         }
     });
+    const RIGHT_W: f32 = 360.0;
+    // 高度按宽高比、且不超 max_h（避免窄高图放大后窗口超出屏幕）
+    let max_h = 700.0_f32;
+    let width = img_w.max(MAX_PIN_W);
+    let scale = (width / img_w).min(max_h / img_h);
+    let disp_w = img_w * scale;
+    let disp_h = img_h * scale;
+    // 窗口高度 = max(图片显示高, 120)，保证左侧至少 120；绘制端已按宽高比居中留白。
+    let win_w = disp_w + RIGHT_W;
+    let win_h = disp_h.max(MIN_PIN_H);
     let origin = point(
         px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
         px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
