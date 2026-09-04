@@ -2,6 +2,8 @@ name: Release
 
 # 打 tag（如 v0.2.0）时：在三平台构建 release 二进制，并作为资产上传到该 tag 的 GitHub Release。
 # 这些资产供应用内置的自动更新（self_update）按当前平台下载并替换二进制用。
+# Linux 额外用 cargo-packager 打 deb + AppImage（含 OCR 模型与 CUDA provider 库）一并上传，
+# 便于「安装即用 GPU」；Windows 的 nsis、macOS 的 app/dmg 由 packaging.yml 产出（仅 workflow 工件）。
 #
 # 触发方式（两种任选）：
 #   1. git tag v0.2.0 && git push origin v0.2.0        → 推送 tag 即自动触发
@@ -40,16 +42,20 @@ jobs:
             # 一并上传让「裸装」也能有 GPU：把二进制与这些库放同一目录即可命中（见 build.rs 的 $ORIGIN）。
             # 与 packager.toml 一致，只打包 cuda + shared（TensorRT 不打：需专用卡且让 linuxdeploy 扫依赖）。
             provider_files: target/release/libonnxruntime_providers_cuda.so,target/release/libonnxruntime_providers_shared.so
+            # deb + AppImage 安装包（内置 OCR small 模型 + CUDA provider 库，安装即用 GPU，无卡回退 CPU）。
+            package_files: dist/*.deb,dist/*.AppImage
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             asset: screenshot-rs-x86_64-pc-windows-msvc.exe
             # Windows 的 ORT provider 是 .dll，放 exe 同目录即被加载（Windows 默认先搜 exe 目录）。
             provider_files: target/release/onnxruntime_providers_*.dll,target/release/onnxruntime.dll
+            package_files: ""
           - os: macos-latest
             triple: aarch64-apple-darwin
             asset: screenshot-rs-aarch64-apple-darwin
             # macOS 用 CoreML（系统内建），无独立 provider 库，无需额外资产。
             provider_files: ""
+            package_files: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -86,6 +92,26 @@ jobs:
         if: runner.os == 'Windows'
         run: copy target\release\screenshot-rs.exe "${{ matrix.asset }}"
 
+      # 打包 deb + AppImage（cargo-packager）：内含 OCR small 模型 + ONNX Runtime
+      # CUDA provider 库。deb 装到 /usr/bin + /usr/lib/screenshot-rs/（RUNPATH 命中），
+      # AppImage 自包含；无 GPU 自动回退 CPU。
+      - name: Install cargo-packager (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      # linuxdeploy 扫描 libonnxruntime_providers_cuda.so 的 NEEDED 依赖（CUDA 运行库
+      # libcublas 等），构建机无 NVIDIA 找不到会中止。注入 build.rs 生成的 0 字节 stub
+      # 到宿主机让解析通过；成品 AppImage 由 excluded-libraries 排除它们，运行时由
+      # 客户机 NVIDIA 驱动提供真库（有卡 GPU、无卡 CPU）。
+      - name: Inject CUDA stub libs for linuxdeploy (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo cp target/release/cuda-stubs/* /usr/lib/x86_64-linux-gnu/
+
+      - name: Package deb + appimage (Linux)
+        if: runner.os == 'Linux'
+        run: cargo packager -c packager.toml -f deb,appimage
+
       # 并行各 job 都打到同一个 Release（按 tag 创建/更新），并追加各自的资产。
       # 建议配合勾选 "Generate release notes"。
       - name: Upload asset to release
@@ -94,6 +120,7 @@ jobs:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.provider_files }}
+            ${{ matrix.package_files }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
