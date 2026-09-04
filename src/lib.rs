@@ -12,4 +12,5 @@ pub mod ocr;
 pub mod overlay;
 pub mod scroll;
 pub mod tray;
+pub mod update;
 pub mod utils;

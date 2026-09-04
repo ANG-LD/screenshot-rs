@@ -1,0 +1,85 @@
+name: Release
+
+# 打 tag（如 v0.2.0）时：在三平台构建 release 二进制，并作为资产上传到该 tag 的 GitHub Release。
+# 这些资产供应用内置的自动更新（self_update）按当前平台下载并替换二进制用。
+#
+# 触发方式（两种任选）：
+#   1. git tag v0.2.0 && git push origin v0.2.0        → 推送 tag 即自动触发
+#   2. GitHub 页面 → Actions → 本工作流 → Run workflow 手动触发
+#
+# 资产命名：`screenshot-rs-<target-triple>`（含 target triple，self_update 的 asset_for
+# 用它匹配当前平台）。每个平台都是一份该平台默认 GPU 的裸二进制（CUDA/DirectML/CoreML），
+# 运行时自动检测，无 GPU 自动回退 CPU。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            asset: screenshot-rs-x86_64-unknown-linux-gnu
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            asset: screenshot-rs-x86_64-pc-windows-msvc.exe
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            asset: screenshot-rs-aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux 需要 GTK / X11 / Wayland 等系统库（与 packaging.yml 一致）
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libglib2.0-dev libx11-dev libxdo-dev \
+            libayatana-appindicator3-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libxrandr-dev libxinerama-dev libxtst-dev \
+            libxcursor-dev libxfixes-dev libxi-dev libxcomposite-dev \
+            libxdamage-dev libxcb1-dev libxcb-render0-dev libx11-xcb-dev \
+            libxext-dev libfontconfig-dev libegl-dev libgles-dev libgl-dev \
+            libpng-dev libjpeg-dev librsvg2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 各平台默认 feature（target 条件依赖已按平台启用 GPU：Linux→cuda、
+      # Windows→cuda+directml、macOS→coreml），无需显式 --features。
+      - name: Build release binary
+        run: cargo build --release
+
+      # 二进制重命名为带 target-triple 的资产名，供 self_update 匹配下载。
+      - name: Stage asset (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: cp target/release/screenshot-rs "${{ matrix.asset }}"
+
+      - name: Stage asset (Windows)
+        if: runner.os == 'Windows'
+        run: copy target\release\screenshot-rs.exe "${{ matrix.asset }}"
+
+      # 并行各 job 都打到同一个 Release（按 tag 创建/更新），并追加各自的资产。
+      # 建议配合勾选 "Generate release notes"。
+      - name: Upload asset to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

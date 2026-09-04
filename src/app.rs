@@ -40,6 +40,21 @@ impl AppState {
         // OCR 引擎后台预加载：模型不存在则自动下载，全程不阻塞 UI。
         // 加载完成后首次 OCR 无需等待（引擎为全局单例，之后每次复用）。
         crate::ocr::paddle::preload();
+
+        // 后台更新检查：不阻塞启动；查到新版本则弹「发现新版本」提示窗。
+        // 网络 / 解析失败静默忽略（离线也能正常启动）。
+        let overlay = state.overlay.clone();
+        std::thread::spawn(move || {
+            match crate::update::check_for_update() {
+                Ok(Some(ver)) => {
+                    tracing::info!("发现新版本 v{ver}，提示用户更新");
+                    overlay.prompt_update(ver);
+                }
+                Ok(None) => tracing::debug!("已是最新版本"),
+                Err(e) => tracing::debug!("更新检查跳过: {e}"),
+            }
+        });
+
         Ok(state)
     }
 

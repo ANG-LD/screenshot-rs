@@ -51,6 +51,15 @@ ort = "=2.0.0-rc.13"
 ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# 应用自更新：启动时查 GitHub Releases，用户确认后下载并替换运行中的二进制。
+# default-features=false + rustls：避免 openssl/native-tls 重依赖；单二进制无需归档解压。
+self_update = { version = "0.41", default-features = false, features = ["rustls"] }
+
+# 版本语义比较（更新检查用）
+semver = "1"
+# 更新检查解析 GitHub Releases JSON（已随其它依赖缓存）
+serde_json = "1"
+
 # 错误处理与日志
 anyhow = "1"
 thiserror = "1"

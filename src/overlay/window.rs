@@ -13,9 +13,9 @@
 //! 免去每窗重编译 pipeline 的 ~570ms（见 `park_overlay_window` /
 //! `reuse_overlay_window`）。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{AppError, AppResult};
 
@@ -4868,6 +4868,11 @@ enum OverlayCommand {
     },
     /// 关闭滚动截屏进度小窗
     HideProgress,
+    /// 启动时检查到新版本，弹「发现新版本」提示窗（用户确认后调用 update 下载替换）
+    PromptUpdate {
+        /// 新版本号（如 "0.2.0"），仅用于展示
+        new_version: String,
+    },
 }
 
 /// 进程级唯一的 GPUI 服务：持有命令 Sender，首次使用时才拉起 GPUI 线程。
@@ -4875,6 +4880,7 @@ enum OverlayCommand {
 /// 常驻单应用（`QuitMode::Explicit`）是修复「Windows 截图后进程被
 /// gpui_windows 的 `ExitProcess(0)` 杀掉」的关键：截图/固定都在同一个
 /// `application().run()` 内创建/销毁窗口，事件循环永不退出。
+#[derive(Clone)]
 pub struct OverlayService {
     cmd: Sender<OverlayCommand>,
 }
@@ -4917,6 +4923,13 @@ impl OverlayService {
     /// 打开 OCR 模型管理窗口（fire-and-forget）。
     pub fn open_ocr_models(&self) {
         let _ = self.cmd.send(OverlayCommand::OpenOcrModels);
+    }
+
+    /// 启动时检查到新版本：弹「发现新版本」提示窗，让用户确认是否下载更新。
+    pub fn prompt_update(&self, new_version: String) {
+        let _ = self.cmd.send(OverlayCommand::PromptUpdate {
+            new_version,
+        });
     }
 
     /// 打开自动滚动截屏进度小窗（主线程调用，不阻塞）
@@ -5032,6 +5045,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
                 let mut ocr_pin: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
+                let mut update_prompt: Option<WindowHandle<UpdatePromptView>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -5097,6 +5111,24 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                 match async_cx.update(open_ocr_models_in_app) {
                                     Ok(h) => ocr_models = Some(h),
                                     Err(e) => tracing::error!("[overlay] 打开 OCR 模型窗口失败: {e}"),
+                                }
+                            }
+                        }
+                        Ok(OverlayCommand::PromptUpdate { new_version }) => {
+                            // 始终只有一个更新提示窗：已存在则聚焦到前台，不重复开
+                            let alive = if let Some(h) = &update_prompt {
+                                h.update(async_cx, |_, window, _| {
+                                    window.activate_window();
+                                    true
+                                })
+                                .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            if !alive {
+                                match async_cx.update(|cx| open_update_prompt_in_app(new_version, cx)) {
+                                    Ok(h) => update_prompt = Some(h),
+                                    Err(e) => tracing::error!("[overlay] 打开更新提示窗失败: {e}"),
                                 }
                             }
                         }
@@ -5686,6 +5718,161 @@ fn open_progress_window(
         |_, cx| cx.new(|_| ProgressView { cancel, done, progress, moving, bottom_has_content, confirming, manual }),
     )
     .map_err(|e| AppError::Gpui(format!("打开进度窗失败: {e}")))
+}
+
+/// 「发现新版本」提示窗：启动时检查到新版本后弹出，用户点「立即更新」则后台
+/// 下载并替换运行中的二进制，点「稍后」关闭。整个更新在后台线程进行，
+/// `status`/`error` 共享状态由窗口以 300ms 轮询刷新（见 `open_update_prompt_in_app`）。
+struct UpdatePromptView {
+    new_version: String,
+    /// 0=待确认, 1=更新中, 2=更新完成请重启, -1=失败
+    status: Arc<AtomicI32>,
+    error: Arc<Mutex<String>>,
+}
+
+impl Render for UpdatePromptView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let status = self.status.load(Ordering::Relaxed);
+        let err: String = self.error.lock().map(|g| g.clone()).unwrap_or_default();
+        let (title, body) = match status {
+            0 => (
+                format!("发现新版本 v{}", self.new_version),
+                "新版本已发布，是否立即下载并安装？".to_string(),
+            ),
+            1 => ("正在更新…".to_string(), "正在下载并安装新版本，请稍候…".to_string()),
+            2 => (
+                "更新完成".to_string(),
+                format!("已更新到 v{}，请重启应用后生效。", self.new_version),
+            ),
+            _ => ("更新失败".to_string(), if err.is_empty() { "请稍后重试".into() } else { err }),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .px(px(16.0))
+            .py(px(14.0))
+            .child(div().text_sm().child(title))
+            .child(div().text_sm().child(body))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .mt(px(8.0))
+                    // 待确认或失败时显示「立即更新」（失败可重试）；更新中/完成时不显示
+                    .when(status == 0 || status == -1, {
+                        let status = self.status.clone();
+                        let error = self.error.clone();
+                        move |b| {
+                            b.child(
+                                Button::new("update-start")
+                                    .label("立即更新")
+                                    .compact()
+                                    .with_size(gpui_component::Size::Small)
+                                    .on_click(move |_, _, _| {
+                                        // 后台执行：下载并替换运行中的二进制，完成后更新状态
+                                        status.store(1, Ordering::Relaxed);
+                                        let status = status.clone();
+                                        let error = error.clone();
+                                        std::thread::spawn(move || {
+                                            match crate::update::apply_update() {
+                                                Ok(_) => status.store(2, Ordering::Relaxed),
+                                                Err(e) => {
+                                                    {
+                                                        let mut guard = error
+                                                            .lock()
+                                                            .unwrap_or_else(|p| p.into_inner());
+                                                        *guard = e;
+                                                    }
+                                                    status.store(-1, Ordering::Relaxed);
+                                                }
+                                            }
+                                        });
+                                    }),
+                            )
+                        }
+                    })
+                    // 已完成：只留「关闭」
+                    .when(status == 2, {
+                        move |b| {
+                            b.child(
+                                Button::new("update-close")
+                                    .label("关闭")
+                                    .compact()
+                                    .with_size(gpui_component::Size::Small)
+                                    .on_click(move |_, window, _| window.remove_window()),
+                            )
+                        }
+                    })
+                    // 「稍后」始终显示（更新中也可关闭）
+                    .child(
+                        Button::new("update-dismiss")
+                            .label("稍后")
+                            .compact()
+                            .with_size(gpui_component::Size::Small)
+                            .on_click(move |_, window, _| window.remove_window()),
+                    ),
+            )
+    }
+}
+
+/// 打开「发现新版本」提示窗，窗口居中。每 300ms 轮询重绘以刷新更新进度。
+fn open_update_prompt_in_app(
+    new_version: String,
+    cx: &mut App,
+) -> AppResult<WindowHandle<UpdatePromptView>> {
+    let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
+        Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: Size::new(px(1280.0), px(800.0)),
+        }
+    });
+    let win_w = 420.0_f32;
+    let win_h = 200.0_f32;
+    let origin = point(
+        px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
+        px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
+    );
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin,
+                size: Size::new(px(win_w), px(win_h)),
+            })),
+            window_background: WindowBackgroundAppearance::Opaque,
+            titlebar: Some(TitlebarOptions {
+                title: Some("更新提示".into()),
+                appears_transparent: false,
+                ..Default::default()
+            }),
+            kind: WindowKind::Normal,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            focus: true,
+            ..Default::default()
+        },
+        |_, cx| {
+            let status = Arc::new(AtomicI32::new(0));
+            let error = Arc::new(Mutex::new(String::new()));
+            let view = cx.new(|_| UpdatePromptView { new_version, status, error });
+            // 后台线程改 status/error 后，这里每 300ms 重绘一次刷新；窗口关闭后退出。
+            let weak = view.downgrade();
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(300))
+                        .await;
+                    let Some(entity) = weak.upgrade() else { break; };
+                    entity.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+            view
+        },
+    )
+    .map_err(|e| AppError::Gpui(format!("打开更新提示窗失败: {e}")))
 }
 
 /// 在常驻应用里打开 Pin 窗口（原 `spawn_pin_window` 的窗口构建逻辑）。
