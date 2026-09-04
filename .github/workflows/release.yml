@@ -2,9 +2,8 @@ name: Release
 
 # 打 tag（如 v0.2.0）时：在三平台构建 release 二进制，并作为资产上传到该 tag 的 GitHub Release。
 # 这些资产供应用内置的自动更新（self_update）按当前平台下载并替换二进制用。
-# Linux 额外用 cargo-packager 打 deb + AppImage、Windows 打 NSIS 安装器一并上传，
-# 均内置 OCR 模型与相应 GPU provider 库，便于「安装即用 GPU」；macOS 的 app/dmg 仍由
-# packaging.yml 产出（仅 workflow 工件）。
+# Linux 额外用 cargo-packager 打 deb + AppImage、Windows 打 NSIS 安装器、macOS 打 dmg
+# 一并上传，均内置 OCR 模型与相应 GPU provider 库，便于「安装即用 GPU」。
 #
 # 触发方式（两种任选）：
 #   1. git tag v0.2.0 && git push origin v0.2.0        → 推送 tag 即自动触发
@@ -57,7 +56,8 @@ jobs:
             asset: screenshot-rs-aarch64-apple-darwin
             # macOS 用 CoreML（系统内建），无独立 provider 库，无需额外资产。
             provider_files: ""
-            package_files: ""
+            # dmg 安装镜像（内含 .app，拖入 Applications 即装；含 OCR 模型，CoreML 开箱即用）
+            package_files: dist/*.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -123,6 +123,16 @@ jobs:
       - name: Package nsis (Windows)
         if: runner.os == 'Windows'
         run: cargo packager -c packager.toml -f nsis
+
+      # macOS 打包 dmg（cargo-packager）：内含 .app + OCR 模型，CoreML 开箱即用；
+      # 上传单文件 dist/*.dmg（.app 是目录，不作为 release 资产）。
+      - name: Install cargo-packager (macOS)
+        if: runner.os == 'macOS'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Package app + dmg (macOS)
+        if: runner.os == 'macOS'
+        run: cargo packager -c packager.toml -f app,dmg
 
       # 并行各 job 都打到同一个 Release（按 tag 创建/更新），并追加各自的资产。
       # 建议配合勾选 "Generate release notes"。
