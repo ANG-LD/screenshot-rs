@@ -5974,13 +5974,12 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
     // pin_frame 尺寸是物理像素，转为逻辑像素用于窗口尺寸
     let img_w = pin_frame.width as f32 / sx;
     let img_h = pin_frame.height as f32 / sy;
-    let max_w = 1200.0_f32;
-    let max_h = 900.0_f32;
+    // 固定窗口按「截取的实际逻辑尺寸」1:1 显示，不再缩放到 1200×900 内。
+    // 用户反馈：大选区（如全屏）固定后图片被整体缩小，宽高与截图不符。
+    // 只对超小图保留 150px 下限（保证可读），绝不缩小；1x 屏下 sx=sy=1，
+    // img_w/img_h 等于截取物理宽高，窗口与截图一一对应。
     const MIN_IMG_W: f32 = 150.0;
-    let scale = (max_w / img_w)
-        .min(max_h / img_h)
-        .min(1.0)
-        .max(MIN_IMG_W / img_w);
+    let scale = (MIN_IMG_W / img_w).max(1.0);
     // 自定义标题栏高度（原生标题栏已移除，由 PinWindowView render 绘制）
     const CUSTOM_TITLEBAR_H: f32 = 32.0;
     let win_w = px(img_w * scale);

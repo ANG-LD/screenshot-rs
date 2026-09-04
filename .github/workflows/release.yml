@@ -36,12 +36,20 @@ jobs:
           - os: ubuntu-24.04
             triple: x86_64-unknown-linux-gnu
             asset: screenshot-rs-x86_64-unknown-linux-gnu
+            # ONNX Runtime CUDA provider 动态库（ort-sys 构建时放进 target/release/，运行时 dlopen）。
+            # 一并上传让「裸装」也能有 GPU：把二进制与这些库放同一目录即可命中（见 build.rs 的 $ORIGIN）。
+            # 与 packager.toml 一致，只打包 cuda + shared（TensorRT 不打：需专用卡且让 linuxdeploy 扫依赖）。
+            provider_files: target/release/libonnxruntime_providers_cuda.so,target/release/libonnxruntime_providers_shared.so
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             asset: screenshot-rs-x86_64-pc-windows-msvc.exe
+            # Windows 的 ORT provider 是 .dll，放 exe 同目录即被加载（Windows 默认先搜 exe 目录）。
+            provider_files: target/release/onnxruntime_providers_*.dll,target/release/onnxruntime.dll
           - os: macos-latest
             triple: aarch64-apple-darwin
             asset: screenshot-rs-aarch64-apple-darwin
+            # macOS 用 CoreML（系统内建），无独立 provider 库，无需额外资产。
+            provider_files: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -83,7 +91,9 @@ jobs:
       - name: Upload asset to release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.provider_files }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

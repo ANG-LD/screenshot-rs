@@ -100,7 +100,22 @@ pub fn apply_update() -> Result<String, String> {
 
     // 在 self_update 替换前记录原始可执行文件路径：替换成功后，新版本就在这个路径。
     let exe = std::env::current_exe().map_err(|e| format!("获取当前程序路径失败: {e}"))?;
-    let _ = UPDATE_EXE.set(exe);
+    let _ = UPDATE_EXE.set(exe.clone());
+
+    // self_update 的替换阶段要在「程序所在目录」写 `.<名>.__temp__XXXXXX` 临时文件再原子改名
+    // （同文件系统才能 rename）。若该目录不可写（如装在系统目录 /usr/bin、普通用户无写权限），
+    // 下载成功后在替换时仍会报 `os error 13`。这里提前探测：能写才继续下载，避免白白下载
+    // 几十 MB 再失败——把应用装到用户可写目录（如 ~/.local/bin/screenshot-rs）后自更新即可正常。
+    let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    if !dir_is_writable(exe_dir) {
+        return Err(format!(
+            "应用更新失败：程序目录「{}」不可写（权限不足）。\n\
+             应用装在系统目录时，普通用户无法自我替换运行中的程序。\n\
+             请把应用安装到用户可写目录（如 ~/.local/bin/screenshot-rs）后再更新，\n\
+             或改用 sudo 安装新版系统包来更新。",
+            exe_dir.display()
+        ));
+    }
 
     let status = self_update::backends::github::Update::configure()
         .repo_owner(REPO_OWNER)
@@ -114,9 +129,122 @@ pub fn apply_update() -> Result<String, String> {
         .build()
         .map_err(|e| format!("初始化更新器失败: {e}"))?
         .update()
-        .map_err(|e| format!("应用更新失败: {e}"))?;
+        .map_err(|e| map_update_error(e, exe_dir))?;
 
     Ok(status.version().to_string())
+}
+
+/// 探测 `dir` 是否可写：`self_replace` 要在 exe 所在目录创建临时文件，这里用「创建 + 删除一个
+/// 探针文件」来模拟（创建成功即说明可写）。不可写目录返回 false，避免误报可更新。
+fn dir_is_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".screenshot-rs-update-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 把 self_update 失败翻译成用户能看懂的错误。权限不足（os error 13 / EACCES /
+/// Permission denied）给出可操作指引；其它原样透传。
+fn map_update_error(e: impl std::fmt::Display, exe_dir: &std::path::Path) -> String {
+    let msg = e.to_string();
+    if msg.contains("os error 13")
+        || msg.contains("Permission denied")
+        || msg.contains("EACCES")
+    {
+        format!(
+            "应用更新失败：程序目录「{}」不可写（权限不足），无法替换运行中的程序。\n\
+             请把应用安装到用户可写目录（如 ~/.local/bin）后重试，\n\
+             或改用 sudo 安装新版系统包来更新。\n\
+             （原错误：{msg}）",
+            exe_dir.display()
+        )
+    } else {
+        format!("应用更新失败: {msg}")
+    }
+}
+
+/// 把「系统安装(exe 目录不可写)」的应用**自迁移**到用户可写目录，让 deb/系统包装机也能自更新。
+///
+/// 背景：deb 把二进制装在 `/usr/bin`(root 属主)，普通用户无法就地替换。首次运行时把
+/// 「自身 + ONNX Runtime provider 库」复制到 `~/.local/`(用户可写)，然后用同一参数重新
+/// exec 该副本并退出当前进程；此后每次都以用户目录副本为运行主体：
+/// - `self_update` 能替换它(可写)→ 系统装机也能自更新；
+/// - RUNPATH `$ORIGIN/../lib/screenshot-rs` 恰好命中 `~/.local/lib/screenshot-rs/` 下的
+///   provider 库 → GPU 加速不丢；
+/// - OCR small 模型仍在系统 `/usr/lib/screenshot-rs/`(deb 未卸载)→ 照常读到。
+///
+/// 仅 Linux 生效：Windows nsis 为 currentUser(用户目录、可写)无需迁移；
+/// macOS 是 .app bundle(Contents/MacOS/Resources 结构不能拆散)不能迁移。
+/// 由 `main()` 启动时最先调用；迁移后当前进程已被重新 exec(子进程 + 退出)。
+#[cfg(target_os = "linux")]
+pub fn relocate_to_user_dir() {
+    // 用户可写目标目录 ~/.local/bin + ~/.local/lib/screenshot-rs
+    let Some(home_dir) = std::env::var_os("HOME") else { return };
+    let home = std::path::Path::new(home_dir.as_os_str());
+    let bin_dir = home.join(".local").join("bin");
+    let lib_dir = home.join(".local").join("lib").join(BIN_NAME);
+    let target_exe = bin_dir.join(BIN_NAME);
+
+    // 已在用户可写目录运行(便携/已迁移)→ 无需再迁移。
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if dir_is_writable(exe.parent().unwrap_or(std::path::Path::new("."))) {
+        return;
+    }
+    tracing::info!(
+        "[update] 系统安装(exe 目录不可写: {}), 迁移到用户目录运行: {}",
+        exe.display(),
+        target_exe.display()
+    );
+
+    // 1) 复制自身(仅当目标不存在；已存在则保留用户目录那份——它才是自更新主体)。
+    if !target_exe.exists() {
+        if std::fs::create_dir_all(&bin_dir).is_err() {
+            tracing::warn!("[update] 无法创建 {}，跳过迁移", bin_dir.display());
+            return;
+        }
+        if std::fs::copy(&exe, &target_exe).is_err() {
+            tracing::warn!("[update] 复制自身到 {} 失败", target_exe.display());
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // 2) 复制 ONNX Runtime provider 库(cuda + shared)到 ~/.local/lib/screenshot-rs/。
+    //    源：系统资源目录(deb: /usr/lib/screenshot-rs)。RUNPATH 从 ~/.local/bin 解析到
+    //    ~/.local/lib/screenshot-rs，正好命中；模型仍在系统目录(base 未卸载)由
+    //    bundled_resource_dirs 的 /usr/lib/<exe>/ 分支读到，无需迁移。
+    let src_lib = std::path::Path::new("/usr/lib").join(BIN_NAME);
+    if src_lib.is_dir() && std::fs::create_dir_all(&lib_dir).is_ok() {
+        if let Ok(read) = std::fs::read_dir(&src_lib) {
+            for entry in read.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("libonnxruntime_providers_") && name.ends_with(".so") {
+                    let dest = lib_dir.join(&name);
+                    if !dest.exists() {
+                        let _ = std::fs::copy(entry.path(), &dest);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) 用同一参数重新 exec 用户目录副本，退出当前进程。
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    match std::process::Command::new(&target_exe).args(&args).spawn() {
+        Ok(_) => {
+            tracing::info!("[update] 已迁移到 {}，重启子进程后退出当前进程", target_exe.display());
+            std::process::exit(0);
+        }
+        Err(e) => tracing::warn!("[update] 重新 exec 迁移副本失败({e})，继续以当前进程运行"),
+    }
 }
 
 /// 自动重启到已安装的新版本：拉起 `UPDATE_EXE`（即 self_update 替换后新版本所在路径），

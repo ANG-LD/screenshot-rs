@@ -39,6 +39,10 @@ fn main() -> AppResult<()> {
     // Windows / macOS 不需要。
     #[cfg(target_os = "linux")]
     {
+        // 系统安装(deb 装到 /usr/bin，root 属主)时先自迁移到用户可写目录，
+        // 让自更新能替换自身。在 GTK/AppState 前做，尽快重新 exec。
+        screenshot_rs::update::relocate_to_user_dir();
+
         gtk::init().expect("Failed to initialize GTK");
         tracing::info!("GTK 初始化完成");
     }

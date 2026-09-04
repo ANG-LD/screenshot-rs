@@ -1,6 +1,6 @@
 name = "screenshot-rs"
 product-name = "Screenshot RS"
-version = "0.1.1"
+version = "0.1.0"
 identifier = "com.screenshot-rs.screenshot-rs"
 description = "Cross-platform screenshot tool built with GPUI"
 homepage = "https://github.com/ANG-LD/screenshot-rs"

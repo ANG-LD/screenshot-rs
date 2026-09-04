@@ -1,6 +1,6 @@
 [package]
 name = "screenshot-rs"
-version = "0.1.2"
+version = "0.1.0"
 edition = "2021"
 description = "Cross-platform screenshot tool built with GPUI"
 license = "MIT"
@@ -54,6 +54,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 应用自更新：启动时查 GitHub Releases，用户确认后下载并替换运行中的二进制。
 # default-features=false + rustls：避免 openssl/native-tls 重依赖；单二进制无需归档解压。
 self_update = { version = "0.41", default-features = false, features = ["rustls"] }
+
+# self_update 内部的 reqwest 只开了 blocking/json(无 gzip)。GitHub API 对带
+# `Accept-Encoding: gzip` 的请求返回 gzip 体；若 reqwest 无 gzip feature 则无法解压，
+# `resp.json::<Value>()` 会抛 "error decoding response body"（用户 VPN/代理下会触发）。
+# 这里显式给 reqwest 开 `gzip`，Cargo 按依赖图统一 feature，使 self_update 的
+# GitHub API / 资产请求也能自动解压 gzip，无需改 self_update。
+reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
 
 # 版本语义比较（更新检查用）
 semver = "1"

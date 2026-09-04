@@ -10,10 +10,15 @@ fn main() {
     }
 
     // Linux：给可执行文件设置 RUNPATH，指向随包分发的 ONNX Runtime CUDA
-    // provider 动态库（deb/appimage 布局：exe 在 <root>/usr/bin，资源在
-    // <root>/usr/lib/screenshot-rs/）。ORT 在运行时用 dlopen 加载
+    // provider 动态库。两个候选目录（按顺序搜索，dlopen 遵守 DT_RUNPATH）：
+    //   1) $ORIGIN/../lib/screenshot-rs —— 安装版布局（deb/appimage：exe 在
+    //      <root>/usr/bin，资源在 <root>/usr/lib/screenshot-rs/）；
+    //   2) $ORIGIN                       —— 便携/目录布局：把 release 的「裸二进制 +
+    //      libonnxruntime_providers_*.so」放同一目录即可命中（release.yml 已把
+    //      provider 库一并作为资产上传）。
+    // 二者兼容，只多一个搜索路径，不破坏 deb 布局。ORT 运行时用 dlopen 加载
     // libonnxruntime_providers_cuda.so，而 dlopen 会参与 DT_RUNPATH 搜索——
-    // 不设则安装版找不到 provider 库，有 NVIDIA 显卡也无法用 GPU 推理。
+    // 不设这两个位置则安装版/裸装都找不到 provider 库，有 NVIDIA 显卡也无法用 GPU 推理。
     //
     // 同时生成 CUDA 运行库的**最小 ELF stub** 到 target/release/cuda-stubs/：
     // linuxdeploy 构建 AppImage 时扫描 provider .so 的 NEEDED 依赖，构建机无
@@ -24,7 +29,9 @@ fn main() {
     // 共享库（0 字节文件 ldd 报 "file too short"），内容为空壳即可。
     #[cfg(target_os = "linux")]
     {
-        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/../lib/screenshot-rs");
+        println!(
+            "cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN/../lib/screenshot-rs:$ORIGIN"
+        );
         let stub_dir = std::path::Path::new("target/release/cuda-stubs");
         let _ = std::fs::create_dir_all(stub_dir);
         let src_file = stub_dir.join("_stub.c");
