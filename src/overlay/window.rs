@@ -27,6 +27,7 @@ use gpui::{
 };
 use gpui_component::button::Button;
 use gpui_component::button::{ButtonVariant, ButtonVariants};
+use gpui_component::ActiveTheme;
 use gpui_component::Disableable;
 use gpui_component::IconName;
 use gpui_component::Selectable;
@@ -5731,9 +5732,11 @@ struct UpdatePromptView {
 }
 
 impl Render for UpdatePromptView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.status.load(Ordering::Relaxed);
         let err: String = self.error.lock().map(|g| g.clone()).unwrap_or_default();
+        // 读取全局主题（自适应明暗），仅取颜色，避免跨渲染借用 cx。
+        let colors = cx.theme().colors.clone();
         let (title, body) = match status {
             0 => (
                 format!("发现新版本 v{}", self.new_version),
@@ -5746,20 +5749,52 @@ impl Render for UpdatePromptView {
             ),
             _ => ("更新失败".to_string(), if err.is_empty() { "请稍后重试".into() } else { err }),
         };
+        // 状态强调色：待确认/更新中=蓝，完成=绿，失败=红
+        let accent = match status {
+            2 => colors.success,
+            -1 => colors.danger,
+            _ => colors.info,
+        };
         div()
             .flex()
             .flex_col()
-            .gap(px(10.0))
-            .px(px(16.0))
-            .py(px(14.0))
-            .child(div().text_sm().child(title))
-            .child(div().text_sm().child(body))
+            .w_full()
+            .px(px(22.0))
+            .py(px(18.0))
+            .gap(px(12.0))
+            // 顶部：强调色圆点 + 粗体标题，像一条可读的通知
             .child(
                 div()
                     .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .child(div().size(px(9.0)).rounded_full().bg(accent))
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(colors.foreground)
+                            .child(title),
+                    ),
+            )
+            // 正文（muted 次级色）
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(colors.muted_foreground)
+                    .child(body),
+            )
+            // 分隔线 + 按钮行（右对齐）
+            .child(
+                div()
+                    .mt(px(14.0))
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .pt(px(12.0))
+                    .flex()
                     .justify_end()
-                    .gap(px(8.0))
-                    .mt(px(8.0))
+                    .items_center()
+                    .gap(px(10.0))
                     // 待确认或失败时显示「立即更新」（失败可重试）；更新中/完成时不显示
                     .when(status == 0 || status == -1, {
                         let status = self.status.clone();
@@ -5770,6 +5805,7 @@ impl Render for UpdatePromptView {
                                     .label("立即更新")
                                     .compact()
                                     .with_size(gpui_component::Size::Small)
+                                    .with_variant(ButtonVariant::Primary)
                                     .on_click(move |_, _, _| {
                                         // 后台执行：下载并替换运行中的二进制，完成后更新状态
                                         status.store(1, Ordering::Relaxed);
@@ -5801,6 +5837,7 @@ impl Render for UpdatePromptView {
                                     .label("关闭")
                                     .compact()
                                     .with_size(gpui_component::Size::Small)
+                                    .with_variant(ButtonVariant::Ghost)
                                     .on_click(move |_, window, _| window.remove_window()),
                             )
                         }
@@ -5811,6 +5848,7 @@ impl Render for UpdatePromptView {
                             .label("稍后")
                             .compact()
                             .with_size(gpui_component::Size::Small)
+                            .with_variant(ButtonVariant::Ghost)
                             .on_click(move |_, window, _| window.remove_window()),
                     ),
             )
