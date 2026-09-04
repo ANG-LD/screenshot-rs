@@ -9,7 +9,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -67,7 +67,7 @@ jobs:
       - name: Package deb + appimage
         run: cargo packager -c packager.toml -f deb,appimage
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: screenshot-rs-linux
           path: |
@@ -77,7 +77,7 @@ jobs:
   windows-nsis:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -92,7 +92,7 @@ jobs:
       - name: Package nsis
         run: cargo packager -c packager.toml -f nsis
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: screenshot-rs-nsis
           path: dist/*.exe
@@ -100,7 +100,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -115,7 +115,7 @@ jobs:
       - name: Package app + dmg
         run: cargo packager -c packager.toml -f app,dmg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: screenshot-rs-macos
           path: |
