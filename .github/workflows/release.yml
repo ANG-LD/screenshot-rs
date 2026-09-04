@@ -10,6 +10,10 @@ name: Release
 # 资产命名：`screenshot-rs-<target-triple>`（含 target triple，self_update 的 asset_for
 # 用它匹配当前平台）。每个平台都是一份该平台默认 GPU 的裸二进制（CUDA/DirectML/CoreML），
 # 运行时自动检测，无 GPU 自动回退 CPU。
+#
+# ⚠️ Linux 必须用 ubuntu-24.04：ORT(onnxruntime) 的预编译二进制在 glibc≥2.38 / GCC13+
+# 上构建，引用了 __isoc23_strtol、_M_replace_cold 等新符号。ubuntu-22.04(glibc 2.35/GCC11)
+# 链接会失败（undefined symbol）。ubuntu-24.04 与 packaging.yml 的 ubuntu-latest 一致能通过。
 
 on:
   push:
@@ -29,7 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             triple: x86_64-unknown-linux-gnu
             asset: screenshot-rs-x86_64-unknown-linux-gnu
           - os: windows-latest
