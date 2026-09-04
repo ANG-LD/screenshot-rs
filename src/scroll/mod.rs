@@ -245,7 +245,9 @@ pub fn run_scroll_capture(
             a.height
         );
         let frame_w = a.width;
-        let mut stitched = a.pixels.clone();
+        // 预留容量：初始一帧 + 一帧续接余量（2x），减少长滚动下 stitched 反复扩容重分配。
+        let mut stitched = Vec::with_capacity(a.pixels.len().saturating_mul(2));
+        stitched.extend_from_slice(&a.pixels);
         let mut stitched_h = a.height;
         // 全屏基线：空白段用它判断页面是否还在滚动（还在动 → 在滚过空白，继续；
         // 不动 → 已到底，提前停止）。正常滚动路径不读它，只在空白段与诊断时捕获。
@@ -792,7 +794,9 @@ pub fn run_manual_scroll_capture(
             a = f;
         }
         let frame_w = a.width;
-        let mut stitched = a.pixels.clone();
+        // 预留容量：初始一帧 + 一帧续接余量（2x），减少长滚动下 stitched 反复扩容重分配。
+        let mut stitched = Vec::with_capacity(a.pixels.len().saturating_mul(2));
+        stitched.extend_from_slice(&a.pixels);
         let mut stitched_h = a.height;
         // anchor：最近一次成功拼接（或刷新）的基线，直接接管首帧所有权；
         // prev：上一帧（做帧间运动检测），首帧之前不存在，用 Option 延迟持有，

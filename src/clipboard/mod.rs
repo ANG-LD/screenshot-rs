@@ -217,13 +217,20 @@ fn write_frame_windows(frame: &CapturedFrame) -> AppResult<()> {
         }
     }
 
-    // 编码 PNG（CF_PNG 用；编码失败不致命，仍有其它格式兜底）
+    // 编码 PNG（CF_PNG 用；编码失败不致命，仍有其它格式兜底）。
+    // 用 `PngEncoder::write_image` 直接编码**借用**的像素切片，省掉一整帧 clone
+    // （原来 `RgbaImage::from_raw` 需要所有权，被迫 `frame.pixels.clone()` 拷贝一整帧）。
     let mut png_buf = Vec::new();
-    if let Some(img) =
-        image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels.clone())
     {
+        use image::ImageEncoder;
+        use image::codecs::png::PngEncoder;
         let mut cursor = std::io::Cursor::new(&mut png_buf);
-        let _ = img.write_to(&mut cursor, image::ImageFormat::Png);
+        let _ = PngEncoder::new(&mut cursor).write_image(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            image::ExtendedColorType::Rgba8,
+        );
     }
 
     // "PNG" 剪贴板格式 ID 由系统按名称运行时分配，不能硬编码：硬编码 0x8017

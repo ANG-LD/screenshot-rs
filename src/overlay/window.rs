@@ -5046,7 +5046,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
                 let mut ocr_pin: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
-                let mut update_prompt: Option<WindowHandle<UpdatePromptView>> = None;
+                let mut update_prompt: Option<WindowHandle<gpui_component::Root>> = None;
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -5736,17 +5736,11 @@ impl Render for UpdatePromptView {
         let status = self.status.load(Ordering::Relaxed);
         let err: String = self.error.lock().map(|g| g.clone()).unwrap_or_default();
         // 读取全局主题（自适应明暗），仅取颜色，避免跨渲染借用 cx。
-        let colors = cx.theme().colors.clone();
+        let colors = cx.theme().colors;
         let (title, body) = match status {
-            0 => (
-                format!("发现新版本 v{}", self.new_version),
-                "新版本已发布，是否立即下载并安装？".to_string(),
-            ),
+            0 => ("发现新版本".to_string(), "新版本已发布，是否立即下载并安装？".to_string()),
             1 => ("正在更新…".to_string(), "正在下载并安装新版本，请稍候…".to_string()),
-            2 => (
-                "更新完成".to_string(),
-                format!("已更新到 v{}，请重启应用后生效。", self.new_version),
-            ),
+            2 => ("更新完成".to_string(), "已更新，正在重启应用…".to_string()),
             _ => ("更新失败".to_string(), if err.is_empty() { "请稍后重试".into() } else { err }),
         };
         // 状态强调色：待确认/更新中=蓝，完成=绿，失败=红
@@ -5755,14 +5749,24 @@ impl Render for UpdatePromptView {
             -1 => colors.danger,
             _ => colors.info,
         };
+        // 按钮颜色：Hsla 是 Copy，可在各 move 闭包里按值捕获，避免 colors 被整体 move。
+        let primary_bg = colors.primary;
+        let primary_fg = colors.primary_foreground;
+        let secondary_bg = colors.secondary;
+        let secondary_fg = colors.secondary_foreground;
+        // 整窗填不透明背景：否则下层窗口颜色会穿透到提示窗，观感很差。标题行
+        // 用「强调色圆点 + 粗体标题 + 版本徽标」，正文用 muted 色，底部弹性占位
+        // 把按钮推到窗底。
         div()
+            .w_full()
+            .h_full()
+            .bg(colors.background)
             .flex()
             .flex_col()
-            .w_full()
             .px(px(22.0))
             .py(px(18.0))
             .gap(px(12.0))
-            // 顶部：强调色圆点 + 粗体标题，像一条可读的通知
+            // 标题行（强调色圆点 + 粗体标题 + 版本徽标）
             .child(
                 div()
                     .flex()
@@ -5775,6 +5779,17 @@ impl Render for UpdatePromptView {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(colors.foreground)
                             .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .px(px(9.0))
+                            .py(px(2.0))
+                            .rounded_md()
+                            .bg(accent.opacity(0.12))
+                            .text_color(accent)
+                            .child(format!("v{}", self.new_version)),
                     ),
             )
             // 正文（muted 次级色）
@@ -5784,6 +5799,8 @@ impl Render for UpdatePromptView {
                     .text_color(colors.muted_foreground)
                     .child(body),
             )
+            // 弹性占位：把按钮行推到窗底
+            .child(div().flex_1())
             // 分隔线 + 按钮行（右对齐）
             .child(
                 div()
@@ -5801,11 +5818,19 @@ impl Render for UpdatePromptView {
                         let error = self.error.clone();
                         move |b| {
                             b.child(
-                                Button::new("update-start")
-                                    .label("立即更新")
-                                    .compact()
-                                    .with_size(gpui_component::Size::Small)
-                                    .with_variant(ButtonVariant::Primary)
+                                div()
+                                    .id("update-start")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(28.0))
+                                    .px(px(18.0))
+                                    .rounded_md()
+                                    .bg(primary_bg)
+                                    .text_color(primary_fg)
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
                                     .on_click(move |_, _, _| {
                                         // 后台执行：下载并替换运行中的二进制，完成后更新状态
                                         status.store(1, Ordering::Relaxed);
@@ -5813,7 +5838,12 @@ impl Render for UpdatePromptView {
                                         let error = error.clone();
                                         std::thread::spawn(move || {
                                             match crate::update::apply_update() {
-                                                Ok(_) => status.store(2, Ordering::Relaxed),
+                                                Ok(_) => {
+                                                    // 短暂显示「更新完成」，再自动重启到新版本。
+                                                    status.store(2, Ordering::Relaxed);
+                                                    std::thread::sleep(std::time::Duration::from_millis(700));
+                                                    crate::update::restart_app();
+                                                }
                                                 Err(e) => {
                                                     {
                                                         let mut guard = error
@@ -5825,7 +5855,8 @@ impl Render for UpdatePromptView {
                                                 }
                                             }
                                         });
-                                    }),
+                                    })
+                                    .child("立即更新"),
                             )
                         }
                     })
@@ -5833,23 +5864,41 @@ impl Render for UpdatePromptView {
                     .when(status == 2, {
                         move |b| {
                             b.child(
-                                Button::new("update-close")
-                                    .label("关闭")
-                                    .compact()
-                                    .with_size(gpui_component::Size::Small)
-                                    .with_variant(ButtonVariant::Ghost)
-                                    .on_click(move |_, window, _| window.remove_window()),
+                                div()
+                                    .id("update-close")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .h(px(28.0))
+                                    .px(px(18.0))
+                                    .rounded_md()
+                                    .bg(secondary_bg)
+                                    .text_color(secondary_fg)
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, _| window.remove_window())
+                                    .child("关闭"),
                             )
                         }
                     })
                     // 「稍后」始终显示（更新中也可关闭）
                     .child(
-                        Button::new("update-dismiss")
-                            .label("稍后")
-                            .compact()
-                            .with_size(gpui_component::Size::Small)
-                            .with_variant(ButtonVariant::Ghost)
-                            .on_click(move |_, window, _| window.remove_window()),
+                        div()
+                            .id("update-dismiss")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(28.0))
+                            .px(px(18.0))
+                            .rounded_md()
+                            .bg(secondary_bg)
+                            .text_color(secondary_fg)
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .on_click(move |_, window, _| window.remove_window())
+                            .child("稍后"),
                     ),
             )
     }
@@ -5859,7 +5908,7 @@ impl Render for UpdatePromptView {
 fn open_update_prompt_in_app(
     new_version: String,
     cx: &mut App,
-) -> AppResult<WindowHandle<UpdatePromptView>> {
+) -> AppResult<WindowHandle<gpui_component::Root>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -5867,7 +5916,7 @@ fn open_update_prompt_in_app(
         }
     });
     let win_w = 420.0_f32;
-    let win_h = 200.0_f32;
+    let win_h = 230.0_f32;
     let origin = point(
         px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
         px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
@@ -5891,7 +5940,7 @@ fn open_update_prompt_in_app(
             focus: true,
             ..Default::default()
         },
-        |_, cx| {
+        |window, cx| {
             let status = Arc::new(AtomicI32::new(0));
             let error = Arc::new(Mutex::new(String::new()));
             let view = cx.new(|_| UpdatePromptView { new_version, status, error });
@@ -5907,7 +5956,9 @@ fn open_update_prompt_in_app(
                 }
             })
             .detach();
-            view
+            // 包 Root：与 OCR 模型窗一致——提供主题化、不透明的窗口背景，
+            // 否则下层窗口颜色会穿透到更新提示窗，观感很差。
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开更新提示窗失败: {e}")))
