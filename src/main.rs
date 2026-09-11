@@ -22,6 +22,17 @@ fn install_panic_hook() {
 }
 
 fn main() -> AppResult<()> {
+    // `--version` / `-V`：只打印版本号后退出。
+    // 必须放在最前面（GTK / 日志 / 迁移之前）：`update::relocate_to_user_dir` 会拿这个
+    // 参数去问 `~/.local/bin` 里的副本「你是什么版本」，若这里也走迁移逻辑就会递归。
+    // `black_box` 引用能力探针字面量，让本二进制带上「支持 --version」的标记，
+    // 供 `update::has_version_support` **不启动进程**就能识别新老副本。
+    if std::env::args_os().skip(1).any(|a| a == "--version" || a == "-V") {
+        std::hint::black_box(screenshot_rs::update::VERSION_QUERY_MARKER);
+        println!("{}", screenshot_rs::update::CURRENT_VERSION);
+        return Ok(());
+    }
+
     install_panic_hook();
 
     // tracing subscriber 必须最先初始化，否则后续 tracing::info! 调用会被丢弃。

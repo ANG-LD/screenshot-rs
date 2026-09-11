@@ -175,8 +175,94 @@ fn map_update_error(e: impl std::fmt::Display, exe_dir: &std::path::Path) -> Str
 /// - `self_update` 能替换它(可写)→ 系统装机也能自更新；
 /// - RUNPATH `$ORIGIN/../lib/screenshot-rs` 恰好命中 `~/.local/lib/screenshot-rs/` 下的
 ///   provider 库 → GPU 加速不丢；
-/// - OCR small 模型仍在系统 `/usr/lib/screenshot-rs/`(deb 未卸载)→ 照常读到。
+/// - OCR small 模型仍在系统 `/usr/lib/screenshot-rs/`(deb 未卸载)→ 照常读到；
+/// - 用户目录副本会比版本：比当前旧就原子替换（否则装新包也被旧副本粘住、永不提示更新），
+///   不比当前旧则保留（应用内自更新的产物，不能降级）。
 ///
+/// `--version` 能力探针字面量（**本项目自用**，不是给用户看的输出）。
+///
+/// `main()` 处理 `--version` 时用 `black_box` 引用它，于是**只要二进制支持
+/// `--version`，文件里就一定有这串字节**，不支持的老版本没有。
+/// `relocate_to_user_dir` 先用它扫描副本文件，就能在不启动进程的前提下判断副本
+/// 认不认识 `--version`——否则拿老副本去问版本，老版本会把它当普通启动真的开出 GUI。
+pub const VERSION_QUERY_MARKER: &str = "screenshot-rs--version-probe--v1";
+
+/// 文件里是否含 [`VERSION_QUERY_MARKER`]（分块扫描，不把几十 MB 整个读进内存）。
+#[cfg(target_os = "linux")]
+fn has_version_support(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    const CHUNK: usize = 1 << 20;
+    let needle = VERSION_QUERY_MARKER.as_bytes();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // 多留 needle.len()-1 字节余量：跨块边界的匹配靠把上一块尾巴搬回开头兜住。
+    let mut buf = vec![0u8; CHUNK + needle.len()];
+    let mut carry = 0usize;
+    loop {
+        let read = match file.read(&mut buf[carry..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+        let filled = carry + read;
+        if buf[..filled].windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+        carry = (needle.len() - 1).min(filled);
+        buf.copy_within(filled - carry..filled, 0);
+    }
+}
+
+/// 问用户目录副本「你是什么版本」。先做无副作用的能力探测，再执行 `--version`。
+/// 返回 `None` = 副本不认识 `--version`（老版本）、执行失败、或输出不是合法 semver。
+#[cfg(target_os = "linux")]
+fn user_copy_version(target: &std::path::Path) -> Option<String> {
+    if !has_version_support(target) {
+        return None;
+    }
+    let out = std::process::Command::new(target)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let ver = raw.trim();
+    if semver::Version::parse(ver).is_err() {
+        return None;
+    }
+    Some(ver.to_string())
+}
+
+/// 是否要用当前这份二进制覆盖 `~/.local/bin` 里的旧副本。
+///
+/// - 副本比当前**旧** → 覆盖。用户刚装了新包（例如 deb 0.1.1），不该被上次迁移留下的
+///   老副本粘住——否则进程永远跑老版本，`check_for_update` 也永远拿老版本号去比。
+/// - 副本 **>= 当前** → 保留。副本可能是应用内自更新后的更新版本，不能降级。
+/// - 副本版本**未知**（连 `--version` 都不认识，或报出来的不是合法 semver）→ 覆盖。
+///   不支持 `--version` 的必然比当前这份老；报不出合法版本号的副本也不该拦着装新包。
+fn should_replace_user_copy(current: &str, copy_version: Option<&str>) -> bool {
+    match copy_version {
+        Some(v) if semver::Version::parse(v.trim_start_matches('v')).is_ok() => is_newer(current, v),
+        _ => true,
+    }
+}
+
+/// 原子替换用户目录副本：同目录写临时文件 → chmod 755 → rename 覆盖。
+/// 用 rename 而非直接 `copy` 覆盖：正在运行的旧副本持有旧 inode 不受影响；
+/// 中途失败也不会把正在使用的副本写成半截（直接覆盖会写坏它）。
+#[cfg(target_os = "linux")]
+fn replace_user_copy(src: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let tmp = target.with_file_name(format!("{BIN_NAME}.new"));
+    std::fs::copy(src, &tmp)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, target)
+}
+
 /// 仅 Linux 生效：Windows nsis 为 currentUser(用户目录、可写)无需迁移；
 /// macOS 是 .app bundle(Contents/MacOS/Resources 结构不能拆散)不能迁移。
 /// 由 `main()` 启动时最先调用；迁移后当前进程已被重新 exec(子进程 + 退出)。
@@ -203,7 +289,12 @@ pub fn relocate_to_user_dir() {
         target_exe.display()
     );
 
-    // 1) 复制自身(仅当目标不存在；已存在则保留用户目录那份——它才是自更新主体)。
+    // 1) 把自身同步到用户目录：
+    //    - 目标不存在 → 复制；
+    //    - 目标存在但**比当前这份旧** → 原子替换。以前这里无条件保留旧副本（注释说
+    //      「它才是自更新主体」），结果装上新包也照样跑着上次留下的老副本：进程一直
+    //      是老版本，`check_for_update` 也一直拿老版本号去比，永远不提示更新；
+    //    - 目标存在且不比当前旧 → 保留（可能是应用内自更新后的更新版本，不能降级）。
     if !target_exe.exists() {
         if std::fs::create_dir_all(&bin_dir).is_err() {
             tracing::warn!("[update] 无法创建 {}，跳过迁移", bin_dir.display());
@@ -215,6 +306,27 @@ pub fn relocate_to_user_dir() {
         }
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&target_exe, std::fs::Permissions::from_mode(0o755));
+    } else {
+        let copy_version = user_copy_version(&target_exe);
+        if should_replace_user_copy(CURRENT_VERSION, copy_version.as_deref()) {
+            match replace_user_copy(&exe, &target_exe) {
+                Ok(()) => tracing::info!(
+                    "[update] 用户目录副本版本 {} 低于当前 {}，已替换为当前版本",
+                    copy_version.as_deref().unwrap_or("未知(不支持 --version)"),
+                    CURRENT_VERSION
+                ),
+                Err(e) => tracing::warn!(
+                    "[update] 替换用户目录副本 {} 失败({e})，继续用旧副本运行",
+                    target_exe.display()
+                ),
+            }
+        } else {
+            tracing::info!(
+                "[update] 用户目录副本 {} 不低于当前 {}，保留（可能是自更新后的更新版本）",
+                copy_version.as_deref().unwrap_or("未知"),
+                CURRENT_VERSION
+            );
+        }
     }
 
     // 2) 复制 ONNX Runtime provider 库(cuda + shared)到 ~/.local/lib/screenshot-rs/。
@@ -292,6 +404,50 @@ fn neutralize_proxy() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用户目录副本的替换决策：旧副本要换掉（否则装新包也被粘住、永不提示更新），
+    /// 同版本/更新版本要保留（自更新产物不能降级），问不出版本的老副本当作旧的处理。
+    #[test]
+    fn user_copy_replacement_decision() {
+        // 副本旧（0.1.0 副本 vs 当前 0.1.1）→ 换
+        assert!(should_replace_user_copy("0.1.1", Some("0.1.0")));
+        // 副本不认识 --version（老版本）→ 换
+        assert!(should_replace_user_copy("0.1.1", None));
+        // 同版本 → 保留
+        assert!(!should_replace_user_copy("0.1.1", Some("0.1.1")));
+        // 副本更新（应用内自更新到 0.2.0）→ 保留，绝不降级
+        assert!(!should_replace_user_copy("0.1.1", Some("0.2.0")));
+        // 非 semver 的副本版本串 → 当作未知 → 换（不 panic）
+        assert!(should_replace_user_copy("0.1.1", Some("garbage")));
+    }
+
+    /// 能力探针扫描：含标记的文件判为支持 `--version`；标记**骑在分块边界上**也要命中
+    /// （这是分块扫描最容易写错的地方，用 1MB 边界上下的位置钉住）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_query_marker_scan_across_chunk_boundary() {
+        let dir = std::env::temp_dir().join(format!("screenshot-rs-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 标记起点落在第一个 1MB 分块的最后 5 字节里：跨块匹配
+        let mut bytes = vec![b'.'; (1 << 20) - 5];
+        bytes.extend_from_slice(VERSION_QUERY_MARKER.as_bytes());
+        bytes.extend_from_slice(b"...tail");
+        let hit = dir.join("with-marker");
+        std::fs::write(&hit, &bytes).unwrap();
+        assert!(has_version_support(&hit), "跨块边界的标记应命中");
+
+        let miss = dir.join("without-marker");
+        std::fs::write(&miss, b"no marker in here").unwrap();
+        assert!(!has_version_support(&miss));
+        // 不存在的文件 / 空文件都不能 panic
+        assert!(!has_version_support(&dir.join("nonexistent")));
+        let empty = dir.join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!has_version_support(&empty));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn newer_when_latest_greater() {
