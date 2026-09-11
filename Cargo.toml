@@ -1,6 +1,6 @@
 [package]
 name = "screenshot-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Cross-platform screenshot tool built with GPUI"
 license = "MIT"
