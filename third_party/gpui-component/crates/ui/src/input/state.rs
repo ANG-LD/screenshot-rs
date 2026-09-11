@@ -372,6 +372,10 @@ pub struct InputState {
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
     pub(super) soft_wrap: bool,
+    /// 是否显示编辑器自带滚动条（*本项目补丁*，默认 `true`）。
+    /// 截图工具浮层里的内联文本框设为 `false`：框体随文字自动扩宽，
+    /// 滚动条只在光标移动/换行时闪一下，纯干扰。
+    pub(super) editor_scrollbar: bool,
     /// See [`Self::scroll_beyond_last_line`].
     pub(super) scroll_beyond_last_line: Option<usize>,
     /// See [`Self::cursor_surrounding_lines`].
@@ -502,6 +506,7 @@ impl InputState {
             clean_on_escape: false,
             submit_on_enter: false,
             soft_wrap: true,
+            editor_scrollbar: true,
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             show_whitespaces: false,
@@ -949,6 +954,16 @@ impl InputState {
     pub fn soft_wrap(mut self, wrap: bool) -> Self {
         debug_assert!(self.mode.is_multi_line());
         self.soft_wrap = wrap;
+        self
+    }
+
+    /// 是否显示编辑器自带的滚动条，默认显示（*本项目补丁*）。
+    ///
+    /// 关掉后 `EditorScrollbar` 不再绘制（也不响应拖动）——用于截图浮层里
+    /// 的内联文本框：它跟着文字自动扩宽，光是光标移动就会让滚动条闪现。
+    /// 光标跟随滚动本身不受影响，只是没有滚动条可见。
+    pub fn editor_scrollbar(mut self, show: bool) -> Self {
+        self.editor_scrollbar = show;
         self
     }
 

@@ -28,7 +28,8 @@ pub const APP_ICON_PREFIX: &str = "app-icons/";
 
 /// 项目自带图标路径常量（`Icon::empty().path(...)` 用）
 pub mod icons {
-    /// 矩形工具
+    /// 矩形工具；固定窗标题栏的「放大（最大化）」按钮复用同一「口」字形
+    /// （要单独换字形时再拆成两个文件即可）
     pub const SQUARE: &str = "app-icons/square.svg";
     /// 椭圆工具
     pub const CIRCLE: &str = "app-icons/circle.svg";
@@ -66,6 +67,8 @@ pub mod icons {
     pub const ZAP: &str = "app-icons/zap.svg";
     /// 保存图片
     pub const IMAGE_DOWN: &str = "app-icons/image-down.svg";
+    /// 窗口最小化（固定窗标题栏的「缩小」按钮）
+    pub const MINUS: &str = "app-icons/minus.svg";
 }
 
 /// 登记表：`资源路径常量 => 磁盘文件（相对本文件）`
@@ -108,6 +111,7 @@ icon_table! {
     icons::GAUGE => "gauge.svg",
     icons::ZAP => "zap.svg",
     icons::IMAGE_DOWN => "image-down.svg",
+    icons::MINUS => "minus.svg",
 }
 
 /// 应用资源源：项目自带图标 + gpui-component 内置图标

@@ -151,6 +151,11 @@ impl Element for EditorScrollbar {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let state = self.state.read(cx);
+        // 本项目补丁：内联文本框可以关掉滚动条（`InputState::editor_scrollbar(false)`），
+        // 此时整条滚动条元素不绘制、也不登记拖动/悬停命中。
+        if !state.editor_scrollbar {
+            return None;
+        }
         let Some(snapshot) = state.editor_scrollbar_snapshot.get() else {
             return None;
         };

@@ -820,6 +820,11 @@ impl OverlayView {
                 .placeholder("")
                 .auto_grow(1, 8)
                 .soft_wrap(false)
+                // 关掉编辑器自带滚动条：框体随文字自动扩宽，但 soft_wrap(false)
+                // 下编辑器只要有**任何**方向的滚动（换行/光标移动/IME 合成）就会
+                // 闪出**横向**滚动条（gpui-component 里 !soft_wrap 时固定用横向条），
+                // 在这么小的浮层框里纯属干扰。光标跟随滚动本身不受影响。
+                .editor_scrollbar(false)
         });
         // 预填旧内容（重新编辑场景）：直接移交所有权，避免 clone。
         // 先重新借用 window，使 move 闭包只捕获该借用而非整个 &mut Window，
@@ -1078,6 +1083,49 @@ impl OverlayView {
 
 /// handle 视觉尺寸：边长（像素）
 const HANDLE_VISUAL_SIZE: f32 = 8.0;
+/// 角手柄视觉直径（正圆）
+const HANDLE_CORNER: f32 = 9.0;
+/// 边手柄视觉长边（细胶囊）
+const HANDLE_EDGE_LONG: f32 = 14.0;
+/// 边手柄视觉短边（细胶囊）
+const HANDLE_EDGE_THIN: f32 = 4.0;
+
+/// 单个手柄的视觉尺寸 (宽, 高)，索引顺序与 `Bounds::handle_positions()` 一致：
+/// 0 TL / 1 T / 2 TR / 3 L / 4 R / 5 BL / 6 B / 7 BR。
+/// 上/下边给横胶囊、左/右边给竖胶囊、四角给圆点（圆点=宽高相等的圆角 quad）。
+fn handle_visual_size(i: usize) -> (f32, f32) {
+    match i {
+        1 | 6 => (HANDLE_EDGE_LONG, HANDLE_EDGE_THIN),
+        3 | 4 => (HANDLE_EDGE_THIN, HANDLE_EDGE_LONG),
+        _ => (HANDLE_CORNER, HANDLE_CORNER),
+    }
+}
+
+/// 画 8 个缩放/拖动手柄：**四角圆点 + 四边细胶囊**（白填充 + 主题强调色描边）。
+///
+/// 取代原来「8 个 8×8 小白方块」：方块压在截图上笨重、直角也和圆角边框不搭。
+/// 位置仍取 `bounds.handle_positions()`（顺序 TL/T/TR/L/R/BL/B/BR），中心落在
+/// 边框线上；命中容差由 `HANDLE_HIT_HALF` / `HANDLE_HALF_SIZE` 独立判定，不受
+/// 视觉尺寸影响（视觉可以更小更精致，命中区保持好点）。
+fn paint_handles(window: &mut Window, bounds: ub::Bounds) {
+    let fill = Hsla::from(rgba(0xFFFFFFF2));
+    let border = Hsla::from(rgba(theme::tokens::ACCENT));
+    for (i, hp) in bounds.handle_positions().iter().enumerate() {
+        let (w, h) = handle_visual_size(i);
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(px(hp.x - w / 2.0), px(hp.y - h / 2.0)),
+                size: Size::new(px(w), px(h)),
+            },
+            // 半径取短边一半：角上是正圆，边上正好是胶囊
+            px(w.min(h) / 2.0),
+            fill,
+            px(1.0),
+            border,
+            Default::default(),
+        ));
+    }
+}
 /// handle 命中容差的一半（与 selection::HANDLE_HALF_SIZE 保持一致）
 const HANDLE_HIT_HALF: f32 = 8.0;
 
@@ -2611,15 +2659,15 @@ fn make_resize_handle(
         TextDragMode::ResizeW | TextDragMode::ResizeE => gpui::CursorStyle::ResizeLeftRight,
         _ => gpui::CursorStyle::Arrow,
     };
+    // 命中区**只**负责收鼠标（cursor + on_mouse_down）：观感统一由 canvas 的
+    // `paint_handles` 画（圆点 + 胶囊）。元素层再画一遍方块会和 canvas 的圆点
+    // 重叠出双重边缘，看着脏——之前两处都在画。
     div()
         .id(id)
         .absolute()
         .top(px(top))
         .left(px(left))
         .size(px(HANDLE_VISUAL_SIZE))
-        .bg(gpui::rgba(0xFFFFFFFF))
-        .border_1()
-        .border_color(gpui::rgba(0x0066CCFF))
         .cursor(cursor)
         .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev, window, cx| {
             begin_text_drag(this, mode, ev, window, cx);
@@ -3630,10 +3678,6 @@ impl Render for OverlayView {
                     // 2.6) 在选中的已绘制命令上渲染拖拽手柄
                     if let Some(vidx) = sel_visible_idx {
                         if let Some(cmd) = visible_cmds.get(vidx).map(|c| &**c) {
-                            let handle_fill = Hsla::from(rgba(0xFFFFFFFF));
-                            let handle_border = Hsla::from(rgba(0x0066CCFF));
-                            let half = px(HANDLE_VISUAL_SIZE / 2.0);
-                            let edge = px(HANDLE_VISUAL_SIZE);
                             match cmd {
                                 DrawCommand::Rectangle { rect, .. }
                                 | DrawCommand::Ellipse { rect, .. } => {
@@ -3643,31 +3687,24 @@ impl Render for OverlayView {
                                         ub::Point::new(a.x.min(b.x), a.y.min(b.y)),
                                         ub::Point::new(a.x.max(b.x), a.y.max(b.y)),
                                     );
-                                    for hp in bounds.handle_positions() {
-                                        window.paint_quad(quad(
-                                            Bounds {
-                                                origin: point(px(hp.x) - half, px(hp.y) - half),
-                                                size: Size::new(edge, edge),
-                                            },
-                                            px(0.),
-                                            handle_fill,
-                                            px(1.0),
-                                            handle_border,
-                                            Default::default(),
-                                        ));
-                                    }
+                                    paint_handles(window, bounds);
                                 }
                                 DrawCommand::Arrow { from, to, .. } => {
+                                    // 箭头两端是「端点」而非边框角：一律用圆点样式，
+                                    // 与四角手柄观感一致。
                                     for pt in &[from, to] {
                                         window.paint_quad(quad(
                                             Bounds {
-                                                origin: point(px(pt.x) - half, px(pt.y) - half),
-                                                size: Size::new(edge, edge),
+                                                origin: point(
+                                                    px(pt.x - HANDLE_CORNER / 2.0),
+                                                    px(pt.y - HANDLE_CORNER / 2.0),
+                                                ),
+                                                size: Size::new(px(HANDLE_CORNER), px(HANDLE_CORNER)),
                                             },
-                                            px(0.),
-                                            handle_fill,
+                                            px(HANDLE_CORNER / 2.0),
+                                            Hsla::from(rgba(0xFFFFFFF2)),
                                             px(1.0),
-                                            handle_border,
+                                            Hsla::from(rgba(theme::tokens::ACCENT)),
                                             Default::default(),
                                         ));
                                     }
@@ -3729,30 +3766,15 @@ impl Render for OverlayView {
                         Default::default(),
                     ));
 
-                    // 4) Editing 模式下额外画 8 个 handle（小白方 + 蓝边）
+                    // 4) Editing 模式下额外画 8 个 handle（圆点 + 胶囊，见 paint_handles）
                     if mode == OverlayMode::Editing {
-                        let handle_fill = Hsla::from(rgba(0xFFFFFFFFu32));
-                        let handle_border = Hsla::from(rgba(0x0066CCFFu32));
-                        let half = px(HANDLE_VISUAL_SIZE / 2.0);
-                        let edge = px(HANDLE_VISUAL_SIZE);
-                        for hp in sel.handle_positions() {
-                            window.paint_quad(quad(
-                                Bounds {
-                                    origin: point(px(hp.x) - half, px(hp.y) - half),
-                                    size: Size::new(edge, edge),
-                                },
-                                px(0.),
-                                handle_fill,
-                                px(1.0),
-                                handle_border,
-                                Default::default(),
-                            ));
-                        }
+                        paint_handles(window, sel);
                     }
 
-                    // 4.5) 文字框编辑态：灰色边框 + 8 个手柄（与矩形选中框同款）。
-                    // 直接画在 canvas 层（元素层 div 的 border/手柄可能被裁剪或遮挡），
-                    // 保证四边灰色边框、8 个手柄都居中在边框线上且一定可见。
+                    // 4.5) 文字框编辑态：圆角强调色描边 + 8 个手柄（与选区/形状手柄
+                    // 同款：四角圆点、四边细胶囊）。
+                    // 画在 canvas 层而不是元素层：元素层的 div 边框/手柄会和这里的
+                    // 描边、手柄重叠成双层边，且可能被裁剪或遮挡。
                     if text_editing {
                         let tr = text_input_rect;
                         let tx = px(tr.origin.x);
@@ -3775,43 +3797,19 @@ impl Render for OverlayView {
                         let ty = px(tr.origin.y);
                         let tw = px(tr.size.x.max(1.0));
                         let th = px(tr.size.y.max(1.0));
-                        let gray = Hsla::from(rgba(0x999999FF));
-                        let clear = gpui::transparent_black();
-                        // 四条 1px 灰色边框线
+                        // 边框：单圈圆角描边（原来是四条 1px 灰线，直角、发闷）。
+                        // 半径与上面的编辑态背景用同一份，边框和背景不会错位。
+                        let radius = px((tr.size.x.min(tr.size.y).max(1.0) * 0.08).max(2.0));
                         window.paint_quad(quad(
-                            Bounds { origin: point(tx, ty), size: Size::new(tw, px(1.0)) },
-                            px(0.), gray, px(0.), clear, Default::default(),
+                            Bounds { origin: point(tx, ty), size: Size::new(tw, th) },
+                            radius,
+                            gpui::transparent_black(),
+                            px(1.5),
+                            Hsla::from(rgba(theme::tokens::ACCENT)),
+                            Default::default(),
                         ));
-                        window.paint_quad(quad(
-                            Bounds { origin: point(tx, ty + th - px(1.0)), size: Size::new(tw, px(1.0)) },
-                            px(0.), gray, px(0.), clear, Default::default(),
-                        ));
-                        window.paint_quad(quad(
-                            Bounds { origin: point(tx, ty), size: Size::new(px(1.0), th) },
-                            px(0.), gray, px(0.), clear, Default::default(),
-                        ));
-                        window.paint_quad(quad(
-                            Bounds { origin: point(tx + tw - px(1.0), ty), size: Size::new(px(1.0), th) },
-                            px(0.), gray, px(0.), clear, Default::default(),
-                        ));
-                        // 8 个手柄
-                        let handle_fill = Hsla::from(rgba(0xFFFFFFFFu32));
-                        let handle_border = Hsla::from(rgba(0x0066CCFFu32));
-                        let half = px(HANDLE_VISUAL_SIZE / 2.0);
-                        let edge = px(HANDLE_VISUAL_SIZE);
-                        for hp in tr.handle_positions() {
-                            window.paint_quad(quad(
-                                Bounds {
-                                    origin: point(px(hp.x) - half, px(hp.y) - half),
-                                    size: Size::new(edge, edge),
-                                },
-                                px(0.),
-                                handle_fill,
-                                px(1.0),
-                                handle_border,
-                                Default::default(),
-                            ));
-                        }
+                        // 8 个手柄（圆点 + 胶囊，与选区/形状手柄同款）
+                        paint_handles(window, tr);
                     }
                 } else {
                     // 没选区：整屏 dim（提示用户拖拽）
@@ -3947,9 +3945,9 @@ impl Render for OverlayView {
                                         .line_height(gpui::relative(1.5)),
                                 ),
                         )
-                        // 四条单实线边框（1px，覆盖在 Input 边缘之上），同时也是移动
-                        // 抓取区：悬停四条边任意位置显示小手，按住即可拖动整框。
-                        // （Input 自身不再画边框，避免双线。）
+                        // 四条边是**移动抓取区**（6px 宽，悬停变小手、按住拖整框）：
+                        // 只做命中，不画边框——边框由 canvas 画一圈圆角描边，避免
+                        // 元素层的直角线和 canvas 的圆角线重叠成双层边框。
                         .child(
                             div()
                                 .id("text-move-top")
@@ -3958,8 +3956,6 @@ impl Render for OverlayView {
                                 .left(px(0.0))
                                 .w(px(lw))
                                 .h(px(h_size))
-                                .border_t_1()
-                                .border_color(gpui::rgba(0x999999FF))
                                 .cursor(gpui::CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
                                     begin_text_drag(this, TextDragMode::Move, ev, window, cx);
@@ -3973,8 +3969,6 @@ impl Render for OverlayView {
                                 .left(px(0.0))
                                 .w(px(lw))
                                 .h(px(h_size))
-                                .border_b_1()
-                                .border_color(gpui::rgba(0x999999FF))
                                 .cursor(gpui::CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
                                     begin_text_drag(this, TextDragMode::Move, ev, window, cx);
@@ -3988,8 +3982,6 @@ impl Render for OverlayView {
                                 .left(px(0.0))
                                 .w(px(h_size))
                                 .h(px(lh))
-                                .border_l_1()
-                                .border_color(gpui::rgba(0x999999FF))
                                 .cursor(gpui::CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
                                     begin_text_drag(this, TextDragMode::Move, ev, window, cx);
@@ -4003,8 +3995,6 @@ impl Render for OverlayView {
                                 .left(px(lw - h_size))
                                 .w(px(h_size))
                                 .h(px(lh))
-                                .border_r_1()
-                                .border_color(gpui::rgba(0x999999FF))
                                 .cursor(gpui::CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {
                                     begin_text_drag(this, TextDragMode::Move, ev, window, cx);
@@ -4791,9 +4781,12 @@ impl Render for PinWindowView {
                             ),
                     )
                     // 右侧：最小化 / 最大化 / 关闭
+                    // 图标用「-」和「口」的窗口控制字形（与系统/组件标题栏一致），
+                    // 不用 Lucide 的 minimize-2 / maximize-2（两个斜向箭头，容易被
+                    // 当成「缩到角落」「放大图片」而不是窗口最小化/最大化）。
                     .child(pin_title_button(
                         "pin-minimize",
-                        Icon::new(IconName::Minimize),
+                        Icon::empty().path(crate::assets::icons::MINUS),
                         PinBtnTone::Neutral,
                         "最小化",
                         move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
@@ -4803,7 +4796,8 @@ impl Render for PinWindowView {
                     ))
                     .child(pin_title_button(
                         "pin-maximize",
-                        Icon::new(IconName::Maximize),
+                        // 「口」= 组件内置矩形工具的同一字形（方形描边）
+                        Icon::empty().path(crate::assets::icons::SQUARE),
                         PinBtnTone::Neutral,
                         "最大化",
                         move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
@@ -7383,6 +7377,42 @@ fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 手柄样式必须落在正确的位置上：上下边才是横胶囊、左右边才是竖胶囊、四角
+    /// 必须是圆点。`handle_positions()` 的顺序一旦变化，这里先炸——而不是等用户
+    /// 看到「角上横着一个胶囊」。
+    #[test]
+    fn handle_visual_sizes_match_positions() {
+        let b = ub::Bounds::new(
+            BoundsPoint::new(10.0, 20.0),
+            BoundsPoint::new(110.0, 70.0),
+        );
+        let (l, t) = (b.origin.x, b.origin.y);
+        let (r, bo) = (b.origin.x + b.size.x, b.origin.y + b.size.y);
+        let (mid_x, mid_y) = ((l + r) / 2.0, (t + bo) / 2.0);
+        for (i, p) in b.handle_positions().iter().enumerate() {
+            let (w, h) = handle_visual_size(i);
+            let on_top_bottom = ((p.y - t).abs() < 0.01 || (p.y - bo).abs() < 0.01)
+                && (p.x - mid_x).abs() < 0.01;
+            let on_left_right = ((p.x - l).abs() < 0.01 || (p.x - r).abs() < 0.01)
+                && (p.y - mid_y).abs() < 0.01;
+            if on_top_bottom {
+                assert!(w > h, "上/下边应是横胶囊, idx={i} size=({w},{h})");
+            } else if on_left_right {
+                assert!(h > w, "左/右边应是竖胶囊, idx={i} size=({w},{h})");
+            } else {
+                assert_eq!(
+                    (w, h),
+                    (HANDLE_CORNER, HANDLE_CORNER),
+                    "四角应是圆点, idx={i}"
+                );
+            }
+            // 圆点必须真的是圆：半径取短边一半由 paint_handles 保证，这里锁住尺寸
+            if w == h {
+                assert_eq!(w, HANDLE_CORNER);
+            }
+        }
+    }
 
     #[test]
     fn text_move_down_keeps_size_and_clamps_to_selection() {
