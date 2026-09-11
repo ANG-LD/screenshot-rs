@@ -145,16 +145,23 @@ const TRULY_STATIC_MIN: u64 = 12;
 const LARGE_S_MAX_STATIC_UNALIGNED: u64 = 30;
 /// 判定「大偏移」的行数占比：s 超过半屏即视为大偏移（周期性内容容易在此出现假峰）。
 const LARGE_S_FRACTION: u64 = 2;
-/// 手动模式取首帧前的稳定等待：连续两帧 max_frame_diff ≤ 此值视为屏幕已静止。
-/// 遮罩关闭/进度窗出现的过渡期帧差异大，直接取首帧会让 find_scroll_delta 误报
-/// 大滚动量（空白自相似）→ 重复拼接。
-const STARTUP_STABLE_DIFF: u8 = 16;
 /// 稳定等待每轮的间隔
 const STARTUP_STABLE_POLL: Duration = Duration::from_millis(50);
 /// 稳定等待的最大轮数（50ms×10 ≈ 0.5s；超时用最近一帧兜底，不强求静止）
-const STARTUP_STABLE_ATTEMPTS: usize = 10;
+const STARTUP_STABLE_ATTEMPTS: usize = 20;
+/// 首帧「真静止」需要连续多少帧逐字节相同（见 `run_manual_scroll_capture` 首帧逻辑）
+const STARTUP_STABLE_REPEATS: usize = 2;
 /// 手动模式最大迭代次数（50ms × 20k ≈ 16 分钟，纯兜底；正常由用户点「完成」结束）
 const MAX_MANUAL_ITERS: usize = 20_000;
+/// 手动模式「高置信优先」的等待时长：这段时间内只接受高置信（静止帧、逐字节对齐）
+/// 的拼接结果；超时才放开为宽判据。
+///
+/// 用**时长**而不是轮数：一轮的耗时取决于抓帧速度（轮询 12ms + 抓帧 20~40ms），
+/// 用轮数会让策略随机器性能漂移。700ms 覆盖一次 Chrome 平滑滚动动画（~250ms）
+/// 加下一格的静止段：动画结束后的静止帧必然是高置信的，接缝能逐像素对齐；
+/// 用户若一直快速滚动（700ms 内都没有静止帧），才放开兜底——宁可接缝差 1~2 行，
+/// 也不能整段丢内容。
+const EXACT_WAIT: Duration = Duration::from_millis(700);
 
 /// 滚动期间进度窗口的显示/隐藏回调（由调用方经 OverlayService 注入）
 pub trait ScrollProgress: Send + Sync {
@@ -388,36 +395,44 @@ pub fn run_scroll_capture(
                 break;
             }
 
-            let mut delta = stitch::find_scroll_delta(&a, &b);
+            // 优先用精层判定滚动量（整行哈希 + 固定栏识别）：比 8 列采样签名更准，
+            // 同时给出固定底栏行数（追加时排除，避免每帧把页脚复制进长图）。
+            let mut plan = stitch::plan_append(&a, &b);
             // 内容在变动但检测失败（平滑滚动动画未结束）→ 多等一次重抓同一内容
-            if delta.is_none() && frames_differ(&a, &b) {
+            if plan.is_none() && frames_differ(&a, &b) {
                 std::thread::sleep(EXTRA_SETTLE);
                 if let Ok(b2) = capture.capture_area(x, y, w, h) {
                     if b2.width == a.width && b2.height == a.height {
-                        delta = stitch::find_scroll_delta(&a, &b2);
+                        plan = stitch::plan_append(&a, &b2);
                         b = b2;
                     }
                 }
             }
 
-            match delta {
-                Some(s) if s >= MIN_SCROLL => {
-                    // 拼接 b 底部新进入视口的 s 行。
-                    // 空白段刚过时基线可能局部均匀，但 find_scroll_delta 能返回 Some
-                    // 说明重叠带已通过 band_has_energy + 匹配行数验证（纯空白基线
-                    // 会因能量门返回 None）；若因此丢弃 delta，会把真实滚动量白白丢掉。
+            match plan {
+                Some(p) if p.s >= MIN_SCROLL => {
+                    // 拼接 b 底部新进入视口的 p.s 行（固定底栏由 p.band 排除）。
+                    // 空白段刚过时基线可能局部均匀，但精层/粗层能给出偏移就说明重叠带
+                    // 已通过校验（纯空白基线会因能量门返回 None）；丢弃它会白白丢掉真实滚动量。
                     let after_blank = blank_streak > 0;
-                    // 校准每 tick 像素：本轮注入 ticks 格、浏览器滚动了 s 像素。
-                    let per = s as f64 / ticks.max(1) as f64;
+                    // 校准每 tick 像素：本轮注入 ticks 格、浏览器滚动了 p.s 像素。
+                    let per = p.s as f64 / ticks.max(1) as f64;
                     px_per_tick = if px_per_tick <= 0.0 {
                         per
                     } else {
                         px_per_tick * 0.8 + per * 0.2
                     };
-                    let append_off = (b.height as usize - s) * frame_w as usize * 4;
-                    if append_off < b.pixels.len() {
-                        stitched.extend_from_slice(&b.pixels[append_off..]);
-                        stitched_h += s as u32;
+                    if append_new_rows(
+                        &mut stitched,
+                        &mut stitched_h,
+                        &a,
+                        &b,
+                        frame_w,
+                        p.s,
+                        p.band,
+                    )
+                    .is_some()
+                    {
                         progress_h.store(stitched_h, Ordering::Relaxed);
                     }
                     a = b;
@@ -425,7 +440,12 @@ pub fn run_scroll_capture(
                     blank_streak = 0;
                     ticks = TICKS_PER_ITER;
                     tracing::info!(
-                        "[scroll] iter={iter} delta={s} ticks={ticks} stitched_h={stitched_h} after_blank={after_blank}"
+                        "[scroll] iter={iter} delta={} band={} exact={}‰{} via_exact={} ticks={ticks} stitched_h={stitched_h} after_blank={after_blank}",
+                        p.s,
+                        p.band,
+                        p.permille,
+                        p.exact,
+                        p.via_exact
                     );
                 }
                 Some(_) => {
@@ -444,7 +464,7 @@ pub fn run_scroll_capture(
                     // 这是「滚动只拼一页」之外内容缺失的直接原因），再减半步长，让
                     // 下一轮的滚动量更小、重叠带更大、更容易被严格检测测出。
                     if let Some(s) =
-                        try_append_scrolled(&a, &b, frame_w, &mut stitched, &mut stitched_h)
+                        try_append_scrolled(&a, &b, frame_w, &mut stitched, &mut stitched_h, false)
                     {
                         progress_h.store(stitched_h, Ordering::Relaxed);
                         if ticks > 1 {
@@ -483,7 +503,14 @@ pub fn run_scroll_capture(
                     // 「真动了」 vs 静止/闪烁），成功即拼接续滚，避免一页。
                     if energy >= TEXTURED_ENERGY && !fd {
                         if let Some(s) =
-                            try_append_scrolled(&a, &b, frame_w, &mut stitched, &mut stitched_h)
+                            try_append_scrolled(
+                                &a,
+                                &b,
+                                frame_w,
+                                &mut stitched,
+                                &mut stitched_h,
+                                false,
+                            )
                         {
                             a = b;
                             streak = 0;
@@ -649,7 +676,14 @@ pub fn run_scroll_capture(
                                 // 移进来的这段拼上，避免「只拼一页」时丢掉 relocate 滚过
                                 // 的那几十行。
                                 if let Some(s) =
-                                    try_append_scrolled(&a, &b, frame_w, &mut stitched, &mut stitched_h)
+                                    try_append_scrolled(
+                                        &a,
+                                        &b,
+                                        frame_w,
+                                        &mut stitched,
+                                        &mut stitched_h,
+                                        false,
+                                    )
                                 {
                                     progress_h.store(stitched_h, Ordering::Relaxed);
                                     tracing::info!(
@@ -774,10 +808,15 @@ pub fn run_manual_scroll_capture(
 
     // 内部闭包包住主循环：任何 `?` 提前退出，外层都统一 hide 进度窗。
     let result = (|| -> AppResult<Option<CapturedFrame>> {
-        // 首帧等画面稳定后再取：遮罩关闭 / 进度窗出现的过渡期，画面轻微变化会被
-        // find_scroll_delta 因「空白自相似」误判成最大滚动量（如 300）→ 重复拼接。
-        // 连续两帧几乎相同（max_frame_diff ≤ 阈值）才算稳定；超时则用最近一帧兜底。
+        // 首帧必须是**真静止**帧（连续 `STARTUP_STABLE_REPEATS` 帧逐字节相同）。
+        //
+        // 为什么不能用「变化小于阈值」判静止：平滑滚动的缓出尾段每帧只差几个像素
+        // （frac=0.99 时每通道差 ≤1），阈值判据会把这种**亚像素混合帧**当首帧收下。
+        // 混合帧按任何整数行偏移都对不齐（整行哈希永远不相等）→ 整场都测不出滚动量，
+        // 最后只能退回粗估拼接 → 接缝错位（用户反馈的「第一页尾行和第二页首行对不上」）。
+        // 真正静止的画面是逐字节相同的，等它出现即可；超时才用最近一帧兜底。
         let mut a = capture.capture_area(x, y, w, h)?;
+        let mut stable = 0usize;
         for _ in 0..STARTUP_STABLE_ATTEMPTS {
             std::thread::sleep(STARTUP_STABLE_POLL);
             let Ok(f) = capture.capture_area(x, y, w, h) else {
@@ -785,13 +824,19 @@ pub fn run_manual_scroll_capture(
             };
             if f.width != a.width || f.height != a.height {
                 a = f;
-                break;
+                stable = 0;
+                continue;
             }
-            if max_frame_diff(&a, &f) <= STARTUP_STABLE_DIFF {
+            if max_frame_diff(&a, &f) == 0 {
+                stable += 1;
                 a = f;
-                break; // 屏幕已静止
+                if stable >= STARTUP_STABLE_REPEATS {
+                    break; // 画面真的静止了
+                }
+            } else {
+                stable = 0;
+                a = f;
             }
-            a = f;
         }
         let frame_w = a.width;
         // 预留容量：初始一帧 + 一帧续接余量（2x），减少长滚动下 stitched 反复扩容重分配。
@@ -813,6 +858,8 @@ pub fn run_manual_scroll_capture(
         // 按钮会灰-亮高频闪烁。这里要求连续 MOVING_DEBOUNCE 帧同向才更新 moving。
         let mut moving_latched = false;
         let mut moving_same = 0u32;
+        // 「高置信优先」：截止时刻之前只接受高置信结果；每次成功拼接后重新计时
+        let mut strict_until = std::time::Instant::now() + EXACT_WAIT;
 
         for iter in 0..MAX_MANUAL_ITERS {
             if cancel.load(Ordering::Relaxed) {
@@ -855,82 +902,54 @@ pub fn run_manual_scroll_capture(
             // 最近一帧底部是否还有内容：点「完成」时据此决定是否先弹确认
             bottom_has_content.store(frame_bottom_has_content(&b), Ordering::Relaxed);
 
-            // 优先尝试重叠检测：只要帧的重叠**可靠**（find_scroll_delta 返回可信 s），
-            // 就立即拼接——**含动画中间帧**。虚拟表格（vxe-table）平滑滚动是连续动画，
-            // 若只等「静止帧」再拼，连续滚动会让引擎攒一个大跳跃（如 iter21 s=187）才
-            // 抓一帧，中间行已被虚拟化滚过、没渲染 → 直接拼接就缺内容（长图跳号）。
-            //
-            // 这里改成**逐帧连续拼接**：滚动过程中每个可靠中间增量帧都拼一小段，更新
-            // anchor 后继续，把整段动画逐步衔接，不留缺口。**安全网**：模糊/不可靠的
-            // 帧（find_scroll_delta 返回 None）仍落下方「等静止重抓」分支精确处理；且
-            // try_append_scrolled 内部有 frames_differ / best_pixel_offset 的相对判据，
-            // 不会把静止帧或模糊帧误拼。is_moving（相邻帧在变）仍驱动「完成」按钮，
-            // 滚动停止后用户才能点完成。
-            if let Some(s) = stitch::find_scroll_delta(&anchor, &b) {
-                if s >= MIN_SCROLL {
-                    if let Some(s) =
-                        try_append_scrolled(&anchor, &b, frame_w, &mut stitched, &mut stitched_h)
-                    {
-                        progress_h.store(stitched_h, Ordering::Relaxed);
-                        tracing::info!(
-                            "[scroll-manual] iter={iter} append s={s} stitched_h={stitched_h} maxdiff={}",
-                            max_frame_diff(&anchor, &b)
-                        );
-                        anchor = Arc::new(b);
-                        prev = Some(anchor.clone());
-                        moving_frames = 0;
-                        continue;
-                    }
-                }
-                // delta 可信但重叠不可靠（模糊中间帧）或小滚动（< MIN_SCROLL）：
-                // 不拼，落检测失败分支（动画帧 → 等静止重抓；小滚动无害丢弃）。
+            // 拼接尝试（**精层优先**，每轮都问一次）：精层用整行哈希确认「内容确实
+            // 滚了、滚了多少」并识别固定底栏，因此比原先「先要求粗层 find_scroll_delta
+            // 成功才拼」更少漏拼（这是「只拼到第一页」的根因），也更少重复（周期假峰被
+            // 逐字节对齐 + 重复否决拦下）。判定不了（静止 / 动画模糊 / 疑似重复）→ None，
+            // 落到下面的分支继续等状态明确，宁缺毋滥。
+            let tolerant = std::time::Instant::now() >= strict_until;
+            if let Some(s) = try_append_scrolled(
+                &anchor,
+                &b,
+                frame_w,
+                &mut stitched,
+                &mut stitched_h,
+                !tolerant,
+            ) {
+                progress_h.store(stitched_h, Ordering::Relaxed);
                 tracing::info!(
-                    "[scroll-manual] iter={iter} delta={s} skip_anim_or_small maxdiff={} diff_prev={}",
-                    max_frame_diff(&anchor, &b),
-                    prev.as_ref().is_some_and(|p| frames_differ(p, &b)),
+                    "[scroll-manual] iter={iter} append s={s} stitched_h={stitched_h} maxdiff={}",
+                    max_frame_diff(&anchor, &b)
                 );
+                anchor = Arc::new(b);
+                prev = Some(anchor.clone());
+                moving_frames = 0;
+                strict_until = std::time::Instant::now() + EXACT_WAIT;
+                continue;
             }
 
             // 检测失败：区分「向上滚」「还在滚动动画中」「静止在新位置」
-            if stitch::find_scroll_delta(&b, &anchor).is_some() {
+            if stitch::scroll_up_delta(&b, &anchor).is_some() {
                 // 反向检测命中 → 用户向上滚了：保持 anchor 在最深基线不动，
                 // 之后滚回原位/继续向下时只追加超出当前拼接底部的真正新内容，
                 // 避免把已拼接的行重复拼进去
                 moving_frames = 0;
                 tracing::info!("[scroll-manual] iter={iter} scrolled_up keep_baseline");
             } else if prev.as_ref().is_some_and(|p| frames_differ(p, &b)) {
-                // 相邻帧仍在变化 → 平滑滚动动画进行中。12ms 轮询几乎总在动画中，
-                // 模糊帧测不出重叠 → 若直接丢段，长图中间缺内容。等动画落定后
-                // 重抓一帧再测：静止帧与旧 anchor 的重叠带逐像素一致 → 精确拼接。
-                // 注意等待要 > Chrome 平滑滚动时长（~300ms）：EXTRA_SETTLE(250ms)
-                // 单独不够，大滚动动画更长，重抓仍抓到模糊帧 → 丢段。补 SETTLE_DELAY。
+                // 相邻帧仍在变化 → 平滑滚动动画进行中。
+                //
+                // **这里绝不能 sleep**：原来等 EXTRA_SETTLE(250ms)+SETTLE_DELAY 再重抓，
+                // 而平滑滚动一格动画约 250ms、动画结束后的静止段只有 ~150ms——一睡就正好
+                // 跳过下一格唯一的静止帧，而静止帧是**唯一能逐字节对齐**的帧（模糊帧按任何
+                // 整数偏移都对不齐）。结果是整场都拿不到精确滚动量，最后只能用粗估拼，
+                // 接缝就错位。改成 12ms 快速轮询：动画一结束，下一轮循环顶部的精层拼接
+                // 立刻就能用静止帧拼上（对得上的帧自己会来）。
                 moving_frames += 1;
-                std::thread::sleep(EXTRA_SETTLE);
-                std::thread::sleep(SETTLE_DELAY);
-                let retried = capture.capture_area(x, y, w, h).ok().filter(|f| {
-                    f.width == anchor.width && f.height == anchor.height
-                });
-                if let Some(b2) = retried {
-                    if let Some(s) =
-                        try_append_scrolled(&anchor, &b2, frame_w, &mut stitched, &mut stitched_h)
-                    {
-                        progress_h.store(stitched_h, Ordering::Relaxed);
-                        tracing::info!(
-                            "[scroll-manual] iter={iter} append_after_settle s={s} stitched_h={stitched_h}"
-                        );
-                        anchor = Arc::new(b2);
-                        prev = Some(anchor.clone());
-                        moving_frames = 0;
-                        continue;
-                    }
-                    // 重抓仍测不出（严格+估计都失败，真无重叠）：用重抓帧继续走
-                    // 「静止在新位置/到底」分支
-                    tracing::info!(
-                        "[scroll-manual] iter={iter} retry_still_undetectable maxdiff={}",
-                        max_frame_diff(&anchor, &b2)
-                    );
-                }
-                tracing::info!("[scroll-manual] iter={iter} moving moving_frames={moving_frames}");
+                tracing::debug!(
+                    "[scroll-manual] iter={iter} animating moving_frames={moving_frames} maxdiff={}",
+                    max_frame_diff(&anchor, &b)
+                );
+                continue;
             } else if frames_differ(&anchor, &b)
                 || max_frame_diff(&anchor, &b) > CREDIBLE_DIFF
             {
@@ -957,6 +976,7 @@ pub fn run_manual_scroll_capture(
                                     frame_w,
                                     &mut stitched,
                                     &mut stitched_h,
+                                    !tolerant,
                                 ) {
                                     progress_h.store(stitched_h, Ordering::Relaxed);
                                     tracing::info!(
@@ -990,7 +1010,14 @@ pub fn run_manual_scroll_capture(
                 }
                 // 低能量兜底 + 正常纹理路径都到这里：优先宽松估计，避免丢段
                 if let Some(s) =
-                    try_append_scrolled(&anchor, &b, frame_w, &mut stitched, &mut stitched_h)
+                    try_append_scrolled(
+                        &anchor,
+                        &b,
+                        frame_w,
+                        &mut stitched,
+                        &mut stitched_h,
+                        !tolerant,
+                    )
                 {
                     progress_h.store(stitched_h, Ordering::Relaxed);
                     tracing::info!(
@@ -999,6 +1026,15 @@ pub fn run_manual_scroll_capture(
                     anchor = Arc::new(b);
                     prev = Some(anchor.clone());
                     moving_frames = 0;
+                    continue;
+                }
+                if !tolerant {
+                    // 严格模式：这只是「暂缓」（当前帧还没有高置信对齐），**绝不能**
+                    // 把基线跟到新位置——那等于把用户滚过的这一段直接丢掉，长图中间
+                    // 出现空档。保持 anchor，下一轮继续用静止帧试。
+                    tracing::debug!(
+                        "[scroll-manual] iter={iter} defer_keep_anchor energy={energy:.1} maxdiff={md}"
+                    );
                     continue;
                 }
                 anchor = Arc::new(b);
@@ -1099,6 +1135,77 @@ fn wait_for_new_content(
     false
 }
 
+/// 长图尾部是否正好是 anchor 的固定底栏。
+///
+/// 首帧是**整帧**拼入的，长图尾部因此残留着当时的固定底栏（页脚/分页栏）；
+/// 之后每拼一帧又只追加内容行，底栏就永久留在长图中间。检测到这种情形时先把
+/// 尾部这段底栏裁掉，长图回到「只存滚动内容」的不变式。
+fn stitched_tail_is_band(
+    stitched: &[u8],
+    frame_w: u32,
+    band: usize,
+    anchor: &CapturedFrame,
+) -> bool {
+    let w = frame_w as usize;
+    if band == 0 || w == 0 {
+        return false;
+    }
+    let need = band * w * 4;
+    if stitched.len() < need || anchor.pixels.len() < need {
+        return false;
+    }
+    let tail = &stitched[stitched.len() - need..];
+    let band_px = &anchor.pixels[anchor.pixels.len() - need..];
+    // 逐像素比 RGB（alpha 在截图里恒为 255，不参与）
+    tail.chunks_exact(4)
+        .zip(band_px.chunks_exact(4))
+        .all(|(x, y)| x[0] == y[0] && x[1] == y[1] && x[2] == y[2])
+}
+
+/// 把「本帧新进入视口的 s 行内容」追加到长图，并统一处理**固定底栏**。
+///
+/// 两处根因（用户反馈「拼接内容有重复 / 只有第一页」）都在这里收敛：
+/// 1. 固定底栏（页脚/分页栏等每帧同一位置重复出现的元素）不随内容滚动。按滚动量
+///    整段追加会把底栏一遍遍复制进长图；首帧整帧拼入的那份还会卡在长图中间。
+///    因此长图只保留滚动内容：先裁掉尾部残留的底栏，再追加帧里**底栏之上**的 s 行。
+/// 2. 帧高减去底栏后剩余的可用内容区不足以容纳一次可靠重叠时，调用方已退回
+///    band=0（见 `stitch::plan_append`），这里只做范围校验，绝不越界追加。
+///
+/// 返回实际追加的行数（= s）；无法追加返回 None（调用方保留基线等下一帧）。
+fn append_new_rows(
+    stitched: &mut Vec<u8>,
+    stitched_h: &mut u32,
+    anchor: &CapturedFrame,
+    frame: &CapturedFrame,
+    frame_w: u32,
+    s: usize,
+    band: usize,
+) -> Option<usize> {
+    let w = frame_w as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 || s < MIN_SCROLL {
+        return None;
+    }
+    let band = band.min(h.saturating_sub(stitch::MIN_OVERLAP + MIN_SCROLL));
+    if band > 0 && stitched_tail_is_band(stitched, frame_w, band, anchor) {
+        let cut = band * w * 4;
+        if stitched.len() >= cut {
+            stitched.truncate(stitched.len() - cut);
+            *stitched_h = stitched_h.saturating_sub(band as u32);
+            tracing::info!("[scroll] band_trim cut={band} stitched_h={stitched_h}");
+        }
+    }
+    let end = (h - band) * w * 4;
+    let start = end.checked_sub(s * w * 4)?;
+    if end > frame.pixels.len() || start >= end {
+        return None;
+    }
+    stitched.extend_from_slice(&frame.pixels[start..end]);
+    *stitched_h += s as u32;
+    Some(s)
+}
+
+
 /// 尝试把 `frame`（滚动后抓到的帧）相对 `anchor` 向下滚动后新进入视口的行拼到 `stitched`。
 ///
 /// 先走严格检测 [`stitch::find_scroll_delta`]（唯一性 + 匹配率验证，最可靠）；严格
@@ -1114,13 +1221,60 @@ fn try_append_scrolled(
     frame_w: u32,
     stitched: &mut Vec<u8>,
     stitched_h: &mut u32,
+    require_exact: bool,
 ) -> Option<usize> {
-    // 真实变化判据：整帧**未对齐**平均差（同一坐标 a vs b）。静止/闪烁帧（b≈a，
-    // 仅光标闪动）该值接近 0 → 是「被误取周期大偏移重复拼接」（iter14-37 s=630×N，
-    // iter82-84 s=585×3）的元凶，拒绝；真实滚动（内容整体移动、行数据不同）该值
-    // 偏高 → 放行。用 mean_unaligned_diff 而非 frames_differ：frames_differ（行匹配
-    // 比例）对 vxe-table 自相似行失效（真实小滚动也判 false → 丢段），这个均值差对
-    // 自相似内容依然能区分「真动了」与「几乎没变」。
+    // **精层（整行哈希逐字节对齐）先判**，再谈像素均值启发式。
+    //
+    // 顺序很重要：`mean_unaligned_diff` 是**全帧采样**均值，对**周期性内容**会被稀释——
+    // 表格行周期与滚动量成整数倍时，只有窄窄的「序号列」变了，均值差可能只有 3~5，
+    // 低于 TRULY_STATIC_MIN(12) 被误判成「没动」→ 整段不拼（长图只到第一页）。
+    // 而精层在有信息行上能拿到 1000‰ 命中，能正确量出真实滚动量。所以精层第一优先，
+    // 像素均值那道门只用来守下面的粗层/估计路径（它确实需要，见下）。
+    let plan = stitch::plan_append(anchor, frame);
+    if let Some(p) = plan.as_ref() {
+        // 精层确认的对齐（多数有信息行命中）：可信，直接拼
+        let exact_ok = p.via_exact && p.permille >= stitch::EXACT_PERMILLE_MIN;
+        if p.confident || (!require_exact && exact_ok) {
+            if let Some(n) = append_new_rows(
+                stitched,
+                stitched_h,
+                anchor,
+                frame,
+                frame_w,
+                p.s,
+                p.band,
+            ) {
+                tracing::info!(
+                    "[scroll-manual] try_append_exact s={} band={} exact={} permille={} via_exact={} stitched_h={stitched_h}",
+                    p.s,
+                    p.band,
+                    p.exact,
+                    p.permille,
+                    p.via_exact
+                );
+                return Some(n);
+            }
+        }
+    }
+    // 严格模式（默认）：没有高置信结果就**暂缓**——保持 anchor，下一轮继续等静止帧
+    // （静止帧能给出逐字节对齐的滚动量）。绝不在这里退化成粗估拼接：动画中间帧的
+    // 近似滚动量差 1~2 行，拼上去就是可见的接缝错位。
+    if require_exact {
+        if let Some(p) = plan.as_ref() {
+            tracing::debug!(
+                "[scroll] try_append defer_unconfident s={} permille={} via_exact={}",
+                p.s,
+                p.permille,
+                p.via_exact
+            );
+        }
+        return None;
+    }
+    // 真实变化判据（只守下面的粗层/估计路径）：整帧**未对齐**平均差（同一坐标 a vs b）。
+    // 静止/闪烁帧（b≈a，仅光标闪动）该值接近 0 → 是「被误取周期大偏移重复拼接」
+    // （iter14-37 s=630×N，iter82-84 s=585×3）的元凶，拒绝；真实滚动（内容整体移动、
+    // 行数据不同）该值偏高 → 放行。用 mean_unaligned_diff 而非 frames_differ：
+    // frames_differ（行匹配比例）对 vxe-table 自相似行失效（真实小滚动也判 false → 丢段）。
     let unaligned = stitch::mean_unaligned_diff(anchor, frame).unwrap_or(u64::MAX);
     // 求 s：find_scroll_delta（行签名，可信）优先，否则 estimate/force 兜底。
     let s = match stitch::find_scroll_delta(anchor, frame) {
@@ -1139,6 +1293,28 @@ fn try_append_scrolled(
             max_frame_diff(anchor, frame)
         );
         return None;
+    }
+    // 精层给出偏移但未达高置信（如模糊帧命中率 500~900‰）：宽判据下可用
+    if let Some(p) = plan.as_ref() {
+        if let Some(n) = append_new_rows(
+            stitched,
+            stitched_h,
+            anchor,
+            frame,
+            frame_w,
+            p.s,
+            p.band,
+        ) {
+            tracing::info!(
+                "[scroll-manual] try_append_exact s={} band={} exact={} permille={} via_exact={} stitched_h={stitched_h}",
+                p.s,
+                p.band,
+                p.exact,
+                p.permille,
+                p.via_exact
+            );
+            return Some(n);
+        }
     }
     // 用「全范围像素差最小」的精确偏移回退粗估：粗估按「匹配行数最多」选，会被
     // vxe-table 的行周期重复骗到整数倍偏移（如 120=4×30），一下跳/重叠多行（跳号）。
@@ -1164,8 +1340,7 @@ fn try_append_scrolled(
         );
         return None;
     }
-    let append_off = (frame.height as usize - s) * frame_w as usize * 4;
-    if s < MIN_SCROLL || append_off >= frame.pixels.len() {
+    if s < MIN_SCROLL || s >= frame.height as usize {
         return None;
     }
     tracing::info!(
@@ -1173,12 +1348,13 @@ fn try_append_scrolled(
         refined,
         max_frame_diff(anchor, frame)
     );
-    stitched.extend_from_slice(&frame.pixels[append_off..]);
-    *stitched_h += s as u32;
-    Some(s)
+    // 追加出口统一走 append_new_rows：固定底栏排除 + 长图尾部残留底栏裁剪
+    let band = stitch::fixed_bottom_band(anchor, frame);
+    append_new_rows(stitched, stitched_h, anchor, frame, frame_w, s, band)
 }
 
-fn frames_differ(a: &CapturedFrame, b: &CapturedFrame) -> bool {    if a.width != b.width || a.height != b.height {
+fn frames_differ(a: &CapturedFrame, b: &CapturedFrame) -> bool {
+    if a.width != b.width || a.height != b.height {
         return false;
     }
     let w = a.width as usize;
@@ -1521,7 +1697,7 @@ mod manual_diag_tests {
         });
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h);
+        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, false);
         assert_eq!(s, Some(scroll), "strict 应测出真实滚动量 {scroll}");
         // 拼接高度 = 视口高 + 新进入的 scroll 行
         assert_eq!(stitched_h as usize, h + scroll);
@@ -1537,8 +1713,850 @@ mod manual_diag_tests {
         let b = a.clone();
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h);
+        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, false);
         assert_eq!(s, None);
         assert_eq!(stitched_h, a.height);
+    }
+    // ─────────────────── 合成「长网页 + 滚动会话」端到端测试 ───────────────────
+    //
+    // 复现用户反馈的两个症状：拼接只剩第一页 / 拼接内容重复。页面模型贴近真实网页：
+    //   * 「序号列」窄带（x < 14）每行唯一，但落在 8 列采样签名**之外**
+    //     （采样列从 w/9 开始）——粗层因此看到「多行签名完全相同」；
+    //   * 正文区可选**周期重复**（pitch 行一循环），模拟表格/列表这种自相似内容；
+    //   * 可选**固定底栏**（页脚/分页栏），每帧同一位置重复出现，不随内容滚动。
+
+    /// 合成长网页（w 像素宽、h 行）。
+    struct SynthPage {
+        w: usize,
+        px: Vec<u8>,
+    }
+
+    impl SynthPage {
+        /// `pitch` = 正文行重复周期（0 表示每行都不同即无周期）。
+        fn new(w: usize, h: usize, pitch: usize) -> Self {
+            let mut px = vec![255u8; w * h * 4];
+            for r in 0..h {
+                for c in 0..w {
+                    // 底：白底 + 深色「文字」块
+                    let mut v = 245u8;
+                    if c >= 14 {
+                        let rr = if pitch == 0 { r } else { r % pitch };
+                        // 文字块：按 (rr, 列带) 决定，形成一行行的深色小块
+                        if row_col_val(rr.wrapping_mul(3), c / 9) % 5 < 2 {
+                            v = 40 + row_col_val(rr, c) % 60;
+                        }
+                    } else {
+                        // 序号列：每行唯一（粗层采样列看不到它）
+                        v = 20 + row_col_val(r.wrapping_mul(11), c) % 200;
+                    }
+                    let p = (r * w + c) * 4;
+                    px[p] = v;
+                    px[p + 1] = v;
+                    px[p + 2] = v;
+                    px[p + 3] = 255;
+                }
+            }
+            Self { w, px }
+        }
+
+        /// 视口帧：固定顶栏 ft 行 + 滚动内容 + 固定底栏 fb 行（固定栏每帧都一样）。
+        fn frame(&self, scroll: usize, vh: usize, ft: usize, fb: usize) -> CapturedFrame {
+            let w = self.w;
+            let mut px = vec![0u8; w * vh * 4];
+            let content = vh - ft - fb;
+            for i in 0..ft {
+                // 固定顶栏：固定花纹
+                for c in 0..w {
+                    let v = 200 + row_col_val(9_999, c / 7) % 40;
+                    let p = (i * w + c) * 4;
+                    px[p] = v;
+                    px[p + 1] = v;
+                    px[p + 2] = v;
+                    px[p + 3] = 255;
+                }
+            }
+            for i in 0..content {
+                let src = (scroll + i) * w * 4;
+                let dst = (ft + i) * w * 4;
+                px[dst..dst + w * 4].copy_from_slice(&self.px[src..src + w * 4]);
+            }
+            for i in 0..fb {
+                // 固定底栏：深色条 + 顶边线 + 按钮块（与页面内容无关，逐行有差异，
+                // 也就是「有纹理」——纯色条会被按内容处理，见 stitch::run_textured）
+                let dst = (ft + content + i) * w * 4;
+                for c in 0..w {
+                    let v = if i == 0 {
+                        130
+                    } else if i > 6 && i < 30 && (c / 40) % 3 == 1 {
+                        205
+                    } else {
+                        45
+                    };
+                    let p = dst + c * 4;
+                    px[p] = v;
+                    px[p + 1] = v;
+                    px[p + 2] = v;
+                    px[p + 3] = 255;
+                }
+            }
+            CapturedFrame {
+                width: w as u32,
+                height: vh as u32,
+                pixels: px,
+            }
+        }
+    }
+
+    /// 逐行比较长图与页面：返回 (首行不匹配的位置, 行数)
+    fn first_mismatch(stitched: &[u8], frame_w: usize, page: &SynthPage, scroll_base: usize) -> Option<usize> {
+        let rows = stitched.len() / (frame_w * 4);
+        for r in 0..rows {
+            let got = &stitched[r * frame_w * 4..(r + 1) * frame_w * 4];
+            let want = &page.px[(scroll_base + r) * frame_w * 4..(scroll_base + r + 1) * frame_w * 4];
+            if got != want {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// 端到端：连续滚动拼接后，长图内容必须**逐行等于**页面对应行
+    /// （既不缺行 = 只拼一页/跳号，也不重复 = 重复拼接）。
+    #[test]
+    fn synth_session_no_band_stitches_exactly() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 0usize, 0usize);
+        let page = SynthPage::new(w, 4000, 0);
+        let deltas = [250usize, 180, 320, 90, 240, 137];
+        let mut scroll = 0usize;
+        let mut anchor = page.frame(0, vh, ft, fb);
+        let mut stitched = anchor.pixels.clone();
+        let mut stitched_h = anchor.height;
+        for d in deltas {
+            scroll += d;
+            let f = page.frame(scroll, vh, ft, fb);
+            let plan = stitch::plan_append(&anchor, &f).expect("应能测出滚动量");
+            assert_eq!(plan.s, d, "滚动量必须精确等于真实值");
+            assert_eq!(plan.band, 0);
+            let n = append_new_rows(&mut stitched, &mut stitched_h, &anchor, &f, w as u32, plan.s, plan.band);
+            assert_eq!(n, Some(d));
+            anchor = f;
+        }
+        assert_eq!(
+            stitched_h as usize,
+            vh + deltas.iter().sum::<usize>(),
+            "长图高度 = 视口 + 累计滚动量"
+        );
+        assert_eq!(
+            first_mismatch(&stitched, w, &page, 0),
+            None,
+            "长图内容必须与页面逐行一致（无缺行、无重复）"
+        );
+    }
+
+    /// 周期性内容（表格/列表自相似行）：粗层（8 列采样）会被周期整数倍骗到，
+    /// 精层（整行哈希，含序号列）必须钉住真实滚动量。
+    #[test]
+    fn synth_periodic_rows_use_true_delta() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 0usize, 0usize);
+        let page = SynthPage::new(w, 6000, 30); // 正文每 30 行一循环
+        let anchor = page.frame(0, vh, ft, fb);
+        for d in [17usize, 43, 137, 301, 59] {
+            let f = page.frame(d, vh, ft, fb);
+            let plan = stitch::plan_append(&anchor, &f).expect("周期内容也必须测出滚动量");
+            assert_eq!(plan.s, d, "周期内容被周期整数倍骗到 → 会重复拼接");
+            assert!(plan.via_exact, "应由精层确认");
+        }
+    }
+
+    /// 固定底栏（页脚/分页栏）不能随每帧追加重复拼入长图，且首帧整帧拼入后
+    /// 残留在长图中间的底栏要被裁掉——长图只保留滚动内容。
+    #[test]
+    fn synth_fixed_bottom_band_stitched_once() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 0usize, 60usize);
+        let page = SynthPage::new(w, 4000, 0);
+        let mut scroll = 0usize;
+        let mut anchor = page.frame(0, vh, ft, fb);
+        let mut stitched = anchor.pixels.clone(); // 引擎行为：首帧整帧拼入
+        let mut stitched_h = anchor.height;
+        // 单次滚动量受「内容区 - 最小重叠」限制（固定底栏占掉 60 行）
+        let deltas = [250usize, 180, 260, 90];
+        for d in deltas {
+            scroll += d;
+            let f = page.frame(scroll, vh, ft, fb);
+            let plan = stitch::plan_append(&anchor, &f).expect("应能测出滚动量");
+            assert_eq!(plan.s, d);
+            assert_eq!(plan.band, fb, "固定底栏行数必须被识别");
+            assert!(append_new_rows(
+                &mut stitched,
+                &mut stitched_h,
+                &anchor,
+                &f,
+                w as u32,
+                plan.s,
+                plan.band
+            )
+            .is_some());
+            anchor = f;
+        }
+        // 长图 = 首帧内容区 + 累计滚动量（底栏不留中间、不重复）
+        assert_eq!(stitched_h as usize, vh - fb + deltas.iter().sum::<usize>());
+        assert_eq!(
+            first_mismatch(&stitched, w, &page, 0),
+            None,
+            "长图内容必须与页面逐行一致（固定底栏不得重复拼入）"
+        );
+    }
+
+    /// 静止帧（内容没动）不得拼入：`plan_append` 之外由 `TRULY_STATIC_MIN` 把关，
+    /// 这里确认 `try_append_scrolled` 整体行为（宁缺毋滥，不拼重复内容）。
+    #[test]
+    fn synth_static_periodic_frame_not_appended() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 0usize, 0usize);
+        let page = SynthPage::new(w, 4000, 30);
+        let a = page.frame(0, vh, ft, fb);
+        let b = a.clone();
+        let mut stitched = a.pixels.clone();
+        let mut stitched_h = a.height;
+        assert_eq!(
+            try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, false),
+            None,
+            "静止帧不得拼接"
+        );
+        assert_eq!(stitched_h, a.height);
+    }
+
+    /// 帧底部是**纯色/空白**段时，不能当成「固定底栏」排除：空白段在任意滚动下
+    /// 同一位置都相等，误判为固定栏会让追加窗口整体上移 → 拼进已拼过的内容（重复）。
+    #[test]
+    fn synth_uniform_bottom_not_treated_as_band() {
+        let w = 600usize;
+        let (vh, ft) = (400usize, 0usize);
+        let mut page = SynthPage::new(w, 4000, 0);
+        // 页面末段 220 行是纯白（模拟内容结束后的空白），并不随滚动「固定」
+        for r in (600..820).rev() {
+            for c in 0..w {
+                let p = (r * w + c) * 4;
+                page.px[p] = 255;
+                page.px[p + 1] = 255;
+                page.px[p + 2] = 255;
+            }
+        }
+        let mut scroll = 0usize;
+        let mut anchor = page.frame(0, vh, ft, 0);
+        let mut stitched = anchor.pixels.clone();
+        let mut stitched_h = anchor.height;
+        for d in [250usize, 180, 220] {
+            scroll += d;
+            let f = page.frame(scroll, vh, ft, 0);
+            let plan = stitch::plan_append(&anchor, &f).expect("应能测出滚动量");
+            assert_eq!(plan.s, d);
+            // 底栏判定的取舍：**宁可多算**（底部纯白段可能被算进底栏）。多算只会让长图
+            // 少掉几行纯色/空白（首帧尾部那段底栏多裁一点，肉眼无差别）；少算才是灾难
+            // ——追加窗口会越过内容末尾伸进底栏，每次拼接都把底栏像素拼进长图，
+            // 表现为「最后一页和倒数第二页部分内容重复」。
+            assert_eq!(
+                append_new_rows(
+                    &mut stitched,
+                    &mut stitched_h,
+                    &anchor,
+                    &f,
+                    w as u32,
+                    plan.s,
+                    plan.band,
+                ),
+                Some(d),
+                "每次追加必须正好补上滚动量"
+            );
+            anchor = f;
+        }
+        // 高度只会因「多算底栏」而略短：首帧尾部那段底栏（最多 h/2）被裁掉一次，
+        // 可见内容不受影响（下面按内容逐行核对）。
+        let ideal = vh + 250 + 180 + 220;
+        assert!(
+            (stitched_h as usize) <= ideal && stitched_h as usize + vh / 2 >= ideal,
+            "长图高度 {} 偏离理想值 {ideal} 过多",
+            stitched_h
+        );
+        // 跳过固定顶栏（它对的是固定花纹，不是页面行），只看滚动内容部分
+        assert_eq!(
+            first_mismatch(&stitched[ft * w * 4..], w, &page, 0),
+            None,
+            "含纯白段的页面也必须逐行对齐（不得重复/缺行）"
+        );
+    }
+
+    /// 固定顶栏 + 固定底栏同时存在（真实网页：导航栏 + 页脚/分页栏）：
+    /// 长图 = 顶栏 + 滚动内容，底栏既不重复拼入也不留在中间。
+    #[test]
+    fn synth_top_and_bottom_bands_session() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 40usize, 60usize);
+        let page = SynthPage::new(w, 4000, 0);
+        let mut scroll = 0usize;
+        let mut anchor = page.frame(0, vh, ft, fb);
+        let mut stitched = anchor.pixels.clone();
+        let mut stitched_h = anchor.height;
+        let deltas = [220usize, 150, 260, 110];
+        for d in deltas {
+            scroll += d;
+            let f = page.frame(scroll, vh, ft, fb);
+            let plan = stitch::plan_append(&anchor, &f).expect("应能测出滚动量");
+            assert_eq!(plan.s, d);
+            assert_eq!(plan.band, fb, "固定底栏必须识别");
+            assert_eq!(plan.top, ft, "固定顶栏必须识别");
+            assert_eq!(plan.permille, 1000, "静止帧的真实偏移应有信息行全中");
+            assert!(append_new_rows(
+                &mut stitched,
+                &mut stitched_h,
+                &anchor,
+                &f,
+                w as u32,
+                plan.s,
+                plan.band
+            )
+            .is_some());
+            anchor = f;
+        }
+        // 顶栏保留在顶部；其后是滚动内容；底栏不留痕
+        assert_eq!(stitched_h as usize, vh - fb + deltas.iter().sum::<usize>());
+        for r in ft..(stitched_h as usize) {
+            let got = &stitched[r * w * 4..(r + 1) * w * 4];
+            let want = &page.px[(r - ft) * w * 4..(r - ft + 1) * w * 4];
+            assert_eq!(got, want, "第 {r} 行应为页面第 {} 行", r - ft);
+        }
+    }
+
+    /// 稀疏页面（大段留白 + 少量正文块）：留白行在任何偏移下都相等，若把它们算进
+    /// 命中率会给「小偏移」白送分数 → 选到过小偏移 → 长图缺行。精层只统计有信息行，
+    /// 必须钉住真实滚动量。
+    #[test]
+    fn synth_sparse_page_uses_true_delta() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 0usize, 0usize);
+        let mut page = SynthPage::new(w, 6000, 0);
+        // 每 200 行只保留 60 行正文，其余全白
+        for r in 0..6000 {
+            if r % 200 >= 60 {
+                for c in 0..w {
+                    let p = (r * w + c) * 4;
+                    page.px[p] = 255;
+                    page.px[p + 1] = 255;
+                    page.px[p + 2] = 255;
+                }
+            }
+        }
+        let anchor = page.frame(0, vh, ft, fb);
+        // 滚动量 < 正文块间距，保证重叠带里仍有正文（有信息行）可判定
+        for d in [73usize, 137, 61] {
+            let f = page.frame(d, vh, ft, fb);
+            let plan = stitch::plan_append(&anchor, &f).expect("稀疏页面也必须测出滚动量");
+            assert_eq!(plan.s, d, "留白把命中率稀释 → 选到过小偏移（缺行）");
+            assert!(plan.via_exact, "应由精层按有信息行命中率确认");
+        }
+        // 重叠带里没有正文（留白占满）时无法判定 → 宁缺毋滥返回 None，
+        // 由上层兜底估计处理，绝不给出「过小偏移」这种会缺行的结果。
+        let f = page.frame(261, vh, ft, fb);
+        if let Some(plan) = stitch::plan_append(&anchor, &f) {
+            assert_eq!(plan.s, 261);
+        }
+    }
+
+    // ─────────────── 端到端：假屏幕 + 假进度窗，真跑手动滚动引擎 ───────────────
+    //
+    // 上面几个测试只验证 `plan_append`/`append_new_rows` 这两个纯函数；这里再跑一遍
+    // **真实引擎循环**（`run_manual_scroll_capture`），覆盖锚点推进、兜底分支、
+    // 固定栏裁剪等集成行为：屏幕按时间推进模拟用户持续滚动，进度窗到点自动「完成」。
+
+    use crate::capture::DisplayInfo;
+
+    /// 假屏幕：按时间推进的滚动页面（每 px_per_sec 像素/秒）。
+    struct FakeScrollingScreen {
+        page: std::sync::Arc<SynthPage>,
+        vh: usize,
+        ft: usize,
+        fb: usize,
+        page_rows: usize,
+        px_per_sec: f64,
+        t0: std::time::Instant,
+    }
+
+    impl ScreenCapture for FakeScrollingScreen {
+        fn capture_primary(&self) -> AppResult<CapturedFrame> {
+            let w = self.page.w as u32;
+            self.capture_area(0, 0, w, self.vh as u32)
+        }
+
+        fn capture_area(&self, _x: i32, _y: i32, _w: u32, _h: u32) -> AppResult<CapturedFrame> {
+            let t = self.t0.elapsed().as_secs_f64();
+            let max_scroll = self.page_rows.saturating_sub(self.vh);
+            let scroll = ((t * self.px_per_sec) as usize).min(max_scroll);
+            Ok(self.page.frame(scroll, self.vh, self.ft, self.fb))
+        }
+
+        fn list_displays(&self) -> Vec<DisplayInfo> {
+            Vec::new()
+        }
+    }
+
+    /// 假进度窗：到点自动置 `done`（等价用户点「完成」），让引擎干净收尾。
+    struct FakeProgress {
+        done_after: Duration,
+    }
+
+    impl ScrollProgress for FakeProgress {
+        fn show(
+            &self,
+            _region: &Bounds,
+            _screen_bounds: &Bounds,
+            _cancel: Arc<AtomicBool>,
+            _done: Arc<AtomicBool>,
+            _progress: Arc<AtomicU32>,
+        ) {
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn show_manual(
+            &self,
+            _region: &Bounds,
+            _screen_bounds: &Bounds,
+            _cancel: Arc<AtomicBool>,
+            done: Arc<AtomicBool>,
+            _progress: Arc<AtomicU32>,
+            _moving: Arc<AtomicBool>,
+            _bottom_has_content: Arc<AtomicBool>,
+            _confirming: Arc<AtomicBool>,
+        ) {
+            let d = self.done_after;
+            std::thread::spawn(move || {
+                std::thread::sleep(d);
+                done.store(true, Ordering::Relaxed);
+            });
+        }
+
+        fn hide(&self) {}
+    }
+
+    /// 长图内容必须是页面的**连续切片**：返回匹配行数，遇到不连续直接 panic。
+    /// （连续 = 既没有重复行、也没有跳过行——正是用户反馈的两个症状。）
+    fn assert_contiguous_slice(
+        stitched: &[u8],
+        frame_w: usize,
+        page: &SynthPage,
+        content_top: usize,
+        page_rows: usize,
+    ) -> usize {
+        let row_bytes = frame_w * 4;
+        let rows = stitched.len() / row_bytes;
+        let first = &stitched[content_top * row_bytes..(content_top + 1) * row_bytes];
+        let mut start = None;
+        for o in 0..page_rows {
+            if &page.px[o * row_bytes..(o + 1) * row_bytes] == first {
+                start = Some(o);
+                break;
+            }
+        }
+        let start = start.expect("长图首行必须能在页面里找到");
+        let n = rows - content_top;
+        for i in 0..n {
+            let o = start + i;
+            assert!(o < page_rows, "长图第 {i} 行超出页面范围（多了内容）");
+            let got = &stitched[(content_top + i) * row_bytes..(content_top + i + 1) * row_bytes];
+            let want = &page.px[o * row_bytes..(o + 1) * row_bytes];
+            assert_eq!(got, want, "长图第 {i} 行与页面第 {o} 行不一致（重复或跳行）");
+        }
+        n
+    }
+
+    /// 端到端：手动滚动引擎必须拼出「页面的连续长片」，且远多于一屏
+    /// （只拼一页 = 长度接近一屏；重复拼接 = 连续切片校验失败）。
+    #[test]
+    fn engine_manual_session_stitches_contiguous_long_image() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 40usize, 60usize);
+        let page_rows = 4000usize;
+        let page = std::sync::Arc::new(SynthPage::new(w, page_rows, 0));
+        let screen = FakeScrollingScreen {
+            page: page.clone(),
+            vh,
+            ft,
+            fb,
+            page_rows,
+            px_per_sec: 900.0,
+            t0: std::time::Instant::now(),
+        };
+        let progress = FakeProgress {
+            done_after: Duration::from_millis(2800),
+        };
+        let region = Bounds {
+            origin: crate::utils::bounds::Point::new(0.0, 0.0),
+            size: crate::utils::bounds::Point::new(w as f32, vh as f32),
+        };
+        let out = run_manual_scroll_capture(&region, &region, &screen, &progress)
+            .expect("引擎不应报错")
+            .expect("点「完成」应返回拼接结果");
+        assert_eq!(out.width as usize, w);
+        let n = assert_contiguous_slice(&out.pixels, w, &page, ft, page_rows);
+        // 1.2s × 900px/s ≈ 1080px ≈ 2.7 屏；要求至少 2 屏，足以证明不是「只有第一页」
+        assert!(
+            n >= 2 * (vh - fb),
+            "只拼了 {n} 行（约 {:.1} 屏），疑似「只拼第一页」",
+            n as f64 / (vh - fb) as f64
+        );
+    }
+
+    // ───────────── 复现用户反馈：接缝错位（1~2 行）与底栏重复 ─────────────
+
+    /// 固定底栏**上方还有一段纯色/空白**：底栏判定不能把那段空白也算进底栏，
+    /// 否则追加窗口整体上移 → 拼进已拼过的内容（重复 + 接缝错位）。
+    #[test]
+    fn synth_band_does_not_swallow_blank_above() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 0usize, 60usize);
+        let page = SynthPage::new(w, 4000, 0);
+        let mut page = page;
+        // 页面 1200 行之后全白（内容结束），于是帧里底栏上方会出现一段空白
+        for r in 1200..4000 {
+            for c in 0..w {
+                let p = (r * w + c) * 4;
+                page.px[p] = 255;
+                page.px[p + 1] = 255;
+                page.px[p + 2] = 255;
+            }
+        }
+        let mut scroll = 900usize;
+        let mut anchor = page.frame(scroll, vh, ft, fb);
+        let mut stitched = anchor.pixels.clone();
+        let mut stitched_h = anchor.height;
+        for d in [120usize, 90, 70] {
+            scroll += d;
+            let f = page.frame(scroll, vh, ft, fb);
+            let plan = stitch::plan_append(&anchor, &f).expect("应能测出滚动量");
+            assert_eq!(plan.s, d);
+            // 底栏上方的空白可能被一起算进底栏（见 `stitch::fixed_bottom_band` 的取舍）：
+            // 只多裁几行纯色/空白，可见内容不多不少（下面按内容逐行核对）。
+            assert_eq!(
+                append_new_rows(
+                    &mut stitched,
+                    &mut stitched_h,
+                    &anchor,
+                    &f,
+                    w as u32,
+                    plan.s,
+                    plan.band,
+                ),
+                Some(d),
+                "每次追加必须正好补上滚动量"
+            );
+            anchor = f;
+        }
+        // 关键：底栏上方的空白被算成底栏后**不得**把可见内容拼重复/拼错位
+        assert_eq!(
+            first_mismatch(&stitched, w, &page, 900),
+            None,
+            "底栏上方有空白时仍须逐行对齐（不得重复可见内容）"
+        );
+        let ideal = vh - fb + 120 + 90 + 70;
+        assert!(
+            (stitched_h as usize) <= ideal && stitched_h as usize + vh / 2 >= ideal,
+            "长图高度 {} 偏离理想值 {ideal} 过多",
+            stitched_h
+        );
+    }
+
+    /// 回归：**底栏判定偏矮不得让长图重复可见内容**。
+    ///
+    /// 用户反馈「长图最后一页和倒数第二页部分内容重复」。底栏判定曾用
+    /// 「尾部相同段 − 段首纯色块」：真实页脚常常是**整条纯色 + 顶部一条细线**
+    /// （也就是底栏自己开头就有多行完全相同的纯色行），减法会把这几行当成「内容空白」
+    /// 减掉 → 底栏判矮 → 追加窗口越过内容末尾往回退几行 → 每次拼接都重复几行**可见内容**。
+    ///
+    /// 判据：长图的滚动内容必须与页面逐行对齐（重复即错位），且不得出现底栏独有的
+    /// 整行 130 灰（页面自身没有这种行）。
+    #[test]
+    fn synth_solid_leading_footer_does_not_duplicate_content() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 40usize, 60usize);
+        let content = vh - ft - fb;
+        let page = SynthPage::new(w, 4000, 0);
+        let row_bytes = w * 4;
+        // 底栏：前 4 行纯色 45、第 5 行 130 灰细线、其余 45/205 交替（有纹理）
+        let build = |scroll: usize| -> CapturedFrame {
+            let mut px = vec![0u8; w * vh * 4];
+            for i in 0..ft {
+                for c in 0..w {
+                    let v = 200 + row_col_val(9_999, c / 7) % 40;
+                    let p = (i * w + c) * 4;
+                    px[p] = v;
+                    px[p + 1] = v;
+                    px[p + 2] = v;
+                    px[p + 3] = 255;
+                }
+            }
+            for i in 0..content {
+                let src = (scroll + i) * row_bytes;
+                let dst = (ft + i) * row_bytes;
+                px[dst..dst + row_bytes].copy_from_slice(&page.px[src..src + row_bytes]);
+            }
+            for i in 0..fb {
+                let v: u8 = if i < 4 {
+                    45
+                } else if i == 4 {
+                    130
+                } else if (i / 3) % 2 == 0 {
+                    45
+                } else {
+                    205
+                };
+                let dst = (ft + content + i) * row_bytes;
+                for c in 0..w {
+                    let p = dst + c * 4;
+                    px[p] = v;
+                    px[p + 1] = v;
+                    px[p + 2] = v;
+                    px[p + 3] = 255;
+                }
+            }
+            CapturedFrame {
+                width: w as u32,
+                height: vh as u32,
+                pixels: px,
+            }
+        };
+        let mut bar_row = Vec::with_capacity(row_bytes);
+        for _ in 0..w {
+            bar_row.extend_from_slice(&[130, 130, 130, 255]);
+        }
+        let count_bar_rows = |buf: &[u8]| {
+            (0..buf.len() / row_bytes)
+                .filter(|&r| buf[r * row_bytes..(r + 1) * row_bytes] == bar_row[..])
+                .count()
+        };
+        assert_eq!(count_bar_rows(&page.px), 0, "合成页面本身不含底栏那条线");
+
+        let mut scroll = 1000usize;
+        let mut anchor = build(scroll);
+        let mut stitched = anchor.pixels.clone();
+        let mut stitched_h = anchor.height;
+        for d in [180usize, 160, 200] {
+            scroll += d;
+            let f = build(scroll);
+            let plan = stitch::plan_append(&anchor, &f).expect("应能测出滚动量");
+            assert_eq!(plan.s, d);
+            assert!(
+                plan.band >= fb,
+                "底栏判定 {} 小于真实底栏 {fb} → 窗口会往回退，拼重复内容",
+                plan.band
+            );
+            assert_eq!(
+                append_new_rows(
+                    &mut stitched,
+                    &mut stitched_h,
+                    &anchor,
+                    &f,
+                    w as u32,
+                    plan.s,
+                    plan.band,
+                ),
+                Some(d)
+            );
+            anchor = f;
+        }
+        assert_eq!(
+            count_bar_rows(&stitched),
+            0,
+            "长图里出现整行 130 灰 = 底栏像素被拼进来了"
+        );
+        // 跳过固定顶栏（固定花纹，不是页面行），滚动内容必须逐行对齐——重复即错位
+        assert_eq!(
+            first_mismatch(&stitched[ft * row_bytes..], w, &page, 1000),
+            None,
+            "底栏以纯色行打头时，长图不得重复/错位可见内容"
+        );
+    }
+
+    /// 假屏幕（带平滑滚动动画）：一个滚轮格 = 180px、250ms 缓出动画 + 150ms 静止，
+    /// 与 Chrome 平滑滚动一致。动画中间帧是**亚像素混合**帧（逐字节匹配率不到 100%），
+    /// 只有静止帧能给出逐字节精确的滚动量。
+    struct FakeAnimatedScreen {
+        page: std::sync::Arc<SynthPage>,
+        vh: usize,
+        ft: usize,
+        fb: usize,
+        page_rows: usize,
+        notch_px: f64,
+        anim_ms: f64,
+        hold_ms: f64,
+        t0: std::time::Instant,
+    }
+
+    impl FakeAnimatedScreen {
+        /// 当前（可能是小数的）滚动位置
+        fn scroll_f(&self) -> f64 {
+            let t = self.t0.elapsed().as_secs_f64() * 1000.0;
+            let cycle = self.anim_ms + self.hold_ms;
+            let notches = (t / cycle).floor();
+            let phase = t - notches * cycle;
+            let done = notches * self.notch_px;
+            let max_scroll = self.page_rows.saturating_sub(self.vh) as f64;
+            if phase <= self.anim_ms {
+                // 缓出：progress = 1-(1-x)^3
+                let x = phase / self.anim_ms;
+                let e = 1.0 - (1.0 - x).powi(3);
+                (done + self.notch_px * e).min(max_scroll)
+            } else {
+                (done + self.notch_px).min(max_scroll)
+            }
+        }
+    }
+
+    impl ScreenCapture for FakeAnimatedScreen {
+        fn capture_primary(&self) -> AppResult<CapturedFrame> {
+            self.capture_area(0, 0, self.page.w as u32, self.vh as u32)
+        }
+
+        fn capture_area(&self, _x: i32, _y: i32, _w: u32, _h: u32) -> AppResult<CapturedFrame> {
+            // 亚像素混合：`scroll_f()` 允许小数滚动量，按小数部分把相邻两行线性插值，
+            // 模拟平滑滚动的中间帧（任何整数偏移都对不齐）。
+            let sf = self.scroll_f();
+            let base = sf.floor() as usize;
+            let frac = sf - base as f64;
+            let w = self.page.w;
+            let content = self.vh - self.ft - self.fb;
+            let mut px = vec![0u8; w * self.vh * 4];
+            // 固定顶栏/底栏：与整数帧完全一致
+            let whole = self.page.frame(0, self.vh, self.ft, self.fb);
+            px[..self.ft * w * 4].copy_from_slice(&whole.pixels[..self.ft * w * 4]);
+            px[(self.ft + content) * w * 4..]
+                .copy_from_slice(&whole.pixels[(self.ft + content) * w * 4..]);
+            for i in 0..content {
+                let r0 = base + i;
+                let r1 = (r0 + 1).min(self.page_rows.saturating_sub(1));
+                let dst = (self.ft + i) * w * 4;
+                for c in 0..w {
+                    let a = self.page.px[(r0 * w + c) * 4] as f64;
+                    let b = self.page.px[(r1 * w + c) * 4] as f64;
+                    let v = (a * (1.0 - frac) + b * frac).round() as u8;
+                    let p = dst + c * 4;
+                    px[p] = v;
+                    px[p + 1] = v;
+                    px[p + 2] = v;
+                    px[p + 3] = 255;
+                }
+            }
+            Ok(CapturedFrame {
+                width: w as u32,
+                height: self.vh as u32,
+                pixels: px,
+            })
+        }
+
+        fn list_displays(&self) -> Vec<DisplayInfo> {
+            Vec::new()
+        }
+    }
+
+    /// 端到端（带平滑滚动动画）：动画中间帧只能给出近似滚动量（差 1~2 行），
+    /// 直接拼会在接缝处错位；引擎必须**优先用静止帧**的精确对齐，长图仍逐行连续。
+    #[test]
+    fn engine_manual_session_seam_is_exact_under_animation() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 40usize, 60usize);
+        let page_rows = 6000usize;
+        let page = std::sync::Arc::new(SynthPage::new(w, page_rows, 30));
+        let screen = FakeAnimatedScreen {
+            page: page.clone(),
+            vh,
+            ft,
+            fb,
+            page_rows,
+            notch_px: 180.0,
+            anim_ms: 250.0,
+            hold_ms: 150.0,
+            t0: std::time::Instant::now(),
+        };
+        let progress = FakeProgress {
+            done_after: Duration::from_millis(2500),
+        };
+        let region = Bounds {
+            origin: crate::utils::bounds::Point::new(0.0, 0.0),
+            size: crate::utils::bounds::Point::new(w as f32, vh as f32),
+        };
+        let out = run_manual_scroll_capture(&region, &region, &screen, &progress)
+            .expect("引擎不应报错")
+            .expect("点「完成」应返回拼接结果");
+        let n = assert_contiguous_slice(&out.pixels, w, &page, ft, page_rows);
+        assert!(
+            n >= 2 * (vh - fb),
+            "只拼了 {n} 行，疑似「只拼第一页」"
+        );
+    }
+
+    /// 周期性内容（表格行周期 30，滚动量 180 = 6 个周期）：整帧像素均值差被稀释到
+    /// 只有 3~5（只有窄窄的序号列变了），**不能**因此判成「没动」而整段不拼——
+    /// 精层按有信息行命中率能拿到 1000‰，必须优先采信，拼出真实滚动量。
+    #[test]
+    fn synth_periodic_gate_does_not_block_append() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 40usize, 60usize);
+        let page = SynthPage::new(w, 4000, 30);
+        let a = page.frame(0, vh, ft, fb);
+        let b = page.frame(180, vh, ft, fb);
+        let mut stitched = a.pixels.clone();
+        let mut stitched_h = a.height;
+        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, true);
+        assert_eq!(s, Some(180), "周期内容的真实滚动量必须拼上（否则只到第一页）");
+        assert_eq!(stitched_h as usize, vh - fb + 180);
+        for r in ft..stitched_h as usize {
+            let got = &stitched[r * w * 4..(r + 1) * w * 4];
+            let want = &page.px[(r - ft) * w * 4..(r - ft + 1) * w * 4];
+            assert_eq!(got, want, "第 {r} 行应为页面第 {} 行", r - ft);
+        }
+    }
+
+    /// 端到端：一直滚到页面**最底部**再点「完成」（用户实际用法），
+    /// 最后一个视口不能与倒数第二个视口重复。
+    #[test]
+    fn engine_manual_session_to_page_bottom_is_contiguous() {
+        let w = 600usize;
+        let (vh, ft, fb) = (400usize, 40usize, 60usize);
+        let page_rows = 1600usize; // max_scroll = 1200
+        let page = std::sync::Arc::new(SynthPage::new(w, page_rows, 30));
+        let screen = FakeAnimatedScreen {
+            page: page.clone(),
+            vh,
+            ft,
+            fb,
+            page_rows,
+            notch_px: 173.0, // 最后一格会被页面底夹住 → 变小（部分滚动）
+            anim_ms: 250.0,
+            hold_ms: 150.0,
+            t0: std::time::Instant::now(),
+        };
+        let progress = FakeProgress {
+            done_after: Duration::from_millis(6000),
+        };
+        let region = Bounds {
+            origin: crate::utils::bounds::Point::new(0.0, 0.0),
+            size: crate::utils::bounds::Point::new(w as f32, vh as f32),
+        };
+        let out = run_manual_scroll_capture(&region, &region, &screen, &progress)
+            .expect("引擎不应报错")
+            .expect("点「完成」应返回拼接结果");
+        // 长图内容 = 顶栏之后的连续切片；末尾必须正好到页面最后一行（不能重复/缺尾）
+        let n = assert_contiguous_slice(&out.pixels, w, &page, ft, page_rows);
+        // 页面滚到底时最后一行可见内容 = page_rows - ft - fb - 1（底栏占掉最后 fb 行）。
+        // 长图末尾必须正好落在这一行：多一行 = 重复，少一行 = 缺尾。
+        let rows = out.pixels.len() / (w * 4);
+        let want_row = page_rows - ft - fb - 1;
+        let got = &out.pixels[(rows - 1) * w * 4..rows * w * 4];
+        assert_eq!(
+            got,
+            &page.px[want_row * w * 4..(want_row + 1) * w * 4],
+            "长图末尾没有落在页面最后一行（重复或缺尾），共 {n} 行内容"
+        );
     }
 }

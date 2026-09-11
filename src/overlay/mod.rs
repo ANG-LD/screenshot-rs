@@ -9,4 +9,5 @@ pub mod font;
 pub mod palette;
 pub mod selection;
 pub mod toolbar;
+pub mod ui_theme;
 pub mod window;

@@ -107,7 +107,90 @@ impl ToolButton {
             ToolButton::Cancel => "取消",
         }
     }
+
+    /// 悬浮提示文本
+    ///
+    /// 纯图标按钮（见 [`ToolButton::shows_label`]）靠 tooltip 说明用途。
+    /// **只写功能名，2–4 个字**：不写括号补充说明、不写快捷键——长提示在
+    /// 按钮下方铺开一大条，反而看不清指哪个按钮（用户反馈）。快捷键统一放在
+    /// README / 帮助里，不挤进 tooltip。
+    pub fn tooltip_text(&self) -> &'static str {
+        match self {
+            ToolButton::Rectangle => "矩形",
+            ToolButton::Ellipse => "椭圆",
+            ToolButton::Arrow => "箭头",
+            ToolButton::Freehand => "画笔",
+            ToolButton::Text => "文字",
+            ToolButton::Ocr => "文字识别",
+            ToolButton::Mosaic => "马赛克",
+            ToolButton::ColorPicker => "取色",
+            ToolButton::Undo => "撤销",
+            ToolButton::Redo => "重做",
+            ToolButton::Bold => "加粗",
+            ToolButton::Scroll => "滚动截屏",
+            ToolButton::ScrollManual => "手动滚动",
+            ToolButton::Pin => "固定",
+            ToolButton::Finish => "完成",
+            ToolButton::Cancel => "取消",
+        }
+    }
+
+    /// 工具栏上是否显示中文短标签
+    ///
+    /// 混合风格：**绘图工具**图标语义弱一些，保留 2 字标签帮助识别；
+    /// **操作类按钮**（OCR / 滚动 / 撤销重做 / 固定 / 完成 / 取消）用纯图标
+    /// + tooltip，工具栏更紧凑、按钮节奏一致。
+    pub fn shows_label(&self) -> bool {
+        matches!(
+            self,
+            ToolButton::Rectangle
+                | ToolButton::Ellipse
+                | ToolButton::Arrow
+                | ToolButton::Freehand
+                | ToolButton::Text
+                | ToolButton::Mosaic
+        )
+    }
+
+    /// 是否是带二级弹层（Popover）的按钮
+    ///
+    /// 绘图工具：点一次选中、再点一次浮出「粗细 + 颜色」；
+    /// 文字工具：浮出「字号 + 加粗 + 颜色 + 背景」。
+    pub fn has_popover(&self) -> bool {
+        matches!(
+            self,
+            ToolButton::Rectangle
+                | ToolButton::Ellipse
+                | ToolButton::Arrow
+                | ToolButton::Freehand
+                | ToolButton::Text
+                | ToolButton::Mosaic
+        )
+    }
+
+    /// 工具栏分组（组内相邻渲染，组间画竖直分隔线）
+    ///
+    /// 顺序即从左到右的渲染顺序；分组表达「工具 → 识别/滚动 → 编辑 → 收尾」
+    /// 的语义层次。渲染与宽度估算都读这一份定义，避免两处漂移。
+    pub const GROUPS: &'static [&'static [ToolButton]] = &[
+        // 1) 绘图工具（带短标签 + 二级弹层）
+        &[
+            ToolButton::Rectangle,
+            ToolButton::Ellipse,
+            ToolButton::Arrow,
+            ToolButton::Freehand,
+            ToolButton::Text,
+            ToolButton::Mosaic,
+        ],
+        // 2) 识别与滚动截屏（纯图标）
+        &[ToolButton::Ocr, ToolButton::Scroll, ToolButton::ScrollManual],
+        // 3) 编辑（纯图标）
+        &[ToolButton::Undo, ToolButton::Redo],
+        // 4) 收尾动作（纯图标：固定 / 取消 / 完成）
+        &[ToolButton::Pin, ToolButton::Cancel, ToolButton::Finish],
+    ];
 }
+
 
 /// 二级面板内容类型（点 active 绘图工具按钮二次时浮出的 popover 内容）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,5 +274,81 @@ mod tests {
         assert!(FONT_SIZES.len() >= 8);
         assert!(FONT_SIZES.contains(&14.0));
         assert!(FONT_SIZES.contains(&64.0));
+    }
+
+    #[test]
+    fn groups_cover_renderable_buttons_without_duplicates() {
+        let mut seen: Vec<ToolButton> = Vec::new();
+        for group in ToolButton::GROUPS {
+            assert!(!group.is_empty(), "分组不应为空");
+            for btn in group.iter() {
+                assert!(!seen.contains(btn), "{btn:?} 在 GROUPS 中重复出现");
+                seen.push(*btn);
+            }
+        }
+        // GROUPS 覆盖所有实际渲染的按钮（ColorPicker/Bold 由弹层内呈现，
+        // 不进工具栏）；与历史顺序表 ORDER 的渲染集合保持一致。
+        for btn in ToolButton::ORDER {
+            if matches!(btn, ToolButton::ColorPicker | ToolButton::Bold) {
+                continue;
+            }
+            assert!(seen.contains(btn), "{btn:?} 未出现在 GROUPS 中");
+        }
+        assert_eq!(seen.len(), ToolButton::ORDER.len() - 2);
+    }
+
+    #[test]
+    fn drawing_tools_keep_labels_and_actions_are_icon_only() {
+        for btn in [
+            ToolButton::Rectangle,
+            ToolButton::Ellipse,
+            ToolButton::Arrow,
+            ToolButton::Freehand,
+            ToolButton::Text,
+            ToolButton::Mosaic,
+        ] {
+            assert!(btn.shows_label(), "{btn:?} 应保留短标签");
+            assert!(btn.has_popover(), "{btn:?} 应有二级弹层");
+        }
+        for btn in [
+            ToolButton::Ocr,
+            ToolButton::Scroll,
+            ToolButton::ScrollManual,
+            ToolButton::Undo,
+            ToolButton::Redo,
+            ToolButton::Pin,
+            ToolButton::Finish,
+            ToolButton::Cancel,
+        ] {
+            assert!(!btn.shows_label(), "{btn:?} 应为纯图标按钮");
+            assert!(!btn.has_popover(), "{btn:?} 不应有二级弹层");
+        }
+    }
+
+    #[test]
+    fn every_button_has_a_tooltip() {
+        for btn in ToolButton::ORDER {
+            assert!(!btn.tooltip_text().is_empty(), "{btn:?} 缺少 tooltip");
+        }
+    }
+
+    #[test]
+    fn tooltips_stay_short_and_plain() {
+        // 提示统一「只写功能名」：不超过 5 个字，且不含括号补充、不含快捷键。
+        // 长提示会在按钮下方铺开一大条，用户分不清它指的是哪个按钮。
+        for btn in ToolButton::ORDER {
+            let tip = btn.tooltip_text();
+            assert!(
+                tip.chars().count() <= 5,
+                "{btn:?} 提示过长（{} 字）: {tip}",
+                tip.chars().count()
+            );
+            for bad in ['（', '(', '：', ':', '，', ','] {
+                assert!(
+                    !tip.contains(bad),
+                    "{btn:?} 提示含说明性标点 {bad:?}: {tip}"
+                );
+            }
+        }
     }
 }

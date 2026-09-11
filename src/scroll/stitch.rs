@@ -4,10 +4,11 @@
 //! 内容上移 s 行，因此 b 的顶部 (h-s) 行等于 a 的底部 (h-s) 行（重叠带），
 //! b 的底部 s 行是新进入视口的内容。`find_scroll_delta` 负责找出 s。
 //!
-//! ## 算法（行级匹配 + 匹配行数计数）
+//! ## 两层算法
 //!
-//! 对每个候选滚动量 s，统计重叠带内「逐行内容一致」的行数（行匹配 =
-//! 8 个采样列的 3×3 局部平均 RGB 差 ≤ 容差），取**匹配行数最多**的 s 为答案。
+//! **粗层（行级匹配 + 匹配行数计数）**：对每个候选滚动量 s，统计重叠带内
+//! 「逐行内容一致」的行数（行匹配 = 8 个采样列的 3×3 局部平均 RGB 差 ≤ 容差），
+//! 取**匹配行数最多**的 s。抗噪声/动画中间帧好，但水平分辨率只有 8 列。
 //!
 //! 相比「签名平均差最小」的旧算法，匹配行数对网页场景更鲁棒：
 //! - 网页滚动是整帧合成平移，静止帧的重叠带逐行完全一致 → 真实 s 匹配行数
@@ -18,9 +19,22 @@
 //!   自相似内容会在 s±周期 处同样高匹配 → 拒绝（宁缺毋滥，不拼错重复）。
 //! - 快速滚动（重叠带 < STRICT_OVERLAP）：额外要求邻居 s±1/±2 不匹配
 //!   （小重叠带下 ±1 行误差会放大成明显重复）。
+//!
+//! **精层（整行哈希 + 固定栏，见 [`plan_append`]）**：粗层的 8 列采样会漏掉
+//! 序号列/图标列这类窄特征，于是周期性内容出现「周期整数倍」假峰（多滚 → 重复
+//! 拼接）或真实滚动被判歧义（只拼一页）。精层改用**整行哈希**，并按真实网页的
+//! 「固定栏 + 滚动内容区」模型判定：
+//! - **固定栏** = a、b 在同一位置逐行完全相同的头部/尾部长；只有**有纹理**的
+//!   尾部才算固定底栏（纯色/空白段在任意滚动下都相等，误当底栏会把追加窗口上移
+//!   → 拼进已拼过的内容）。固定底栏在追加时排除，长图尾部残留的那份还要裁掉，
+//!   否则页脚会在长图里被复制多次。
+//! - **打分**只在滚动内容区、只统计**有信息行**（与相邻行不同的行），命中率最高者
+//!   胜；候选含 s=0、平票取最小 s —— 内容没动时 s=0 满命中，静止帧与周期假偏移
+//!   都无法胜出（宁缺毋滥，不拼重复）。
 
 use std::cell::RefCell;
 
+use super::MIN_SCROLL;
 use crate::capture::CapturedFrame;
 
 /// 行匹配采样列数（8 列均匀分布）
@@ -30,7 +44,7 @@ const MIN_ENERGY: u64 = 16;
 /// 滚动量上限（超出视为异常，拒绝）
 const MAX_SCROLL: usize = 800;
 /// 要求重叠带至少保留的行数（太少则无法可靠判定）
-const MIN_OVERLAP: usize = 30;
+pub const MIN_OVERLAP: usize = 30;
 /// 逐行匹配容差（每通道，3×3 局部平均）。
 ///
 /// 网页滚动是整帧合成平移：静止帧的重叠带**逐像素一致**（差 0），所以容差
@@ -57,6 +71,18 @@ struct StitchScratch {
     mb: Vec<RowAvg>,
     /// 候选列表：(匹配行数, s)，按匹配行数降序
     cands: Vec<(usize, usize)>,
+    /// 精层用的整行哈希（a 帧 / b 帧）
+    ha: Vec<u64>,
+    hb: Vec<u64>,
+    /// `score_candidates` 每偏移的匹配行数（counts[s]），跨调用复用避免反复分配
+    counts: Vec<usize>,
+    /// 相邻行差 d[r] 及其后缀和 / 后缀纹理计数：把「每偏移现算 band_has_energy」
+    /// 这类 O(h) 重复计算压成 O(1)（同一对相邻行被 1000 多个偏移重复 diff）
+    energy_d: Vec<u64>,
+    energy_sum: Vec<u64>,
+    energy_tex: Vec<u32>,
+    /// 偏移 s 是否通过能量门（与 band_has_energy 逐位等价）
+    energy_ok: Vec<bool>,
 }
 
 impl Default for StitchScratch {
@@ -66,6 +92,13 @@ impl Default for StitchScratch {
             ma: Vec::new(),
             mb: Vec::new(),
             cands: Vec::new(),
+            ha: Vec::new(),
+            hb: Vec::new(),
+            counts: Vec::new(),
+            energy_d: Vec::new(),
+            energy_sum: Vec::new(),
+            energy_tex: Vec::new(),
+            energy_ok: Vec::new(),
         }
     }
 }
@@ -95,19 +128,71 @@ impl StitchScratch {
     /// 宽松估计允许滚到接近整个帧高（快速滚动无重叠时也能取到最可能偏移）。
     fn score_candidates(&mut self, h: usize, max_s: usize) -> Option<(usize, usize)> {
         self.cands.clear();
+        if max_s == 0 {
+            return None;
+        }
+        // ── 能量门（band_has_energy）预计算 ────────────────────────────────────
+        // 原实现在每个偏移 s 上现算一次：内部要 diff 相邻行 (s+1..h)，于是同一对
+        // 相邻行被上千个 s 反复 diff（总代价 O(h·max_s)，1080p 约百万次 row_avg_diff）。
+        // 相邻行差只依赖行号 → 先算一遍 d[r]，再做后缀和 / 后缀纹理计数，每个 s 的
+        // 判定降为 O(1)。**判定式逐字复刻**（含 `total / (h-s)` 用的是 h-s、而不是
+        // 求和项数 h-1-s 这个细节），结果与原来完全一致。
+        self.energy_d.clear();
+        self.energy_d.resize(h, 0);
+        for r in 1..h {
+            self.energy_d[r] = row_avg_diff(&self.ma[r], &self.ma[r - 1]);
+        }
+        self.energy_sum.clear();
+        self.energy_sum.resize(h + 1, 0);
+        self.energy_tex.clear();
+        self.energy_tex.resize(h + 1, 0);
+        for r in (1..h).rev() {
+            self.energy_sum[r] = self.energy_sum[r + 1] + self.energy_d[r];
+            self.energy_tex[r] = self.energy_tex[r + 1] + u32::from(self.energy_d[r] >= MIN_ENERGY);
+        }
+        self.energy_ok.clear();
+        self.energy_ok.resize(max_s + 1, false);
         for s in 1..=max_s {
-            // band_has_energy 拒绝空白/均匀带（任何偏移都能匹配，无法判定）
-            if !band_has_energy(&self.ma, s, h) {
+            let n = h - s;
+            if n < 2 {
                 continue;
             }
-            let n = h - s;
-            let mut count = 0usize;
-            for r in 0..n {
-                if row_matches(&self.ma[s + r], &self.mb[r]) {
-                    count += 1;
+            // 后缀起点 s+1：total = Σ_{r=s+1..h-1} d[r]，textured 同理
+            self.energy_ok[s] = self.energy_sum[s + 1] / n as u64 >= MIN_ENERGY
+                || self.energy_tex[s + 1] * 8 >= n as u32;
+        }
+
+        // ── 行匹配计数 ───────────────────────────────────────────────────────
+        // 循环次序调换：外层走 mb 的行（每行只读一次，留在寄存器里）、内层走 s，
+        // 于是 `ma[s + r]` 随 s **顺序前进**——原来外层 s、内层 r 时它是斜对角跳读，
+        // 1080p 实测 117 万次比较全卡在 L2/L3 上，单次调用 ~18ms。
+        // 比较次数与结果不变：counts[s] = #{r : r < h-s 且行签名匹配}。
+        self.counts.clear();
+        self.counts.resize(max_s + 1, 0);
+        for r in 0..h {
+            let mb_r = &self.mb[r];
+            let end = (h - r).min(max_s + 1);
+            if end < 2 {
+                continue;
+            }
+            // 用切片迭代代替下标：一轮里 3 次下标访问的边界检查全部消失
+            let rows = &self.ma[r + 1..r + end];
+            let oks = &self.energy_ok[1..end];
+            let cnts = &mut self.counts[1..end];
+            for ((ma_row, ok), cnt) in rows.iter().zip(oks).zip(cnts.iter_mut()) {
+                // 能量门在计数前先过（与原实现一样直接跳过无信息偏移）
+                if *ok && row_matches(ma_row, mb_r) {
+                    *cnt += 1;
                 }
             }
-            self.cands.push((count, s));
+        }
+        // push 顺序保持「s 升序」不变：排序是 unstable 的，并列时谁胜出取决于输入
+        // 顺序，改顺序会让并列偏移的选择漂移（拼接行为跟着变）。
+        for s in 1..=max_s {
+            if !self.energy_ok[s] {
+                continue;
+            }
+            self.cands.push((self.counts[s], s));
         }
         self.cands.sort_unstable_by(|x, y| y.0.cmp(&x.0));
         self.cands.first().copied()
@@ -352,7 +437,8 @@ pub fn pixel_diff_at(a: &CapturedFrame, b: &CapturedFrame, s: usize) -> Option<u
     let w = a.width as usize;
     let h = a.height as usize;
     let row_stride = (h / 16).max(1);
-    let cols: Vec<usize> = (0..64).map(|i| w * (i + 1) / 65).collect();
+    // 栈上数组：这个函数在滚动循环里每次迭代都被调用，别再为 64 个采样列做堆分配
+    let cols: [usize; 64] = std::array::from_fn(|i| w * (i + 1) / 65);
     offset_mean_diff(a, b, s, w, h, row_stride, &cols)
 }
 
@@ -366,7 +452,7 @@ pub fn mean_unaligned_diff(a: &CapturedFrame, b: &CapturedFrame) -> Option<u64> 
     let w = a.width as usize;
     let h = a.height as usize;
     let row_stride = (h / 16).max(1);
-    let cols: Vec<usize> = (0..64).map(|i| w * (i + 1) / 65).collect();
+    let cols: [usize; 64] = std::array::from_fn(|i| w * (i + 1) / 65);
     offset_mean_diff(a, b, 0, w, h, row_stride, &cols)
 }
 
@@ -401,7 +487,7 @@ pub fn best_pixel_offset(a: &CapturedFrame, b: &CapturedFrame) -> Option<(usize,
         return None;
     }
     let row_stride = (h / 16).max(1);
-    let cols: Vec<usize> = (0..64).map(|i| w * (i + 1) / 65).collect();
+    let cols: [usize; 64] = std::array::from_fn(|i| w * (i + 1) / 65);
     // 第一遍：找全范围最小像素差。
     let mut min_diff = u64::MAX;
     for cand in lo..=hi {
@@ -431,6 +517,431 @@ pub fn best_pixel_offset(a: &CapturedFrame, b: &CapturedFrame) -> Option<(usize,
     }
     best
 }
+
+// ───────────────────────── 精层：整行哈希校验 ─────────────────────────
+//
+// 粗层（上面的 8 列 × 3 通道 3×3 平均签名）抗噪好，但**水平分辨率只有 8 列**：
+// 表格的序号列、进度条、图标列等窄特征可能整列落在采样列之间 → 多行签名相同
+// → 要么周期假峰（多滚 → 重复拼接），要么真实滚动被判「没动/歧义」（只拼一页）。
+//
+// 精层的模型更贴近真实网页：一帧 = **固定栏**（页头/页脚/分页栏/悬浮条，每帧
+// 同一位置重复出现、不随内容滚动）+ **滚动内容区**。于是：
+//   * 固定栏 = a、b 在同一位置逐行完全相同的头部/尾部长（`fixed_bands`）；
+//   * 只有滚动内容区携带「滚了多少」的信息，判定与追加都应**只取内容区**——
+//     这同时解决三件事：固定底栏不再被当作新内容重复拼入、首帧残留的底栏从
+//     长图中间裁掉、固定栏不参与打分（否则大片固定栏会淹掉真实偏移）。
+// 打分用**整行哈希**：静止帧的真实滚动是逐字节平移，真实偏移处内容行全中
+// （1000‰），假偏移处全错（0‰）。候选里**含 s=0**，平票取最小 s —— 内容没动
+// 时 s=0 天然满命中，假偏移（周期倍数）无法胜出，静止帧自动被否，不会拼重复。
+
+/// 整行哈希的采样步长（每 N 个像素取一个；2 已足够判别，耗时减半）
+const HASH_STEP: usize = 2;
+/// 固定底栏最短长度：1~3 行的相同只是巧合，不按固定栏处理
+const BAND_MIN: usize = 4;
+/// 固定栏最长占比（h / 此值）：超过说明整帧大半没动（静止帧），不是「固定栏」
+const BAND_MAX_DIV: usize = 2;
+/// 精层判「精确对齐可信」的最低命中率（千分比：命中有信息行 / 有信息行总数）
+pub const EXACT_PERMILLE_MIN: usize = 500;
+/// 判「高置信」：有信息行几乎全中（动态元素只影响少数行）。
+///
+/// 静止帧的真实滚动是逐字节平移，命中率 1000‰；动画中间帧（亚像素混合）会明显
+/// 掉下来。手写滚动时**静止帧很多**（滚轮一格一段动画，动画结束后画面静止），
+/// 所以先用高置信结果拼（接缝逐像素对齐），高置信长时间不出现才退回宽判据。
+const EXACT_PERMILLE_CONFIDENT: usize = 900;
+/// 精层最小可信有信息行数（绝对下限，防小重叠带巧合）
+const EXACT_INFO_MIN: usize = 8;
+
+/// 每行的哈希（RGB 逐像素采样，跳过 alpha）。
+///
+/// 用 FNV-1a 逐字节混合：整行内容参与，窄特征（序号列/图标）不会被漏掉。
+/// 行宽也混入哈希尾，避免不同宽度帧截断后同哈希（调用方已校验尺寸，纯保险）。
+fn fill_row_hashes(f: &CapturedFrame, w: usize, h: usize, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(h);
+    let px = &f.pixels;
+    let row_bytes = w * 4;
+    // 采样仍是「每 HASH_STEP 个像素取一个」，但做了两件让 CPU 跑满的事：
+    //
+    // 1. **拆开 FNV 的串行乘法依赖链**：FNV 每步 `hash = (hash ^ w) * PRIME`，上一步的
+    //    乘法结果喂下一步，单累加器时整个循环被乘法延迟（~5 周期）卡住——1080p 实测
+    //    5.5ms/帧。这里用 4 条独立累加链，乱序执行能并行，末尾再混合（§mix4）。
+    // 2. **按 4×HASH_STEP 字节的块遍历**：一次拿到 4 个采样点的定长切片，省掉逐点
+    //    下标边界检查（编译器能直接消掉）。步长恰好等于 HASH_STEP 个像素的宽度，
+    //    所以采样点与逐点写法**完全一致**。
+    //
+    // 哈希**数值**因此变了，但「两行是否相同」的判定语义不变：同样的采样点、同样
+    // 只由 RGB 决定（掩掉 alpha）。1080p 实测 5.5ms → ~0.9ms/帧。
+    const W: usize = 4; // 一次处理 4 个采样点
+    let chunk = 4 * HASH_STEP; // 单个采样点的字节宽度（= 一个像素 4 字节 × 步长）
+    let block = W * chunk;
+    #[inline(always)]
+    fn word(part: &[u8], off: usize) -> u64 {
+        // 只取 RGB（低 3 字节，掩掉 alpha），与逐通道写法等价
+        (u32::from_ne_bytes(part[off..off + 4].try_into().unwrap()) & 0x00FF_FFFF) as u64
+    }
+    #[inline(always)]
+    fn mix(h: u64, w: u64) -> u64 {
+        (h ^ w).wrapping_mul(0x100_0000_01b3)
+    }
+    for r in 0..h {
+        let row = &px[r * row_bytes..r * row_bytes + row_bytes];
+        let mut h0 = 0xcbf2_9ce4_8422_2325u64;
+        let mut h1 = 0x9e37_79b9_7f4a_7c15u64;
+        let mut h2 = 0xff51_afd7_ed55_8ccdu64;
+        let mut h3 = 0xc4ce_b9fe_1a85_ec53u64;
+        let mut it = row.chunks_exact(block);
+        for part in &mut it {
+            h0 = mix(h0, word(part, 0));
+            h1 = mix(h1, word(part, chunk));
+            h2 = mix(h2, word(part, chunk * 2));
+            h3 = mix(h3, word(part, chunk * 3));
+        }
+        // 行尾不足一整块的部分：用 `chunks`（不是 chunks_exact）拿到最后那段零头，
+        // 只要还剩**至少一个像素**就按原语义哈希该像素的 RGB（掩掉 alpha）；
+        // 连一个像素都不够则与原来一样不采样。采样集合与「每 HASH_STEP 个像素取一个」
+        // 逐点一致（w 为奇数时也不会漏掉/重复末像素）。
+        for part in it.remainder().chunks(chunk) {
+            if part.len() >= 4 {
+                h0 = mix(h0, word(part, 0));
+            }
+        }
+        // 混合 4 条链：不引入新的「不同行 → 相同哈希」风险，只是把并行结果合起来
+        let hash = (h0 ^ h1.rotate_left(17) ^ h2.rotate_left(31) ^ h3.rotate_left(47))
+            .wrapping_mul(0x100_0000_01b3)
+            ^ (w as u64);
+        out.push(hash);
+    }
+}
+
+/// 该行是否「有信息」：与相邻行（前或后）哈希不同。
+///
+/// 纯色/空白行**在任何偏移下都相等**，把它们算进命中率会给「小偏移」白送一大截
+/// 分数（重叠带更大、白送的行更多）→ 精层会选到过小的偏移 → 长图缺行。
+/// 只统计有信息行后：真实偏移处有信息行全中，假偏移处全错，判别力远强于
+/// 「命中行数最多」。
+#[inline]
+fn row_informative(hashes: &[u64], i: usize) -> bool {
+    let prev_diff = i > 0 && hashes[i] != hashes[i - 1];
+    let next_diff = i + 1 < hashes.len() && hashes[i] != hashes[i + 1];
+    prev_diff || next_diff
+}
+
+/// 固定栏：a、b 在**同一位置逐行完全相同**的头部/尾部长（`(头部, 尾部)`）。
+///
+/// 这些行不随内容滚动（页头、页脚、分页栏、悬浮条、播放控制条），是「固定栏」；
+/// 中间剩下的就是滚动内容区。上限各 h/2（超过说明整帧基本没动）。
+pub fn fixed_bands(a: &CapturedFrame, b: &CapturedFrame) -> (usize, usize) {
+    if a.width != b.width || a.height != b.height {
+        return (0, 0);
+    }
+    let w = a.width as usize;
+    let h = a.height as usize;
+    if w == 0 || h == 0 {
+        return (0, 0);
+    }
+    let mut ha = Vec::new();
+    let mut hb = Vec::new();
+    fill_row_hashes(a, w, h, &mut ha);
+    fill_row_hashes(b, w, h, &mut hb);
+    bands_from_hashes(&ha, &hb, h)
+}
+
+/// 从整行哈希流求固定栏长度（见 [`fixed_bands`]）。哈希是 64 位 FNV，碰撞概率可忽略。
+fn bands_from_hashes(ha: &[u64], hb: &[u64], h: usize) -> (usize, usize) {
+    let limit = h / BAND_MAX_DIV;
+    let mut ft = 0;
+    while ft < limit && ha[ft] == hb[ft] {
+        ft += 1;
+    }
+    let mut fb = 0;
+    while fb < limit && ha[h - 1 - fb] == hb[h - 1 - fb] {
+        fb += 1;
+    }
+    (ft, fb)
+}
+
+/// 该行段是否有纹理（相邻行存在差异）：真实 UI 栏（页脚/分页栏/按钮条）内部一定有
+/// 文字、边框、按钮等差异行；**纯色/空白段**没有。
+///
+/// 这个区分很关键：纯色/空白段在 a、b 里同一位置本来就相等（与滚动无关），若当成
+/// 「固定底栏」排除，追加窗口会整体上移 k 行 → 拼进去的是**已经拼过的内容**（重复），
+/// 而真正的底栏必须排除（否则每帧复制一条进长图）。所以只把**有纹理**的段当固定栏。
+fn run_textured(hashes: &[u64], from: usize, to: usize) -> bool {
+    let len = to.saturating_sub(from);
+    if len < 2 {
+        return false;
+    }
+    let mut changes = 0usize;
+    for i in (from + 1)..to {
+        if hashes[i] != hashes[i - 1] {
+            changes += 1;
+        }
+    }
+    // 只要段内存在两处相邻行差异就算有纹理：真实 UI 栏必然有边线/文字/按钮，
+    // 而纯色/空白段的相邻行**完全相同**（0 处差异）。段本身已由「同一位置逐行相等」
+    // 筛过，所以这里不需要比例门槛。
+    changes >= 2
+}
+
+/// 固定底栏行数：帧底「与上一帧同一位置逐行相同」的连续行数。
+///
+/// 这里刻意**宁可多算**（不剔除纯色/空白行），因为两个方向的代价完全不对等：
+/// - **多算**（底栏上方的空白内容也算成底栏）：只有首帧尾部那段底栏会被多裁一点，
+///   每次追加仍正好补上滚动量，接缝严格连续——少掉的是纯色/空白行，肉眼无差别。
+/// - **少算**（真正的底栏没算全）：追加窗口会越过内容末尾往回退，每次拼接都重复几行
+///   **可见内容**——就是用户反馈的「长图最后一页和倒数第二页部分内容重复」。
+///
+/// 曾经这里额外剔除了「段首纯色块」（为了对付底栏上方的空白）。问题在于真实页脚常常
+/// 是「整条纯色 + 顶部细线」，纯色块就是底栏自己的一部分，减掉它就把底栏判矮了——
+/// 于是又回到上面那条灾难路径。回归测试见
+/// `scroll::manual_diag_tests::synth_solid_leading_footer_does_not_duplicate_content`。
+pub fn fixed_bottom_band(a: &CapturedFrame, b: &CapturedFrame) -> usize {
+    if a.width != b.width || a.height != b.height {
+        return 0;
+    }
+    let w = a.width as usize;
+    let h = a.height as usize;
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    let mut ha = Vec::new();
+    let mut hb = Vec::new();
+    fill_row_hashes(a, w, h, &mut ha);
+    fill_row_hashes(b, w, h, &mut hb);
+    band_from_identical_tail(&hb, &ha, h)
+}
+
+/// 供**判定阶段**使用的底栏估计（此时还没测出滚动量，也还没有长图可对照）。
+///
+/// 与 [`fixed_bottom_band`] 不同，这里会剔掉尾部相同段**段首的纯色/空白块**：判定阶段
+/// 需要尽量多的「有信息行」，纯色块不含信息，还会把内容区压小 → 大滚动量被 `max_s` 拒掉。
+/// 只用于算命中率的分母，不决定追加窗口位置（那个必须用「宁可多算」的
+/// [`fixed_bottom_band`]，否则会重复拼接可见内容）。
+fn band_for_metric(ha: &[u64], hb: &[u64], h: usize) -> usize {
+    let (_, fb) = bands_from_hashes(ha, hb, h);
+    if fb < BAND_MIN {
+        return 0;
+    }
+    let from = h - fb;
+    let mut uniform = 1;
+    while uniform < fb && hb[from + uniform] == hb[from] {
+        uniform += 1;
+    }
+    let uniform = if uniform >= 2 { uniform } else { 0 };
+    let band = fb - uniform;
+    if band < BAND_MIN || !run_textured(hb, h - band, h) {
+        return 0;
+    }
+    band
+}
+
+/// 帧底与上一帧同一位置逐行相同的连续行数（见 [`fixed_bottom_band`] 的语义）。
+fn band_from_identical_tail(hb: &[u64], ha: &[u64], h: usize) -> usize {
+    let limit = h / BAND_MAX_DIV;
+    let mut band = 0usize;
+    while band < limit && hb[h - 1 - band] == ha[h - 1 - band] {
+        band += 1;
+    }
+    if band < BAND_MIN {
+        0
+    } else {
+        band
+    }
+}
+
+
+/// 反向（向上滚）判定：当前帧 `cur` 的内容相对上一次基线 `prev` 是**向上**移动的。
+///
+/// 只认精层逐字节对齐（命中率高）的结果。为什么不能用粗层：粗层签名对「向下滚」
+/// 的一对帧也会给出 1~30 的噪声偏移（周期性内容 / 模糊帧），一旦把它当成「向上滚」，
+/// 引擎每轮都会走进「保持基线、不拼接」的分支——用户明明在向下滚，静止帧却全被
+/// 白白错过，长图最后只剩第一页。
+pub fn scroll_up_delta(cur: &CapturedFrame, prev: &CapturedFrame) -> Option<usize> {
+    let plan = plan_append(cur, prev)?;
+    if plan.s >= MIN_SCROLL && plan.via_exact && plan.permille >= EXACT_PERMILLE_MIN {
+        Some(plan.s)
+    } else {
+        None
+    }
+}
+
+/// 精层决策结果（见 [`plan_append`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendPlan {
+    /// 滚动量（行）：本帧新进入视口的内容行数
+    pub s: usize,
+    /// 固定底栏行数：帧末尾这么多行不参与滚动，追加时须排除
+    pub band: usize,
+    /// 固定顶栏行数（日志/诊断用）
+    pub top: usize,
+    /// 精层有信息行数（日志/诊断用）
+    pub exact: usize,
+    /// 精层有信息行命中率（千分比）
+    pub permille: usize,
+    /// 是否由精层确认（false = 由粗层采样签名给出）
+    pub via_exact: bool,
+    /// 高置信：精层有信息行几乎全中（接缝可保证逐像素对齐）
+    pub confident: bool,
+}
+
+impl StitchScratch {
+    /// 精层：在滚动内容区里找**有信息行命中率**最高的偏移，返回 (s, 命中率‰, 有信息行数)。
+    ///
+    /// 候选从 0 开始（0 = 内容没动）；打分只在内容区 `[ft, ft + content_h - s)` 内进行，
+    /// 命中率更高者胜、平票保留更小的 s（周期内容取最小倍数不跳过内容；内容没动时
+    /// s=0 满命中，天然否决周期假偏移）。
+    fn exact_aligned_offset(
+        &mut self,
+        ft: usize,
+        content_h: usize,
+        max_s: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for s in 0..=max_s {
+            let n = content_h.saturating_sub(s);
+            if n < EXACT_INFO_MIN {
+                break;
+            }
+            let mut info = 0usize;
+            let mut hit = 0usize;
+            for i in ft..ft + n {
+                if !(row_informative(&self.hb, i) || row_informative(&self.ha, s + i)) {
+                    continue;
+                }
+                info += 1;
+                if self.hb[i] == self.ha[s + i] {
+                    hit += 1;
+                }
+            }
+            if info < EXACT_INFO_MIN {
+                continue;
+            }
+            let permille = hit * 1000 / info;
+            if best.is_none_or(|(_, bp, _)| permille > bp) {
+                best = Some((s, permille, info));
+            }
+        }
+        best
+    }
+
+    /// 追加行（内容区末尾 s 行，即 `[ft + content_h - s, ft + content_h)`）里有多少行是
+    /// anchor **已经显示过的内容**（整行哈希命中 anchor 的内容区）。
+    ///
+    /// 真实滚动追加的是「从未出现过」的新内容 → 该值应接近 0；周期性内容的假大偏移
+    /// 会把 anchor 里已有的行再拼一遍（重复拼接）→ 该值很高。
+    fn duplicated_rows(&self, s: usize, ft: usize, content_h: usize) -> usize {
+        if content_h == 0 || s == 0 {
+            return 0;
+        }
+        let start = ft + content_h - s.min(content_h);
+        let end = ft + content_h;
+        let mut dup = 0usize;
+        for i in start..end.min(self.hb.len()) {
+            let hash = self.hb[i];
+            if self.ha[ft..end.min(self.ha.len())].contains(&hash) {
+                dup += 1;
+            }
+        }
+        dup
+    }
+}
+
+/// 决定这一帧该怎么拼：**精层优先**（整行哈希确认 + 固定栏识别），精层不够可信时
+/// 回落粗层（采样签名，抗噪但分辨率低）。
+///
+/// 返回 `None` = 这一帧不可可靠拼接，调用方应保留基线等下一帧（宁缺毋滥）：
+///   * 内容没动（含「只有固定栏在动」的静止帧）——精层 s=0 胜出即判否；
+///   * 内容区太小（整帧几乎都是固定栏）；
+///   * 精层与粗层都测不出可靠偏移；
+///   * 粗层给出的偏移疑似重复拼接（追加行大段是 anchor 已有内容）。
+pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<AppendPlan> {
+    if anchor.width != frame.width || anchor.height != frame.height {
+        return None;
+    }
+    let w = anchor.width as usize;
+    let h = anchor.height as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        // 整行哈希只算一遍：固定栏、纹理判定、打分都用它（省掉重复的全帧扫描）。
+        fill_row_hashes(anchor, w, h, &mut sc.ha);
+        fill_row_hashes(frame, w, h, &mut sc.hb);
+        // 固定栏：帧首/帧尾在同一位置逐行相同 → 不随内容滚动。**底栏必须排除**，
+        // 否则每拼一帧就复制一条底栏进长图（判矮还会让窗口往回退、重复可见内容）。
+        let (raw_ft, _) = bands_from_hashes(&sc.ha, &sc.hb, h);
+        // 顶栏同理：顶栏里与内容区相邻的纯色/空白块不含信息，还会把内容区压小
+        // （大滚动量被 max_s 拒掉 = 「只拼一页」），因此从**判定起点**里去掉；
+        // `plan.top` 仍报告识别到的顶栏高度。
+        let mut ft = raw_ft;
+        while ft > 0 && sc.hb[ft - 1] == sc.hb[ft] {
+            ft -= 1;
+        }
+        // 判定阶段先用 `band_for_metric`（尾部相同段 − 纯色块）估底栏：这里只需要内容区
+        // 里有足够多「有信息行」，纯色块会把内容区压小、把大滚动量拒掉。真正决定追加
+        // 窗口位置的是返回值里的 `band`，用的是「宁可多算」的 `band_from_identical_tail`
+        //（见 `fixed_bottom_band`：判矮会重复拼入可见内容，判高只是少几行纯色）。
+        let band = band_for_metric(&sc.ha, &sc.hb, h);
+        let content_h = h.saturating_sub(ft).saturating_sub(band);
+        if content_h < MIN_SCROLL + EXACT_INFO_MIN {
+            // 内容区太小：整帧几乎没动（静止帧 ft+fb≈h）或全被固定栏占满 → 无法判定
+            return None;
+        }
+        let max_s = content_h.saturating_sub(EXACT_INFO_MIN).min(MAX_SCROLL);
+        if max_s < MIN_SCROLL {
+            return None;
+        }
+        let exact = sc.exact_aligned_offset(ft, content_h, max_s);
+        let (s, info, permille, via_exact) = match exact {
+            // 精层满命中但指向「没动」（s=0 胜出）／内容区无信息行 → 内容确实没滚，
+            // 直接否（静止帧不拼重复）；仅当粗层给出可信偏移时才用粗层结果。
+            Some((0, _, _)) | None => match sc.find_scroll_delta(anchor, frame) {
+                Some(s_c) if s_c >= MIN_SCROLL => (s_c, 0, 0, false),
+                _ => return None,
+            },
+            Some((s_e, permille, info)) if permille >= EXACT_PERMILLE_MIN => {
+                (s_e, info, permille, true)
+            }
+            Some((s_e, permille, info)) => {
+                // 精层命中率不高：动画中间帧（亚像素混合 → 逐字节不等）居多，交粗层。
+                match sc.find_scroll_delta(anchor, frame) {
+                    // 粗层与精层指向同一偏移 → 互相印证，采信精层
+                    Some(s_c) if s_c.abs_diff(s_e) <= 2 => (s_e, info, permille, true),
+                    Some(s_c) => (s_c, info, permille, false),
+                    // 粗层测不出但精层有可观命中（≥1/3 有信息行）→ 救回真实滚动。
+                    // 这正是「真实滚动被粗层严格门拒掉 → 只拼一页」的场景。
+                    None if permille >= EXACT_PERMILLE_MIN * 2 / 3 => (s_e, info, permille, true),
+                    None => return None,
+                }
+            }
+        };
+        if s < MIN_SCROLL || s > content_h {
+            return None;
+        }
+        // 重复拼接否决：只用于**粗层**给出的偏移（精层已被逐字节确认）。
+        // 周期假峰会给出「多滚一截」的偏移，其追加行大段是 anchor 已有内容。
+        if !via_exact {
+            let dup = sc.duplicated_rows(s, ft, content_h);
+            if s >= EXACT_INFO_MIN && dup * 2 > s {
+                tracing::debug!("plan: reject_dup s={s} dup={dup} new={s} band={band}");
+                return None;
+            }
+        }
+        // 追加窗口用「宁可多算」的底栏判定（见 fixed_bottom_band），理由见那里的注释。
+        let band = band_from_identical_tail(&sc.hb, &sc.ha, h);
+        Some(AppendPlan {
+            s,
+            band,
+            top: raw_ft,
+            exact: info,
+            permille,
+            via_exact,
+            confident: via_exact && permille >= EXACT_PERMILLE_CONFIDENT,
+        })
+    })
+}
+
 
 /// 逐像素验证采样列（8 列均匀分布）
 fn fill_vcols(w: usize, out: &mut Vec<usize>) {
@@ -479,6 +990,11 @@ fn row_matches(ma: &RowAvg, mb: &RowAvg) -> bool {
 /// 但「均值过低」对**大部分空白/平滑、夹一条窄纹理带**的帧会误判：空白行把均值
 /// 稀释到阈值以下，而那条纹理带其实是能钉住偏移的。因此除了均值判定，还要看
 /// 带内**有纹理的行数**——存在可观纹理行（≥1/8 行相邻差达标）就仍可判定。
+///
+/// 注意：**生产路径**（`score_candidates`）已把这套判定改写为「相邻行差后缀和 +
+/// 后缀纹理计数」的 O(1) 形式（同一对相邻行原先会被上千个偏移重复 diff）。
+/// 这里保留逐偏移现算的朴素版本，只作为等价性测试的参照实现。
+#[cfg(test)]
 fn band_has_energy(ma: &[RowAvg], s: usize, h: usize) -> bool {
     let n = h - s;
     if n < 2 {
@@ -579,6 +1095,140 @@ mod tests {
             width: w as u32,
             height: h as u32,
             pixels,
+        }
+    }
+
+    /// 性能改造的**等价性护栏**：`score_candidates` 现在用「后缀和预计算能量门 +
+    /// 交换循环次序 + 切片迭代」重写（1080p 实测 18ms → 5.8ms），这里按**原始写法**
+    /// （外层 s、内层 r、每个 s 现算 band_has_energy）重算候选表逐项比对：
+    /// best 偏移、候选顺序都必须完全一致——否则并列偏移的胜出项会漂移、拼接行为跟着变。
+    #[test]
+    fn score_candidates_equivalent_to_naive_reference() {
+        fn naive(
+            ma: &[RowAvg],
+            mb: &[RowAvg],
+            h: usize,
+            max_s: usize,
+        ) -> (Option<(usize, usize)>, Vec<(usize, usize)>) {
+            let mut cands: Vec<(usize, usize)> = Vec::new();
+            for s in 1..=max_s {
+                if !band_has_energy(ma, s, h) {
+                    continue;
+                }
+                let n = h - s;
+                let mut count = 0usize;
+                for r in 0..n {
+                    if row_matches(&ma[s + r], &mb[r]) {
+                        count += 1;
+                    }
+                }
+                cands.push((count, s));
+            }
+            cands.sort_unstable_by(|x, y| y.0.cmp(&x.0));
+            (cands.first().copied(), cands)
+        }
+
+        const W: usize = 160;
+        const H: usize = 240;
+        // 纯色帧：能量门应当大面积拒绝（覆盖 n<2 / 无纹理分支）
+        let mut blank = frame(W, H);
+        for r in 0..H {
+            for c in 0..W {
+                let p = (r * W + c) * 4;
+                blank.pixels[p] = 240;
+                blank.pixels[p + 1] = 240;
+                blank.pixels[p + 2] = 240;
+            }
+        }
+        // 周期帧：制造大量并列候选（排序顺序敏感的场景）
+        let mut pa = frame(W, H);
+        let mut pb = frame(W, H);
+        for f in [&mut pa, &mut pb] {
+            for r in 0..H {
+                for c in 0..W {
+                    let p = (r * W + c) * 4;
+                    let v = ((r % 12) * 20 + (c % 7) * 3) as u8;
+                    f.pixels[p] = v;
+                    f.pixels[p + 1] = v.wrapping_add(50);
+                    f.pixels[p + 2] = v.wrapping_mul(5);
+                }
+            }
+        }
+        let textured = frame(W, H);
+        let cases: Vec<(&str, CapturedFrame, CapturedFrame)> = vec![
+            ("textured", textured.clone(), scrolled(&textured, W, H, 70)),
+            ("blank", blank.clone(), blank.clone()),
+            ("periodic", pa, pb),
+        ];
+
+        for (label, a, b) in cases {
+            let h = a.height as usize;
+            let max_s = h.saturating_sub(MIN_OVERLAP);
+            let mut sc = StitchScratch::default();
+            fill_vcols(W, &mut sc.vcols);
+            fill_row_avgs(&a, W, h, &sc.vcols, &mut sc.ma);
+            fill_row_avgs(&b, W, h, &sc.vcols, &mut sc.mb);
+            let got = sc.score_candidates(h, max_s);
+            let (want_best, want_cands) = naive(&sc.ma, &sc.mb, h, max_s);
+            assert_eq!(got, want_best, "{label}: best 偏移不一致");
+            assert_eq!(sc.cands, want_cands, "{label}: 候选表逐项不一致");
+        }
+    }
+
+    /// 整行哈希的**语义契约**（性能重写后必须继续成立）：
+    /// 只由「每 HASH_STEP 个像素取一个」的采样点 **RGB** 决定——
+    ///  - 采样点 RGB 相同（alpha 不同、或未采样像素不同）→ 哈希必须相同；
+    ///  - 采样点 RGB 不同 → 哈希必须不同。
+    /// 这层契约是固定栏/滚动量判定的基础（哈希值本身可以随实现变，相等关系不能变）。
+    #[test]
+    fn row_hash_semantics_only_sampled_rgb() {
+        for &w in &[8usize, 9, 62, 63, 64, 65, 160] {
+            let h = 4usize;
+            let mk = || CapturedFrame {
+                width: w as u32,
+                height: h as u32,
+                pixels: vec![0u8; w * h * 4],
+            };
+            let mut base = mk();
+            for r in 0..h {
+                for c in 0..w {
+                    let p = (r * w + c) * 4;
+                    base.pixels[p] = (r as u8).wrapping_mul(31).wrapping_add(c as u8);
+                    base.pixels[p + 1] = 90;
+                    base.pixels[p + 2] = 200;
+                    base.pixels[p + 3] = 255;
+                }
+            }
+            let mut ha = Vec::new();
+            let mut hb = Vec::new();
+            fill_row_hashes(&base, w, h, &mut ha);
+
+            // alpha 变了：不参与哈希
+            let mut alpha = base.clone();
+            for p in (3..alpha.pixels.len()).step_by(4) {
+                alpha.pixels[p] = 7;
+            }
+            fill_row_hashes(&alpha, w, h, &mut hb);
+            assert_eq!(ha, hb, "w={w}: alpha 不应影响行哈希");
+
+            // 未采样像素（采样点为 0,2,4...，改第 1、3、5... 个像素）：不参与哈希
+            let mut unsampled = base.clone();
+            for r in 0..h {
+                let mut c = 1;
+                while c < w {
+                    let p = (r * w + c) * 4;
+                    unsampled.pixels[p] = unsampled.pixels[p].wrapping_add(77);
+                    c += 2;
+                }
+            }
+            fill_row_hashes(&unsampled, w, h, &mut hb);
+            assert_eq!(ha, hb, "w={w}: 未采样像素不应影响行哈希");
+
+            // 采样像素 RGB 变了：必须影响哈希
+            let mut sampled = base.clone();
+            sampled.pixels[0] = sampled.pixels[0].wrapping_add(13);
+            fill_row_hashes(&sampled, w, h, &mut hb);
+            assert_ne!(ha, hb, "w={w}: 采样像素 RGB 必须影响行哈希");
         }
     }
 

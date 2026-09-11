@@ -30,7 +30,6 @@ use gpui_component::button::{ButtonVariant, ButtonVariants};
 use gpui_component::ActiveTheme;
 use gpui_component::Disableable;
 use gpui_component::IconName;
-use gpui_component::Selectable;
 use gpui_component::Sizable;
 use gpui_component::Icon;
 use gpui_component::popover::Popover;
@@ -46,6 +45,8 @@ use crate::overlay::drawing::{DrawCommand, DrawingState, FontWeight, RGBA};
 use crate::overlay::palette;
 use crate::overlay::selection::{DragState, SelectionState};
 use crate::overlay::toolbar::{ToolButton, ToolbarPopup, ToolbarState};
+// 统一设计令牌（颜色/圆角/间距/阴影）+ 复用按钮样式：见 ui_theme 模块文档
+use crate::overlay::ui_theme as theme;
 use crate::utils::bounds::{self as ub, Point as BoundsPoint};
 
 /// 覆盖窗口交互状态机
@@ -396,7 +397,71 @@ impl OverlayView {
         self.scale_factor = scale_factor;
         tracing::info!("[overlay] start_session scale_factor={scale_factor} frame={}x{}", self.frame_width, self.frame_height);
         self.dim_opacity = 1.0;
+        self.apply_ui_probe();
         cx.notify();
+    }
+
+    /// **仅用于 UI 视觉调试**：`SCREENSHOT_RS_UI_PROBE=<工具>[:popover]` 时，
+    /// 会话一开始就造一个默认选区、选中指定工具（可选同时展开它的弹层）。
+    ///
+    /// 动机：截图工具栏/二级弹层的样式只能在真实覆盖窗口里看到，而手工
+    /// 拖拽+点击既慢又容易点空（还会误改用户桌面上的东西）。带上这个环境
+    /// 变量后，一次 `alt+s` 就能直接得到「已选中矩形工具 + 弹层展开」的画面，
+    /// 供截图脚本逐像素核对。工具名：rect/ellipse/arrow/pen/text/mosaic。
+    ///
+    /// 正常使用不带该环境变量，此函数立即返回。
+    fn apply_ui_probe(&mut self) {
+        let Ok(spec) = std::env::var("SCREENSHOT_RS_UI_PROBE") else {
+            return;
+        };
+        // spec 形如 `rect[:popover]`；也可以和辅助窗口探针组合成
+        // `rect:popover,pin,progress`（逗号后面是 [`probe_aux_windows`] 的取值），
+        // 所以这里按逗号切分后再判断有没有 popover。
+        let (head, rest) = match spec.split_once(':') {
+            Some((n, p)) => (n.to_string(), p.to_string()),
+            None => (spec.clone(), String::new()),
+        };
+        let (name, want_popup) = (
+            head.split(',').next().unwrap_or("").trim(),
+            rest.split(',').any(|p| p.trim() == "popover"),
+        );
+        let tool = match name {
+            "rect" => ToolButton::Rectangle,
+            "ellipse" => ToolButton::Ellipse,
+            "arrow" => ToolButton::Arrow,
+            "pen" => ToolButton::Freehand,
+            "text" => ToolButton::Text,
+            "mosaic" => ToolButton::Mosaic,
+            other => {
+                tracing::warn!("[UI 探针] 未知工具 {other}，忽略");
+                return;
+            }
+        };
+        // 默认选区：屏幕中部 640x420 的框（工具栏/弹层相对它定位）
+        let sb = self.screen_bounds;
+        let w = sb.size.x.min(640.0);
+        let h = sb.size.y.min(420.0);
+        let ox = sb.origin.x + (sb.size.x - w) / 2.0;
+        let oy = sb.origin.y + (sb.size.y - h) / 2.0;
+        self.selection.mouse_down(ub::Point::new(ox, oy));
+        self.selection.mouse_move(ub::Point::new(ox + w, oy + h));
+        self.selection.mouse_up();
+        // 正常流程里 mouse_up 会把模式切到 Editing（工具栏只在 Editing 显示），
+        // 这里直接驱动纯逻辑状态机，必须自己补上这一步。
+        self.mode = OverlayMode::Editing;
+        self.toolbar.active_tool = Some(tool);
+        if want_popup {
+            self.toolbar.popup = Some(if tool == ToolButton::Text {
+                ToolbarPopup::Text
+            } else {
+                ToolbarPopup::Stroke
+            });
+        }
+        tracing::warn!(
+            "[UI 探针] 已注入默认选区 {:?} 工具={tool:?} 弹层={:?}",
+            self.selection.current(),
+            self.toolbar.popup
+        );
     }
 
     /// 发送结果并停靠窗口（复用：窗口不销毁，缩到不可见/unmap 供下次使用）
@@ -911,141 +976,86 @@ impl OverlayView {
         let active_tool = self.toolbar.active_tool;
         let can_undo = self.drawing.history_index > 0;
         let can_redo = self.drawing.history_index < self.drawing.commands.len();
+        // 滚动截屏需要一个像样的选区（太小没有可滚动内容，注入滚动也没意义）
+        let scroll_disabled = sel.size.x < 20.0 || sel.size.y < 20.0;
 
         let (toolbar_x, toolbar_y, _toolbar_w, toolbar_h) =
             compute_toolbar_bounds(sel, self.screen_bounds);
 
-        // 弹窗展开方向：工具栏在选区**上方**（截图框被拖到屏幕底部、工具栏翻上去）
-        // 时才考虑向上展开以避开截图框。
-        // 但仅当工具栏距屏幕顶部有足够空间（弹层向上展开不会被 snap 弹回窗口内、
-        // 盖到「完成/取消」等操作按钮）时才向上；否则仍向下展开（弹层在工具栏下方，
-        // 不遮操作按钮，只是可能盖到截图框顶部）。
-        let popover_open_up = (toolbar_y + toolbar_h <= sel.origin.y)
-            && (toolbar_y >= self.screen_bounds.origin.y + POPOVER_UP_MIN_ROOM);
+        // 弹层展开方向：**永远不要盖住工具栏自己**（用户反馈：文字弹层会挡住
+        // 「文字」按钮）。判定顺序：
+        //   1) 先看首选方向放不放得下——首选是「不遮截图框」：工具栏在选区上方
+        //      时向上展开，否则向下展开；
+        //   2) 首选方向放不下就换另一边；
+        //   3) 两边都放不下（矮屏幕 + 超长弹层）就选空间大的那边，此时 gpui 的
+        //      snap 仍可能平移，但至少不会把弹层挪到工具栏正上方。
+        let screen_top = self.screen_bounds.origin.y;
+        let screen_bottom = self.screen_bounds.origin.y + self.screen_bounds.size.y;
+        let popover_est_h = if active_tool == Some(ToolButton::Text) {
+            POPOVER_EST_H_TEXT
+        } else {
+            POPOVER_EST_H_STROKE
+        };
+        let toolbar_bottom = toolbar_y + toolbar_h;
+        let space_below = screen_bottom - toolbar_bottom - POPOVER_EDGE_MARGIN;
+        let space_above = toolbar_y - screen_top - POPOVER_EDGE_MARGIN;
+        let prefer_up = toolbar_bottom <= sel.origin.y;
+        let popover_open_up = match (prefer_up, space_above, space_below) {
+            (true, above, _) if above >= popover_est_h => true,
+            (true, _, below) if below >= popover_est_h => false,
+            (false, _, below) if below >= popover_est_h => false,
+            (false, above, _) if above >= popover_est_h => true,
+            // 两边都放不下：选空间更大的一边（尽量少触发 snap 平移）
+            _ => space_above > space_below,
+        };
 
         let weak = cx.weak_entity();
-        let row = div()
+
+        // 按 ToolButton::GROUPS 分组渲染：组内按钮紧凑排列，组间画一条竖直
+        // 分隔线，把「绘图工具 → 识别/滚动 → 撤销重做 → 收尾动作」四类分开，
+        // 用户扫视时能快速定位（也避免 16 个按钮糊成一片）。
+        let mut bar = div()
             .flex()
             .flex_wrap()
-            .gap(px(TOOLBAR_GAP))
             .items_center()
-            // 1) 绘图工具按钮组：6 个工具按钮，每个都是 Popover trigger
-            //    (active_tool 在 Popover 内根据当前选中状态确定 popover kind)
-            .child(render_tool_button_with_popover(
-                ToolButton::Rectangle,
-                active_tool == Some(ToolButton::Rectangle),
-                popover_open_up,
-                weak.clone(),
-                self,
-                cx,
-            ))
-            .child(render_tool_button_with_popover(
-                ToolButton::Ellipse,
-                active_tool == Some(ToolButton::Ellipse),
-                popover_open_up,
-                weak.clone(),
-                self,
-                cx,
-            ))
-            .child(render_tool_button_with_popover(
-                ToolButton::Arrow,
-                active_tool == Some(ToolButton::Arrow),
-                popover_open_up,
-                weak.clone(),
-                self,
-                cx,
-            ))
-            .child(render_tool_button_with_popover(
-                ToolButton::Freehand,
-                active_tool == Some(ToolButton::Freehand),
-                popover_open_up,
-                weak.clone(),
-                self,
-                cx,
-            ))
-            .child(render_tool_button_with_popover(
-                ToolButton::Text,
-                active_tool == Some(ToolButton::Text),
-                popover_open_up,
-                weak.clone(),
-                self,
-                cx,
-            ))
-            .child(render_simple_button(
-                ToolButton::Ocr,
-                active_tool == Some(ToolButton::Ocr),
-                false,
-                weak.clone(),
-                cx,
-            ))
-            .child(render_simple_button(
-                ToolButton::Scroll,
-                false,
-                sel.size.x < 20.0 || sel.size.y < 20.0,
-                weak.clone(),
-                cx,
-            ))
-            .child(render_simple_button(
-                ToolButton::ScrollManual,
-                false,
-                sel.size.x < 20.0 || sel.size.y < 20.0,
-                weak.clone(),
-                cx,
-            ))
-            .child(render_tool_button_with_popover(
-                ToolButton::Mosaic,
-                active_tool == Some(ToolButton::Mosaic),
-                popover_open_up,
-                weak.clone(),
-                self,
-                cx,
-            ))
-            // 2) Undo / Redo
-            .child(render_simple_button(
-                ToolButton::Undo,
-                false,
-                !can_undo,
-                weak.clone(),
-                cx,
-            ))
-            .child(render_simple_button(
-                ToolButton::Redo,
-                false,
-                !can_redo,
-                weak.clone(),
-                cx,
-            ))
-            // 3) Pin / Cancel / Finish
-            .child(render_simple_button(
-                ToolButton::Pin,
-                false,
-                false,
-                weak.clone(),
-                cx,
-            ))
-            .child(render_simple_button(
-                ToolButton::Cancel,
-                false,
-                false,
-                weak.clone(),
-                cx,
-            ))
-            .child(render_simple_button(
-                ToolButton::Finish,
-                false,
-                false,
-                weak,
-                cx,
-            ));
+            .gap(px(theme::m::GROUP_GAP));
+        for (gi, group) in ToolButton::GROUPS.iter().enumerate() {
+            if gi > 0 {
+                bar = bar.child(group_divider());
+            }
+            let mut row = div().flex().items_center().gap(px(theme::m::BTN_GAP));
+            for &btn in group.iter() {
+                // 禁用条件集中在这里：撤销/重做看历史栈，滚动截屏要求选区够大
+                let disabled = match btn {
+                    ToolButton::Undo => !can_undo,
+                    ToolButton::Redo => !can_redo,
+                    ToolButton::Scroll | ToolButton::ScrollManual => scroll_disabled,
+                    _ => false,
+                };
+                let is_active = active_tool == Some(btn);
+                let el = if btn.has_popover() {
+                    render_tool_button_with_popover(
+                        btn,
+                        is_active,
+                        popover_open_up,
+                        weak.clone(),
+                        self,
+                        cx,
+                    )
+                    .into_any_element()
+                } else {
+                    render_simple_button(btn, is_active, disabled, weak.clone()).into_any_element()
+                };
+                row = row.child(el);
+            }
+            bar = bar.child(row);
+        }
 
         // 工具栏根 div
         // 通过 on_mouse_down 设 toolbar_hovered=true，配合 root.on_mouse_down 检查
         // 该标志 → 早 return，吞掉点击，避免 selection.mouse_down 把选区打散。
-        // 之前用 compute_toolbar_bounds 的几何矩形判断，但按钮实际宽度（图标+
-        // 中文标签）远超 32px 估算，导致 Finish / Cancel 落在估算外、被当成拖选。
-        // 子 div 的 on_mouse_down 先于 root 的 listener 跑（冒泡顺序：内→外），
-        // 所以 root.on_mouse_down 看到的 toolbar_hovered 是本次按下时刚 set 的值。
-        // on_mouse_up 时清回 false，避免下次非工具栏点击误判。
+        // 不用几何估算判断：按钮宽度随标签/图标变化，几何估算容易漏判，
+        // 而「内层先于外层」的冒泡顺序保证这里 set 的标志在 root 里已是新值。
         div()
             .absolute()
             .top(px(toolbar_y))
@@ -1053,15 +1063,16 @@ impl OverlayView {
             // 限制工具栏最大宽度为「从 toolbar_x 到屏幕右缘」，让按钮在窄截图区内
             // 自动换行，保证「完成/取消」等右侧按钮始终可见。
             .max_w(px(self.screen_bounds.origin.x + self.screen_bounds.size.x - toolbar_x))
-            .bg(gpui::rgba(0x1E1E1EF5))
-            .rounded_lg()
+            .bg(theme::c::rgb(theme::tokens::PANEL_BG))
+            .rounded(px(theme::r::PANEL))
             .border_1()
-            .border_color(gpui::rgba(0xFFFFFF26))
-            .p(px(TOOLBAR_PAD))
+            .border_color(theme::c::rgb(theme::tokens::PANEL_BORDER))
+            .shadow(theme::panel_shadow())
+            .p(px(theme::m::PANEL_PAD))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _window, _cx| {
                 this.toolbar_hovered = true;
             }))
-            .child(row)
+            .child(bar)
     }
 }
 
@@ -1070,69 +1081,85 @@ const HANDLE_VISUAL_SIZE: f32 = 8.0;
 /// handle 命中容差的一半（与 selection::HANDLE_HALF_SIZE 保持一致）
 const HANDLE_HIT_HALF: f32 = 8.0;
 
-/// 工具栏按钮视觉尺寸（正方形边长，px）
-const TOOLBAR_BTN_SIZE: f32 = 32.0;
-/// 工具栏按钮之间间距
-const TOOLBAR_GAP: f32 = 4.0;
-/// 工具栏整体内边距
-const TOOLBAR_PAD: f32 = 6.0;
-/// 弹窗向上展开所需的、距屏幕顶部的**最小**空间（px）。
-/// 小于该空间时向上展开会被 snap 弹回窗口内、盖到工具栏操作按钮，故改向下展开。
-const POPOVER_UP_MIN_ROOM: f32 = 260.0;
+/// 弹层与窗口边缘的安全间距（px）——与 gpui-component 的
+/// `snap_to_window_with_margin(px(8.))` 保持一致。
+const POPOVER_EDGE_MARGIN: f32 = 8.0;
+/// 弹层高度估计（px，宁大勿小）：只用来判断「往哪边展开放得下」。
+///
+/// gpui-component 的 Popover 用 `snap_to_window_with_margin` 兜底：如果按锚定
+/// 方向放不下，它会把弹层**整体平移**回窗口内——平移方向是向上，结果就是弹层
+/// 压住工具栏、盖住「文字/矩形」这些按钮本身（用户反馈）。所以展开方向必须
+/// 自己先算准，不能让 snap 去挪。
+/// 实测：粗细弹层 12 列色板 ≈ 190px（留出余量）
+const POPOVER_EST_H_STROKE: f32 = 210.0;
+/// 文字弹层更高（标签 + 字号档位 + 两组色板），实测 ≈ 257px；
+/// 取 300 是为了兜住"字号档位换行成两行"的情况（+30px），
+/// 估计值偏大只会让弹层偶尔多向上展开，偏小则会被 snap 推回来盖住按钮。
+const POPOVER_EST_H_TEXT: f32 = 300.0;
 /// 工具栏距离选区上沿的距离（px）
 const TOOLBAR_OFFSET_Y: f32 = 8.0;
 
-/// 把 ToolButton 映射到 gpui-component 的 Lucide 图标名
+/// 把 ToolButton 映射到图标
 ///
-/// gpui-component-assets 内置图标有限，找不到对应语义时取最接近的占位：
-/// - 画笔/手绘用 Asterisk（无 pen.svg/brush.svg/pencil.svg）
-/// - 马赛克用 LayoutDashboard（无 mosaic.svg，网格感接近）
-/// - Bold 用 CaseSensitive（无 bold.svg，字母大小写图标兜底）
-fn icon_for(btn: ToolButton) -> IconName {
+/// 优先用**项目自带**的 Lucide 图标（`assets/icons/ui`，经 [`crate::assets::AppAssets`]
+/// 以 `app-icons/` 前缀暴露）——截图工具需要的语义（画笔 / 文字 / 扫描 /
+/// 马赛克 / 固定 / 加粗 / 滚轮）在 gpui-component 内置集里没有好的对应，
+/// 之前只能用 Frame / CircleX / Asterisk / SquareTerminal 之类凑数，语义不清。
+/// 其余（撤销 / 重做 / 完成 / 取消）沿用内置图标，两者同源同风格。
+fn icon_for(btn: ToolButton) -> Icon {
+    use crate::assets::icons as app_icon;
     match btn {
-        ToolButton::Rectangle => IconName::Frame,
-        ToolButton::Ellipse => IconName::CircleX,
-        ToolButton::Arrow => IconName::ArrowUp,
-        ToolButton::Freehand => IconName::Asterisk,
-        ToolButton::Text => IconName::SquareTerminal,
-        ToolButton::Ocr => IconName::Eye,
-        ToolButton::Mosaic => IconName::LayoutDashboard,
-        ToolButton::ColorPicker => IconName::Palette,
-        ToolButton::Undo => IconName::Undo2,
-        ToolButton::Redo => IconName::Redo2,
-        ToolButton::Finish => IconName::Check,
-        ToolButton::Cancel => IconName::Close,
-        ToolButton::Pin => IconName::ExternalLink,
-        ToolButton::Bold => IconName::CaseSensitive,
-        ToolButton::Scroll => IconName::ChevronDown,
-        ToolButton::ScrollManual => IconName::ChevronsUpDown,
+        ToolButton::Rectangle => Icon::empty().path(app_icon::SQUARE),
+        ToolButton::Ellipse => Icon::empty().path(app_icon::CIRCLE),
+        ToolButton::Arrow => Icon::empty().path(app_icon::MOVE_UP_RIGHT),
+        ToolButton::Freehand => Icon::empty().path(app_icon::PENCIL),
+        ToolButton::Text => Icon::empty().path(app_icon::TYPE),
+        ToolButton::Ocr => Icon::empty().path(app_icon::SCAN_TEXT),
+        ToolButton::Mosaic => Icon::empty().path(app_icon::GRID_2X2),
+        ToolButton::ColorPicker => Icon::empty().path(app_icon::PIPETTE),
+        ToolButton::Pin => Icon::empty().path(app_icon::PIN),
+        ToolButton::Bold => Icon::empty().path(app_icon::BOLD),
+        ToolButton::Scroll => Icon::empty().path(app_icon::UNFOLD_VERTICAL),
+        ToolButton::ScrollManual => Icon::empty().path(app_icon::MOUSE),
+        ToolButton::Undo => Icon::new(IconName::Undo2),
+        ToolButton::Redo => Icon::new(IconName::Redo2),
+        ToolButton::Finish => Icon::new(IconName::Check),
+        ToolButton::Cancel => Icon::new(IconName::Close),
     }
 }
 
-/// 计算工具栏位置 (x, y, width, height)
+/// 工具栏实际渲染宽度估算（px）
 ///
-/// width 仅是估算值，用来在 root.on_mouse_down 中判定点击是否落在工具栏区域。
-/// 实际渲染宽度可能因 popover 触发器而略宽，但估算不影响功能正确性——
-/// 若估算偏小，root 会让点击穿透到 selection.mouse_down 打散选区，
-/// 触发后会通过按钮 on_click 收到 click —— 设计上我们通过 div + flexbox
-/// 测量真实 bounds 再吞掉冒泡，目前用估算偏宽避免吞掉事件。
-/// 估算工具栏实际渲染宽度（13 个「图标+中文标签」按钮）。
-/// 之前用 `TOOLBAR_BTN_SIZE(32) * 14` 严重低估（实际约 800px），截图框靠右时
-/// 工具栏被屏幕截断、「完成/取消」跑出屏外不可点。按图标(12)+间距(2)+标签
-/// (中文≈13px/字)+compact 内边距(≈16px) 估算，偏宽一点更安全。
+/// 用途只有一个：光标贴屏幕右缘时把工具栏整体左移，避免「完成」被截断在屏外。
+/// 渲染与估算共用 `ToolButton::GROUPS` / `shows_label()` 这一份定义，
+/// 任何按钮增删/改标签都自动同步，不会再出现「估算 32px、实际 800px」的漂移。
 fn toolbar_width_estimate() -> f32 {
-    const LABELS: [&str; 13] = [
-        "矩形", "椭圆", "箭头", "画图", "文字", "OCR", "滚动截屏", "手动滚动", "马赛克",
-        "撤销", "重做", "完成", "取消",
-    ];
-    let buttons: f32 = LABELS
-        .iter()
-        .map(|s| {
-            let label_w = s.chars().count() as f32 * 13.0;
-            label_w + 12.0 + 2.0 + 16.0 // 标签 + 图标 + 间隙 + compact 内边距
-        })
-        .sum();
-    buttons + (LABELS.len() as f32 - 1.0) * TOOLBAR_GAP + TOOLBAR_PAD * 2.0 + 2.0
+    /// 图标与标签之间的间距（与 btn_content 里的 gap 一致）
+    const ICON_LABEL_GAP: f32 = 5.0;
+    let mut w = theme::m::PANEL_PAD * 2.0;
+    for (gi, group) in ToolButton::GROUPS.iter().enumerate() {
+        if gi > 0 {
+            // 组间：左右间距 + 1px 分隔线
+            w += theme::m::GROUP_GAP * 2.0 + 1.0;
+        }
+        for (bi, &btn) in group.iter().enumerate() {
+            if bi > 0 {
+                w += theme::m::BTN_GAP;
+            }
+            w += if btn.shows_label() {
+                // 中文字宽略大于字号（实测 12.5px 字号渲染约 13.2px/字），
+                // 低估会让工具栏在屏幕右缘被裁掉十几个像素（「完成」被切），
+                // 所以这里按 13.2 估并整体留 4px 余量。
+                theme::m::BTN_PAD_X * 2.0
+                    + theme::m::ICON
+                    + ICON_LABEL_GAP
+                    + btn.label().chars().count() as f32 * (theme::m::FONT_LABEL * 1.056)
+            } else {
+                theme::m::BTN_H
+            };
+        }
+    }
+    w + 4.0
 }
 
 fn compute_toolbar_bounds(
@@ -1141,7 +1168,7 @@ fn compute_toolbar_bounds(
 ) -> (f32, f32, f32, f32) {
     let screen_y0 = screen_bounds.origin.y;
     let screen_h = screen_y0 + screen_bounds.size.y;
-    let toolbar_h = TOOLBAR_BTN_SIZE + TOOLBAR_PAD * 2.0;
+    let toolbar_h = theme::m::BTN_H + theme::m::PANEL_PAD * 2.0;
     let toolbar_y_below = sel.origin.y + sel.size.y + TOOLBAR_OFFSET_Y;
     // 优先级：选区下方 → 选区上方 → 屏幕底部。
     // 选区贴屏幕底部时放下方会与选区重叠，选区的鼠标处理截获点击
@@ -1158,62 +1185,232 @@ fn compute_toolbar_bounds(
     (toolbar_x, toolbar_y, toolbar_w, toolbar_h)
 }
 
-/// 工具栏按钮中的图标+文字，紧凑间距
-///
-/// gpui-component 的 Custom 按钮变体忽略 `foreground` 字段（渲染时 text_color
-/// 取的是 `colors.color`，即背景色），文字会继承到近透明的白色而看不清。
-/// 这里显式把图标/文字设为白色，禁用按钮用半透明白区分状态。
-fn icon_label(btn: ToolButton, disabled: bool) -> impl IntoElement {
-    let color = if disabled {
-        gpui::rgba(0xFFFFFF66)
-    } else {
-        gpui::rgba(0xFFFFFFFF)
-    };
+/// 按钮组之间的竖直分隔线（高度约按钮的 55%，居中）
+fn group_divider() -> impl IntoElement {
     div()
+        .w(px(1.0))
+        .h(px(theme::m::BTN_H * 0.55))
+        .flex_none()
+        .rounded_full()
+        .bg(theme::c::rgb(theme::tokens::DIVIDER))
+}
+
+/// 工具栏按钮内容：图标（+ 可选的 2 字短标签）
+///
+/// gpui-component 的 Custom 按钮变体**忽略** `foreground` 字段（渲染时
+/// text_color 取的是 `colors.color`，即背景色），所以图标/文字颜色必须在这里
+/// 显式指定，否则会继承到近乎透明的背景色而看不见。
+fn btn_content(btn: ToolButton, disabled: bool, tone: ToolbarBtnStyle) -> impl IntoElement {
+    let color = if disabled {
+        theme::c::rgb(theme::tokens::TEXT_DISABLED)
+    } else {
+        match tone {
+            // 实心强调底（蓝/绿）上用白字
+            ToolbarBtnStyle::Accent | ToolbarBtnStyle::Success => {
+                theme::c::rgb(theme::tokens::TEXT_ON_ACCENT)
+            }
+            ToolbarBtnStyle::Neutral | ToolbarBtnStyle::Danger => {
+                theme::c::rgb(theme::tokens::TEXT)
+            }
+        }
+    };
+    let mut row = div()
         .flex()
         .items_center()
-        .gap(px(2.0))
+        .justify_center()
+        .gap(px(5.0))
         .text_color(color)
-        .child(Icon::new(icon_for(btn)).size(px(12.0)).text_color(color))
-        .child(div().text_xs().text_color(color).child(btn.label()))
+        .child(icon_for(btn).size(px(theme::m::ICON)).text_color(color));
+    if btn.shows_label() {
+        row = row.child(
+            div()
+                .flex_none()
+                .text_size(px(theme::m::FONT_LABEL))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(color)
+                .child(btn.label()),
+        );
+    }
+    row
 }
 
 /// 工具栏按钮配色
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolbarBtnStyle {
-    /// 普通按钮：深色工具栏上的浅色半透明底 + 亮文字
+    /// 普通按钮：深色玻璃上的极淡底，靠 hover 提亮提示可点
     Neutral,
-    /// 激活/主操作：蓝色强调
+    /// 激活工具：蓝色实心强调
     Accent,
-    /// 完成：绿色
+    /// 主操作（完成）：绿色实心
     Success,
+    /// 危险/次操作（取消）：常态中性，hover 泛红
+    Danger,
 }
 
-/// 构造工具栏按钮的定制样式（背景/文字/hover/active 配色）
-fn toolbar_btn_style(cx: &App, kind: ToolbarBtnStyle) -> gpui_component::button::ButtonCustomVariant {
-    let base = gpui_component::button::ButtonCustomVariant::new(cx);
-    match kind {
-        ToolbarBtnStyle::Neutral => base
-            .color(gpui::rgba(0xFFFFFF0F).into())
-            .foreground(gpui::rgba(0xE4E4EA).into())
-            .hover(gpui::rgba(0xFFFFFF20).into())
-            .active(gpui::rgba(0xFFFFFF2E).into()),
-        ToolbarBtnStyle::Accent => base
-            .color(gpui::rgba(0x3B82F6).into())
-            .foreground(gpui::rgba(0xFFFFFFFF).into())
-            .hover(gpui::rgba(0x4C8FFA).into())
-            .active(gpui::rgba(0x3374E8).into()),
-        ToolbarBtnStyle::Success => base
-            .color(gpui::rgba(0x22C55E).into())
-            .foreground(gpui::rgba(0xFFFFFFFF).into())
-            .hover(gpui::rgba(0x2ED36B).into())
-            .active(gpui::rgba(0x1CAE50).into()),
+impl ToolbarBtnStyle {
+    /// 由按钮语义 + 是否激活推导配色
+    fn for_button(btn: ToolButton, is_active: bool) -> Self {
+        match btn {
+            // 「完成」始终是主操作：绿色实心，视觉上最醒目
+            ToolButton::Finish => ToolbarBtnStyle::Success,
+            // 「取消」hover 时泛红，降低误点成本
+            ToolButton::Cancel => ToolbarBtnStyle::Danger,
+            _ if is_active => ToolbarBtnStyle::Accent,
+            _ => ToolbarBtnStyle::Neutral,
+        }
     }
 }
 
-/// 给 5 个绘图工具构造带 Popover 的按钮 Popover
+/// 按钮尺寸档：工具栏按钮（30px 高）/ 弹层与浮窗里的 chip（26px 高）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtnSize {
+    Toolbar,
+    Chip,
+    /// 对话框按钮：高度同工具栏，左右内边距更宽（中文按钮不至于挤）
+    Dialog,
+}
+
+impl BtnSize {
+    /// (高度, 圆角, 带标签时的左右内边距)
+    fn metrics(self) -> (f32, f32, f32) {
+        match self {
+            BtnSize::Toolbar => (theme::m::BTN_H, theme::r::BTN, theme::m::BTN_PAD_X),
+            BtnSize::Chip => (theme::m::CHIP, theme::r::CHIP, 7.0),
+            BtnSize::Dialog => (theme::m::BTN_H, theme::r::BTN, 15.0),
+        }
+    }
+}
+
+/// 自绘按钮（工具栏 / 弹层 / 浮窗通用）
 ///
-/// trigger = Button（带工具图标）。第一次点击 → 选中工具；
+/// **为什么不用 `gpui_component::Button`**：它的 Custom 变体内部把背景色按
+/// `color.mix_oklab(transparent, 0.2)` 处理，实测落到屏幕上只剩约 17% 不透明度
+/// ——绿色主操作按钮（0x2BB673）渲染出来是 (30,60,53) 的暗绿，蓝色激活态同样
+/// 发灰（截图逐像素核对过）。而且该变体**忽略** `foreground`，图标/文字颜色还得
+/// 逐个显式指定。自绘 div 能拿到满不透明度的强调色、精确的圆角与内边距，以及
+/// 常态/hover/按下三态，外观完全可控。
+///
+/// 交互语义不减：`on_click`、禁用（不挂回调 + 变灰 + 默认光标）、原生 tooltip
+/// （`TooltipLabel`，与 Pin 标题栏同一套）。
+// 参数确实多（内容/配色/尺寸/是否带文字/禁用/提示/回调），但它们都是
+// "按钮的一格属性"，拆成结构体反而让 9 个调用点更啰嗦；这里显式豁免。
+#[allow(clippy::too_many_arguments)]
+fn ui_button(
+    id: impl Into<gpui::ElementId>,
+    content: impl IntoElement,
+    tone: ToolbarBtnStyle,
+    size: BtnSize,
+    labeled: bool,
+    disabled: bool,
+    tooltip: Option<&'static str>,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use theme::tokens as t;
+    let (h, radius, pad_x) = size.metrics();
+    let (bg, hover, active, fg) = if disabled {
+        // 禁用：比常态更暗的底 + 灰字，且完全不响应 hover
+        (
+            theme::c::rgb(t::BTN_BG_DISABLED),
+            theme::c::rgb(t::BTN_BG_DISABLED),
+            theme::c::rgb(t::BTN_BG_DISABLED),
+            theme::c::rgb(t::TEXT_DISABLED),
+        )
+    } else {
+        match tone {
+            ToolbarBtnStyle::Neutral => (
+                theme::c::rgb(t::BTN_BG),
+                theme::c::rgb(t::BTN_BG_HOVER),
+                theme::c::rgb(t::BTN_BG_ACTIVE),
+                theme::c::rgb(t::TEXT),
+            ),
+            ToolbarBtnStyle::Accent => (
+                theme::c::rgb(t::ACCENT),
+                theme::c::rgb(t::ACCENT_HOVER),
+                theme::c::rgb(t::ACCENT_ACTIVE),
+                theme::c::rgb(t::TEXT_ON_ACCENT),
+            ),
+            ToolbarBtnStyle::Success => (
+                theme::c::rgb(t::SUCCESS),
+                theme::c::rgb(t::SUCCESS_HOVER),
+                theme::c::rgb(t::SUCCESS_ACTIVE),
+                theme::c::rgb(t::TEXT_ON_ACCENT),
+            ),
+            // 取消/关闭：常态低调，hover 泛红（危险预警），按下实心红
+            ToolbarBtnStyle::Danger => (
+                theme::c::rgb(t::BTN_BG),
+                theme::c::rgb(t::DANGER_SOFT),
+                theme::c::rgb(t::DANGER),
+                theme::c::rgb(t::TEXT),
+            ),
+        }
+    };
+
+    let mut el = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        // flex_none：工具栏一行放不下时按钮**不许被压缩**（图标会被压扁），
+        // 宁可让工具栏整体换行/溢出，由上层决定布局。
+        .flex_none()
+        .h(px(h))
+        .min_w(px(h))
+        .rounded(px(radius))
+        .text_color(fg)
+        .bg(bg);
+    el = if labeled {
+        el.px(px(pad_x))
+    } else {
+        el.w(px(h)).px(px(0.0))
+    };
+    // 实心强调色按钮加 1px 接触影，和面板分离出层次
+    if !disabled && matches!(tone, ToolbarBtnStyle::Accent | ToolbarBtnStyle::Success) {
+        el = el.shadow(theme::button_shadow());
+    }
+    let el = if disabled {
+        el.cursor_default()
+    } else {
+        el.cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .active(move |s| s.bg(active))
+            .on_click(on_click)
+    };
+    el.when_some(tooltip, |el, text| {
+        el.tooltip(move |_window, cx| {
+            cx.new(|_| TooltipLabel { text: text.into() }).into()
+        })
+    })
+    .child(content)
+}
+
+/// Popover 的 trigger 要求 `Selectable + IntoElement`，自绘按钮是普通 `Div`，
+/// 用这个薄包装满足约束。选中态不参与样式（颜色已按 `ToolbarBtnStyle` 定死），
+/// 仅用于满足接口。
+struct ToolbarTrigger {
+    el: gpui::Stateful<gpui::Div>,
+    selected: bool,
+}
+
+impl gpui_component::Selectable for ToolbarTrigger {
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+    fn is_selected(&self) -> bool {
+        self.selected
+    }
+}
+
+impl IntoElement for ToolbarTrigger {
+    type Element = gpui::Stateful<gpui::Div>;
+    fn into_element(self) -> Self::Element {
+        self.el
+    }
+}
+
+/// 给绘图工具构造带 Popover 的按钮 Popover
+///
+/// trigger = Button（工具图标 + 2 字短标签）。第一次点击 → 选中工具；
 /// 再点 active 工具 → 浮出 popover。popover 内容由 active_tool 决定：
 /// - Text → 字号档位 + Bold + 颜色
 /// - Rectangle/Arrow/Freehand/Mosaic → 粗细档位 + 颜色
@@ -1234,39 +1431,42 @@ fn render_tool_button_with_popover(
     let is_open = is_active && view.toolbar.popup == Some(popup_kind);
 
     let weak_for_trigger = weak.clone();
-    let trigger_style = toolbar_btn_style(
-        cx,
-        if is_active { ToolbarBtnStyle::Accent } else { ToolbarBtnStyle::Neutral },
-    );
-    let trigger = Button::new(("tool", btn as usize))
-        .tooltip(btn.label())
-        .with_size(gpui_component::Size::Small)
-        .compact()
-        .custom(trigger_style)
-        .selected(is_active)
-        .child(icon_label(btn, false))
-        .on_click(move |_, _, cx| {
-            let _ = weak_for_trigger.update(cx, |this, cx| {
-                if this.toolbar.active_tool != Some(btn) {
-                    // 切到新工具：先提交活跃的 Text 输入，避免文字丢失，关旧弹层
-                    this.finalize_text_input_if_active(cx);
-                    this.toolbar.active_tool = Some(btn);
-                    this.toolbar.popup = None;
-                    cx.notify();
-                }
-                // 已 active：弹层开/关完全由 GPUI popover 状态驱动
-                //（trigger 的 toggle → on_open_change 回调同步 toolbar.popup）。
-                // 此前 on_click 再 toggle 会与 GPUI 双重竞争——
-                // 弹层刚被 GPUI 打开(open_change→popup=Some)又立刻被我们关掉，
-                // 表现为"弹出即消失"。
-            });
-        });
+    let tone = ToolbarBtnStyle::for_button(btn, is_active);
+    let trigger = ToolbarTrigger {
+        el: ui_button(
+            ("tool", btn as usize),
+            btn_content(btn, false, tone),
+            tone,
+            BtnSize::Toolbar,
+            btn.shows_label(),
+            false,
+            Some(btn.tooltip_text()),
+            move |_, _, cx| {
+                let _ = weak_for_trigger.update(cx, |this, cx| {
+                    if this.toolbar.active_tool != Some(btn) {
+                        // 切到新工具：先提交活跃的 Text 输入，避免文字丢失，关旧弹层
+                        this.finalize_text_input_if_active(cx);
+                        this.toolbar.active_tool = Some(btn);
+                        this.toolbar.popup = None;
+                        cx.notify();
+                    }
+                    // 已 active：弹层开/关完全由 GPUI popover 状态驱动
+                    //（trigger 的 toggle → on_open_change 回调同步 toolbar.popup）。
+                    // 此前 on_click 再 toggle 会与 GPUI 双重竞争——
+                    // 弹层刚被 GPUI 打开(open_change→popup=Some)又立刻被我们关掉，
+                    // 表现为"弹出即消失"。
+                });
+            },
+        ),
+        selected: is_active,
+    };
 
     let weak_content = weak.clone();
     Popover::new(("tool-popover", btn as usize))
         // 展开方向随工具栏位置切换：工具栏在选区上方→向上展开，避免
         // 弹层向下盖住截图框；否则向下展开（默认 TopLeft）。
         .anchor(if popover_open_up {
+            // 向上展开：弹层底边贴住工具栏上沿（实测缝隙 ≤1px，无需再补偏移）
             gpui::Anchor::BottomLeft
         } else {
             gpui::Anchor::TopLeft
@@ -1276,6 +1476,10 @@ fn render_tool_button_with_popover(
         // 弹层」的点击外部判定而立即消失——用户报"弹层弹出后鼠标没移动到
         // 弹层上就消失"。关闭靠：再点按钮 toggle / 切工具 / Esc。
         .overlay_closable(false)
+        // appearance(false)：关掉 gpui-component 弹层自带的底色/描边/阴影/
+        // padding（它跟随主题，会在深色工具栏旁多包一层浅色壳），弹层外观
+        // 全部交给 `popover_panel()` 自绘。
+        .appearance(false)
         .trigger(trigger)
         .open(is_open)
         .on_open_change(cx.listener(move |this, open, _w, cx| {
@@ -1309,43 +1513,42 @@ fn render_tool_button_with_popover(
                 })
                 .unwrap_or((RGBA::new(0, 0, 0, 255), 24.0, FontWeight::Normal, RGBA::TRANSPARENT, 4.0));
             match popup_kind {
-                ToolbarPopup::Text => render_text_popover_content(cur_color, cur_size, cur_weight, cur_bg, weak),
-                ToolbarPopup::Stroke => render_stroke_popover_content(cur_color, cur_lw, weak),
+                ToolbarPopup::Text => render_text_popover_content(
+                    popover_panel(),
+                    cur_color,
+                    cur_size,
+                    cur_weight,
+                    cur_bg,
+                    weak,
+                ),
+                ToolbarPopup::Stroke => {
+                    render_stroke_popover_content(popover_panel(), cur_color, cur_lw, weak)
+                }
             }
         })
 }
 
-/// 简单按钮（Undo/Redo/Cancel/Finish，没有 Popover）
+/// 简单按钮（Ocr/Scroll/Pin/Undo/Redo/Cancel/Finish，没有 Popover）
 ///
-/// 用 Button.on_click 直接处理 click。Finish 在 active=false 时也走 primary 让"完成"
-/// 在视觉上始终高亮（用户期望"完成"是醒目的绿色对勾）。
+/// 用 Button.on_click 直接处理 click。配色由 [`ToolbarBtnStyle::for_button`]
+/// 决定：Finish 恒为绿色实心（主操作），Cancel hover 泛红，激活工具蓝色实心。
 fn render_simple_button(
     btn: ToolButton,
     active: bool,
     disabled: bool,
     weak: gpui::WeakEntity<OverlayView>,
-    cx: &mut Context<OverlayView>,
-) -> Button {
-    // Finish 用绿色"完成"；激活工具用蓝色；其余中性配色
-    let style = toolbar_btn_style(
-        cx,
-        if btn == ToolButton::Finish {
-            ToolbarBtnStyle::Success
-        } else if active {
-            ToolbarBtnStyle::Accent
-        } else {
-            ToolbarBtnStyle::Neutral
-        },
-    );
+) -> gpui::Stateful<gpui::Div> {
+    let tone = ToolbarBtnStyle::for_button(btn, active);
     let weak_for_click = weak.clone();
-    let b = Button::new(("action", btn as usize))
-        .tooltip(btn.label())
-        .with_size(gpui_component::Size::Small)
-        .compact()
-        .custom(style)
-        .disabled(disabled)
-        .child(icon_label(btn, disabled))
-        .on_click(move |_, window, cx| {
+    ui_button(
+        ("action", btn as usize),
+        btn_content(btn, disabled, tone),
+        tone,
+        BtnSize::Toolbar,
+        btn.shows_label(),
+        disabled,
+        Some(btn.tooltip_text()),
+        move |_, window, cx| {
             let _ = weak_for_click.update(cx, |this, cx| {
                 this.toolbar.popup = None;
                 match btn {
@@ -1503,8 +1706,8 @@ fn render_simple_button(
                     _ => {}
                 }
             });
-        });
-    b
+        },
+    )
 }
 
 /// 马赛克画笔几何 → (画笔边长, 像素化块边长)
@@ -1519,8 +1722,297 @@ fn mosaic_geom(lw: f32) -> (f32, u32) {
     (brush, block.max(1.0) as u32)
 }
 
-/// 渲染文字 popover 内容：字号档位 + Bold + 文字颜色 + 背景色
+// ── 二级弹层（popover）视觉 ────────────────────────────────────────────────
+//
+// 弹层用 `.appearance(false)` 关掉 gpui-component 的默认样式（它跟随主题色，
+// 浮在深色工具栏旁会突兀），改由下面这套自绘容器统一：深色玻璃底 + 冷白描边
+// + 柔和阴影，与工具栏共用同一套令牌。内容按「分区标签 + 档位 chip / 色板网格」
+// 组织——文字弹层与画图弹层结构一致，来回切换时不跳动。
+
+/// 色板每行格子数（固定列数 → 网格整齐、弹层宽度可预期）
+const SWATCH_COLS: usize = 12;
+/// 色板格间距（px）
+const SWATCH_GAP: f32 = 8.0;
+
+/// 色板「当前色」判定容差（RGB 欧氏距离）
+///
+/// 默认红 (255,0,0) 与色板红 (230,34,34) 的距离约 49，取 60 既能覆盖这种
+/// 同色系偏差，又不至于把相邻色相（相距 100+）误判成同一个。
+const SWATCH_MATCH_TOLERANCE: f32 = 60.0;
+
+/// 两个 RGBA 的 RGB 欧氏距离（忽略 alpha；alpha 由「无背景」格子单独表示）
+fn color_distance(a: RGBA, b: RGBA) -> f32 {
+    let dr = a.r as f32 - b.r as f32;
+    let dg = a.g as f32 - b.g as f32;
+    let db = a.b as f32 - b.b as f32;
+    (dr * dr + dg * dg + db * db).sqrt()
+}
+
+/// 色板网格的内容宽度（12 列固定），弹层与网格共用，保证左右对齐
+fn swatch_grid_width() -> f32 {
+    SWATCH_COLS as f32 * theme::m::SWATCH + (SWATCH_COLS as f32 - 1.0) * SWATCH_GAP
+}
+
+/// 弹层容器：深色玻璃面板
+fn popover_panel() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(9.0))
+        .p(px(10.0))
+        .w(px(swatch_grid_width() + 20.0))
+        .bg(theme::c::rgb(theme::tokens::POPOVER_BG))
+        .rounded(px(theme::r::PANEL))
+        .border_1()
+        .border_color(theme::c::rgb(theme::tokens::POPOVER_BORDER))
+        .shadow(theme::popover_shadow())
+}
+
+/// 弹层分区标签（如「字号」「颜色」）
+fn section_label(text: &'static str) -> impl IntoElement {
+    div()
+        .flex_none()
+        .text_size(px(theme::m::FONT_SECTION))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme::c::rgb(theme::tokens::SECTION_LABEL))
+        .child(text)
+}
+
+/// chip 里的纯文本（字号/字重统一，颜色由外层 text_color 决定）
+fn label_text(text: impl Into<gpui::SharedString>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .text_size(px(12.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .line_height(gpui::relative(1.0))
+        .child(text.into())
+}
+
+/// 弹层 / 浮窗里的动作按钮（图标 + 可选文字），按 `tone` 取色
+///
+/// 与工具栏按钮同一套令牌，只是尺寸更小（chip 高度），用于 popover 档位、
+/// 滚动进度窗的「完成 / 取消」等。
+fn bar_button(
+    id: impl Into<gpui::ElementId>,
+    content: impl IntoElement,
+    tone: ToolbarBtnStyle,
+    disabled: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    ui_button(
+        id,
+        content,
+        tone,
+        BtnSize::Chip,
+        true,
+        disabled,
+        None,
+        on_click,
+    )
+}
+
+/// 弹层里的档位 chip（字号 / 线宽 / 加粗）：选中 = 蓝底白字
+fn chip_button(
+    id: impl Into<gpui::ElementId>,
+    content: impl IntoElement,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let tone = if selected {
+        ToolbarBtnStyle::Accent
+    } else {
+        ToolbarBtnStyle::Neutral
+    };
+    bar_button(id, content, tone, false, on_click)
+}
+
+/// 图标 + 文字的按钮内容（颜色由外层按钮的 text_color 统一决定）
+fn icon_label_content(icon: Icon, label: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(icon.size(px(13.0)))
+        .child(label_text(label))
+}
+
+/// 色板点击目标：决定单击色块时改的是哪种颜色
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwatchTarget {
+    /// 画笔/边框颜色
+    StrokeColor,
+    /// 文字颜色
+    TextColor,
+    /// 文字背景色（alpha=0 = 无背景）
+    TextBackground,
+}
+
+impl SwatchTarget {
+    /// 把颜色写回工具栏状态
+    fn apply_state(self, toolbar: &mut ToolbarState, color: RGBA) {
+        match self {
+            SwatchTarget::StrokeColor | SwatchTarget::TextColor => toolbar.current_color = color,
+            SwatchTarget::TextBackground => toolbar.current_bg = color,
+        }
+    }
+}
+
+/// 把颜色应用到**已选中**的命令（选中后能二次改色 / 改背景）
+fn apply_swatch_to_cmd(target: SwatchTarget, cmd: &mut DrawCommand, color: RGBA) {
+    match (target, cmd) {
+        (
+            SwatchTarget::StrokeColor,
+            DrawCommand::Rectangle { color: c, .. }
+            | DrawCommand::Ellipse { color: c, .. }
+            | DrawCommand::Arrow { color: c, .. }
+            | DrawCommand::Freehand { color: c, .. },
+        ) => *c = color,
+        (SwatchTarget::TextColor, DrawCommand::Text { color: c, .. }) => *c = color,
+        (SwatchTarget::TextBackground, DrawCommand::Text { background, .. }) => *background = color,
+        _ => {}
+    }
+}
+
+/// 单个色块：选中 = 蓝色描边 + 对勾（对勾按底色亮度取黑/白，保证可读）
+fn swatch_box(
+    id: impl Into<gpui::ElementId>,
+    color: RGBA,
+    selected: bool,
+    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    // 感知亮度（Rec.601）→ 决定对勾用深色还是白色
+    let luma = 0.299 * color.r as f32 + 0.587 * color.g as f32 + 0.114 * color.b as f32;
+    let check_color = if luma > 140.0 {
+        theme::c::rgb(0x1B1E27FF)
+    } else {
+        theme::c::rgb(theme::tokens::TEXT_ON_ACCENT)
+    };
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(theme::m::SWATCH))
+        .rounded(px(theme::r::CHIP - 1.0))
+        .bg(gpui::rgba(rgba_u32(color)))
+        .border_2()
+        .border_color(if selected {
+            theme::c::rgb(theme::tokens::ACCENT_BORDER)
+        } else {
+            theme::c::rgb(theme::tokens::SWATCH_BORDER)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(selected, |d| {
+            d.child(Icon::new(IconName::Check).size(px(13.0)).text_color(check_color))
+        })
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
+/// 色板网格：固定 12 列（23 色 → 2 行，弹层更扁）；`with_none_tile` 时末尾追加「无背景」棋盘格
+fn swatch_grid(
+    cur: RGBA,
+    target: SwatchTarget,
+    with_none_tile: bool,
+    weak: gpui::WeakEntity<OverlayView>,
+) -> gpui::Div {
+    let swatches = palette::default_palette();
+    let mut grid = div().flex().flex_wrap().gap(px(SWATCH_GAP)).w(px(swatch_grid_width()));
+    // 当前颜色在色板里的"最近一格"：精确相等判定会漏掉默认色——`ToolbarState`
+    // 默认 `current_color = RGBA::RED`(255,0,0)，而调色板里的红是 HSV 采样出来的
+    // (230,34,34)，两者不相等 → 弹层打开时**没有任何格子被标记**，用户看不出
+    // 当前用的是什么颜色。改成"颜色距离最近且在阈值内"即视为选中。
+    // 当前色完全透明时不做「最近色」判定：距离计算忽略 alpha，透明色会命中纯黑，
+    // 出现「黑色」与「无背景」同时选中的假象（背景色默认就是透明）。
+    let nearest = if with_none_tile && cur.a == 0 {
+        None
+    } else {
+        swatches
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i, color_distance(c, cur)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|&(_, d)| d <= SWATCH_MATCH_TOLERANCE)
+            .map(|(i, _)| i)
+    };
+    for (i, &c) in swatches.iter().enumerate() {
+        let weak_c = weak.clone();
+        let selected = nearest == Some(i);
+        grid = grid.child(swatch_box(
+            ("swatch", target as usize * 1000 + i),
+            c,
+            selected,
+            move |_, _, cx| {
+                let _ = weak_c.update(cx, |this, cx| {
+                    target.apply_state(&mut this.toolbar, c);
+                    this.apply_style_to_selected(|cmd| apply_swatch_to_cmd(target, cmd, c));
+                    cx.notify();
+                });
+            },
+        ));
+    }
+    if with_none_tile {
+        let weak_none = weak;
+        // 「无背景」：5×5 棋盘格示意透明 + 选中蓝框；放在末位（“无”读到最后）
+        let is_none = cur.a == 0;
+        let mut board = div().absolute().inset(px(0.0)).flex_wrap();
+        let mut idx = 0_u32;
+        for _ in 0..5 {
+            for _ in 0..5 {
+                let cell = if idx % 2 == 0 {
+                    theme::c::rgb(theme::tokens::CHECKER_LIGHT)
+                } else {
+                    theme::c::rgb(theme::tokens::CHECKER_DARK)
+                };
+                board = board.child(div().size(px(4.4)).bg(cell));
+                idx += 1;
+            }
+        }
+        grid = grid.child(
+            div()
+                .id("swatch-none")
+                .flex_none()
+                .relative()
+                .size(px(theme::m::SWATCH))
+                .rounded(px(theme::r::CHIP - 1.0))
+                .border_2()
+                .border_color(if is_none {
+                    theme::c::rgb(theme::tokens::ACCENT_BORDER)
+                } else {
+                    theme::c::rgb(theme::tokens::SWATCH_BORDER)
+                })
+                .overflow_hidden()
+                .cursor_pointer()
+                .child(board)
+                .child(
+                    div()
+                        .absolute()
+                        .inset(px(0.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::c::rgb(0x1B1E27FF))
+                        .child("无"),
+                )
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let _ = weak_none.update(cx, |this, cx| {
+                        target.apply_state(&mut this.toolbar, RGBA::TRANSPARENT);
+                        this.apply_style_to_selected(|cmd| {
+                            apply_swatch_to_cmd(target, cmd, RGBA::TRANSPARENT)
+                        });
+                        cx.notify();
+                    });
+                }),
+        );
+    }
+    grid
+}
+
+/// 渲染文字 popover 内容：字号 + 加粗 + 文字颜色 + 背景色
 fn render_text_popover_content(
+    panel: gpui::Div,
     cur_color: RGBA,
     cur_size: f32,
     cur_weight: FontWeight,
@@ -1529,16 +2021,36 @@ fn render_text_popover_content(
 ) -> gpui::Div {
     use crate::overlay::toolbar::FONT_SIZES;
 
-    let mut col = div().flex().flex_col().gap(px(6.0)).p(px(6.0)).min_w(px(220.0));
+    // 1) 字号档位（自动换行成多行）
+    let mut size_row = div().flex().flex_wrap().gap(px(4.0)).items_center();
+    for (i, &size) in FONT_SIZES.iter().enumerate() {
+        let weak_s = weak.clone();
+        let is_current = (cur_size - size).abs() < f32::EPSILON;
+        size_row = size_row.child(chip_button(
+            ("font-size", i),
+            label_text(format!("{}", size as i32)),
+            is_current,
+            move |_, _, cx| {
+                let _ = weak_s.update(cx, |this, cx| {
+                    this.toolbar.current_size = size;
+                    cx.notify();
+                });
+            },
+        ));
+    }
 
-    // 第一行：Bold + 字号档位（自动换行，容纳更多字号）
-    let mut top = div().flex().flex_wrap().gap(px(4.0)).items_center();
+    // 2) 加粗开关：与「字号」标签同行，右对齐（图标 chip，选中 = 蓝底）
     let weak_bold = weak.clone();
-    let bold_btn = Button::new("font-bold")
-        .label("加粗")
-        .compact()
-        .selected(cur_weight == FontWeight::Bold)
-        .on_click(move |_, _, cx| {
+    let bold_chip = chip_button(
+        "font-bold",
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(Icon::empty().path(crate::assets::icons::BOLD).size(px(13.0)))
+            .child(label_text("加粗")),
+        cur_weight == FontWeight::Bold,
+        move |_, _, cx| {
             let _ = weak_bold.update(cx, |this, cx| {
                 this.toolbar.current_weight = match this.toolbar.current_weight {
                     FontWeight::Normal => FontWeight::Bold,
@@ -1546,176 +2058,56 @@ fn render_text_popover_content(
                 };
                 cx.notify();
             });
-        });
-    top = top.child(bold_btn);
+        },
+    );
 
-    for (i, &size) in FONT_SIZES.iter().enumerate() {
-        let weak_s = weak.clone();
-        let is_current = (cur_size - size).abs() < f32::EPSILON;
-        let label: gpui::SharedString = format!("{}", size as i32).into();
-        let btn = Button::new(("font-size", i))
-            .label(label)
-            .compact()
-            .selected(is_current)
-            .on_click(move |_, _, cx| {
-                let _ = weak_s.update(cx, |this, cx| {
-                    this.toolbar.current_size = size;
-                    cx.notify();
-                });
-            });
-        top = top.child(btn);
-    }
-    col = col.child(top);
-
-    // 第二行：文字颜色（加「字体」标签，区分于背景色）
-    col = col.child(render_labeled_swatch_row("字体", cur_color, render_color_swatch_row, weak.clone()));
-
-    // 第三行：选框/高亮背景色（加「背景」标签，含「无背景」透明选项）
-    col = col.child(render_labeled_swatch_row("背景", cur_bg, render_bg_swatch_row, weak));
-    col
-}
-
-/// 带名称标签的颜色行：label（「字体」/「背景」）+ 一套色板。
-///
-/// `swatch_fn` 决定该行单击时修改的是字体色还是背景色。
-/// 标签不设 text_color，继承 popover 的主题前景色（与白色弹层背景形成对比）。
-fn render_labeled_swatch_row(
-    label: &str,
-    cur: RGBA,
-    swatch_fn: fn(RGBA, gpui::WeakEntity<OverlayView>) -> gpui::Div,
-    weak: gpui::WeakEntity<OverlayView>,
-) -> gpui::Div {
-    div()
+    let header = div()
         .flex()
         .items_center()
-        .gap(px(4.0))
-        .child(
-            div().text_size(px(13.0)).font_weight(gpui::FontWeight::SEMIBOLD).child(gpui::SharedString::from(label)),
-        )
-        .child(swatch_fn(cur, weak))
+        .justify_between()
+        .gap(px(8.0))
+        .child(section_label("字号"))
+        .child(bold_chip);
+
+    panel
+        .child(header)
+        .child(size_row)
+        .child(section_label("文字颜色"))
+        .child(swatch_grid(cur_color, SwatchTarget::TextColor, false, weak.clone()))
+        .child(section_label("背景色"))
+        .child(swatch_grid(cur_bg, SwatchTarget::TextBackground, true, weak))
 }
 
-/// 渲染「选框/高亮背景色」色板：一个「无背景」框 + 12 色。点选即设置当前文字背景色，
-/// 并应用到已选中命令的 `background`（支持后续再次改色）。
-fn render_bg_swatch_row(cur_bg: RGBA, weak: gpui::WeakEntity<OverlayView>) -> gpui::Div {
-    let swatch = palette::default_palette();
-    let mut row = div().flex().gap(px(4.0)).items_center().flex_wrap();
-
-    // 「无背景」选项：透明（用浅灰棋盘格表示，避免和纯白混成「两个白色」）
-    let weak_none = weak.clone();
-    let is_none = cur_bg.a == 0;
-    let none_box = div()
-        .id("bg-none")
-        .size(px(22.0))
-        .rounded(px(4.0))
-        .border_1()
-        .border_color(if is_none {
-            gpui::rgba(0xFF1890FF)
-        } else {
-            gpui::rgba(0xFFAAAAAA)
-        })
-        .overflow_hidden()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        // 棋盘格（transparent 标记）：4×4 浅灰/白交替小格
-        .child({
-            let mut board = div().absolute().inset(px(0.0)).flex_wrap();
-            let mut idx = 0_u32;
-            for _ in 0..4 {
-                for _ in 0..4 {
-                    let cell_color = if idx % 2 == 0 {
-                        gpui::rgba(0xFFDDDDDD)
-                    } else {
-                        gpui::rgba(0xFFFFFFFF)
-                    };
-                    board = board.child(
-                        div().size(px(5.5)).bg(cell_color),
-                    );
-                    idx += 1;
-                }
-            }
-            board
-        })
-        // 「无」标签（深色，棋盘格上可读；作为后绘制子元素叠在棋盘格之上）
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(gpui::rgba(0xFF333333))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(gpui::SharedString::from("无")),
-        )
-        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-            let _ = weak_none.update(cx, |this, cx| {
-                this.toolbar.current_bg = RGBA::TRANSPARENT;
-                this.apply_style_to_selected(|cmd| match cmd {
-                    DrawCommand::Text { background, .. } => *background = RGBA::TRANSPARENT,
-                    _ => {}
-                });
-                cx.notify();
-            });
-        });
-
-    for (i, &c) in swatch.iter().enumerate() {
-        let bg = gpui::rgba(rgba_u32(c));
-        let weak_c = weak.clone();
-        let is_current = c == cur_bg;
-        // 淡灰细边框区分白色/透明；选中蓝色高亮
-        let border_color = if is_current {
-            gpui::rgba(0xFF1890FF)
-        } else {
-            gpui::rgba(0xFFAAAAAA)
-        };
-        row = row.child(
-            div()
-                .id(("bg-swatch", i))
-                .size(px(22.0))
-                .rounded(px(4.0))
-                .bg(bg)
-                .border_1()
-                .border_color(border_color)
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    let _ = weak_c.update(cx, |this, cx| {
-                        this.toolbar.current_bg = c;
-                        this.apply_style_to_selected(|cmd| match cmd {
-                            DrawCommand::Text { background, .. } => *background = c,
-                            _ => {}
-                        });
-                        cx.notify();
-                    });
-                }),
-        );
-    }
-    // 「无」框移到色板末尾（用户要求：文字色块「无」放到最后）
-    row = row.child(none_box);
-    row
-}
-
-
-/// 渲染画图类 popover 内容：粗细档位 + 12 色色板
+/// 渲染画图类 popover 内容：粗细档位 + 颜色
 fn render_stroke_popover_content(
+    panel: gpui::Div,
     cur_color: RGBA,
     cur_lw: f32,
     weak: gpui::WeakEntity<OverlayView>,
 ) -> gpui::Div {
     use crate::overlay::toolbar::LINE_WIDTHS;
 
-    let mut col = div().flex().flex_col().gap(px(6.0)).p(px(6.0)).min_w(px(200.0));
-
-    // 第一行：粗细档位（8 档，flex_wrap 自动换行成 4×2）
-    let mut top = div().flex().flex_wrap().gap(px(4.0)).items_center();
+    let mut width_row = div().flex().flex_wrap().gap(px(4.0)).items_center();
     for (i, &lw) in LINE_WIDTHS.iter().enumerate() {
         let weak_lw = weak.clone();
         let is_current = (cur_lw - lw).abs() < f32::EPSILON;
-        // 0.5 显示 "0.5"，整数档显示 "1"、"2" 等
-        let label: gpui::SharedString = format!("{}", lw).into();
-        let btn = Button::new(("lw", i))
-            .label(label)
-            .compact()
-            .selected(is_current)
-            .on_click(move |_, _, cx| {
+        width_row = width_row.child(chip_button(
+            ("lw", i),
+            // 线宽 chip：一条按比例加粗的线段 + 数字，比纯数字更直观
+            div()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .w(px(14.0))
+                        .h(px(lw.clamp(1.0, 4.0)))
+                        .rounded_full()
+                        .bg(gpui::rgba(0xFFFFFFFF)),
+                )
+                .child(label_text(format!("{}", lw as i32))),
+            is_current,
+            move |_, _, cx| {
                 let _ = weak_lw.update(cx, |this, cx| {
                     this.finalize_text_input_if_active(cx);
                     this.toolbar.line_width = lw;
@@ -1729,58 +2121,16 @@ fn render_stroke_popover_content(
                     });
                     cx.notify();
                 });
-            });
-        top = top.child(btn);
+            },
+        ));
     }
-    col = col.child(top);
 
-    // 第二行：颜色色板
-    col = col.child(render_color_swatch_row(cur_color, weak));
-    col
+    panel
+        .child(section_label("粗细"))
+        .child(width_row)
+        .child(section_label("颜色"))
+        .child(swatch_grid(cur_color, SwatchTarget::StrokeColor, false, weak))
 }
-
-/// 渲染 12 色色板行（构造时不依赖 OverlayView listener，所有回调用 WeakEntity）
-fn render_color_swatch_row(cur_color: RGBA, weak: gpui::WeakEntity<OverlayView>) -> gpui::Div {
-    let swatch = palette::default_palette();
-    let mut row = div().flex().gap(px(4.0)).items_center().flex_wrap();
-    for (i, &c) in swatch.iter().enumerate() {
-        let bg = gpui::rgba(rgba_u32(c));
-        let weak_c = weak.clone();
-        let is_current = c == cur_color;
-        // 淡灰细边框：区分白色/无色块；选中用蓝色高亮描边
-        let border_color = if is_current {
-            gpui::rgba(0xFF1890FF)
-        } else {
-            gpui::rgba(0xFFAAAAAA)
-        };
-        row = row.child(
-            div()
-                .id(("swatch", i))
-                .size(px(22.0))
-                .rounded(px(4.0))
-                .bg(bg)
-                .border_1()
-                .border_color(border_color)
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                    let _ = weak_c.update(cx, |this, cx| {
-                        this.toolbar.current_color = c;
-                        // 应用到选中命令（改色）
-                        this.apply_style_to_selected(|cmd| match cmd {
-                            DrawCommand::Rectangle { color, .. }
-                            | DrawCommand::Ellipse { color, .. }
-                            | DrawCommand::Arrow { color, .. }
-                            | DrawCommand::Freehand { color, .. } => *color = c,
-                            _ => {}
-                        });
-                        cx.notify();
-                    });
-                }),
-        );
-    }
-    row
-}
-
 
 /// RGBA → BGRA 通道 swap（GPUI RenderImage 用 BGRA）
 /// RGBA → BGRA（RenderImage 数据约定是 BGRA，见 gpui_wgpu swizzle_upload_data）。
@@ -2282,7 +2632,12 @@ fn build_render_image_from_pixels(width: u32, height: u32, mut pixels: Vec<u8>) 
     rgba_to_bgra(&mut pixels);
     let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
         .expect("CapturedFrame 像素长度必须与 width*height*4 一致");
-    Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)))
+    // 用 push **移动** Frame 进 SmallVec：`SmallVec::from_elem(frame, 1)` 内部是
+    // `ptr::write(ptr, elem.clone())`（smallvec 实现），会把整帧像素再复制一遍
+    // （1080p 8MB，长图/大选区更大），而原值随即被丢弃——纯浪费。
+    let mut frames: SmallVec<[Frame; 1]> = SmallVec::new();
+    frames.push(Frame::new(buffer));
+    Arc::new(RenderImage::new(frames))
 }
 
 /// 把 GPUI 像素坐标转成 SelectionState 用的 f32 点（utils::bounds::Point）
@@ -4189,6 +4544,10 @@ impl Render for OverlayView {
 }
 
 /// 标题栏按钮 tooltip 视图
+///
+/// Pin 窗口是透明窗口（桌面从窗口后面透出），tooltip 若用半透明底会和桌面
+/// 颜色混色、边缘发虚，因此这里用**不透明**深色底 + 柔和阴影，去掉原来那条
+/// 53% 透明度的 1px 描边（半透明边框叠半透明底会读成"双层边"）。
 struct TooltipLabel {
     text: gpui::SharedString,
 }
@@ -4196,32 +4555,104 @@ struct TooltipLabel {
 impl Render for TooltipLabel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px(px(6.0))
-            .py(px(2.0))
-            .bg(rgba(0x2d2d2dee))
-            .rounded(px(3.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .max_w(px(220.0))
+            .bg(rgba(0x2A2F3BFF))
+            .rounded(px(6.0))
             .border_1()
-            .border_color(rgba(0x55555588))
-            .text_color(rgba(0xeeeeeeff))
-            .text_size(px(11.0))
+            .border_color(rgba(0xFFFFFF1F))
+            .shadow_sm()
+            .text_color(rgba(0xF3F5FAFF))
+            .text_size(px(12.0))
             .child(self.text.clone())
     }
 }
 
 /// Pin 窗口视图：显示固定到桌面的标注截图
-#[derive(Clone, Copy, PartialEq)]
-enum HoveredButton {
-    AlwaysOnTop,
-    Minimize,
-    Maximize,
-    Close,
-}
-
+///
+/// 视觉规范与工具栏同源（[`theme`] 令牌）：顶部一条 32px 深色标题栏
+/// （置顶开关 + 尺寸信息 + 最小化/最大化/关闭），下方图片区**满幅 1:1**
+/// 绘制——根容器不再画 1px 描边，否则内容盒被吃掉 2px、图片被缩放出
+/// 一点点模糊（见下方 `paint_canvas` 注释）。
 struct PinWindowView {
     image: Arc<RenderImage>,
     focus_handle: FocusHandle,
     is_always_on_top: bool,
-    hovered_button: Option<HoveredButton>,
+}
+
+/// Pin 窗口标题栏高度
+///
+/// 窗口高度 = 图片高 + 这个值；图片从 client y = 该值处开始绘制（根容器不再
+/// 画描边）。窗口尺寸计算（[`open_pin_in_app`]）与视图渲染共用此常量，
+/// 改一处即可，不会再出现"视图改了高度、窗口尺寸没跟着改"的错位。
+const PIN_TITLEBAR_H: f32 = 32.0;
+
+/// Pin 标题栏按钮尺寸（24px 见方：32px 标题栏内留 4px 上下呼吸）
+const PIN_TITLE_BTN: f32 = 24.0;
+
+/// Pin 标题栏按钮配色
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PinBtnTone {
+    /// 普通按钮：无底色，hover 才浮出一层浅底
+    Neutral,
+    /// 已开启状态（置顶）：蓝色实心 + 白图标，一眼可辨
+    On,
+    /// 危险操作（关闭）：hover 变红
+    Danger,
+}
+
+/// Pin 标题栏按钮：图标 + tooltip + hover/按下三态
+///
+/// 用 `.hover()`/`.active()` 直接表达三态，不再像旧实现那样把
+/// `hovered_button` 存进实体再 `cx.notify()` 重绘——状态存在实体里会让
+/// 每次鼠标进出都触发整窗重绘（固定窗口可能很大），且四个按钮重复四份
+/// 样板代码、容易漏改。
+fn pin_title_button(
+    id: &'static str,
+    icon: Icon,
+    tone: PinBtnTone,
+    tooltip: &'static str,
+    on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use theme::tokens as t;
+    let (bg, hover, active, fg) = match tone {
+        PinBtnTone::Neutral => (
+            None,
+            theme::c::rgb(t::BTN_BG_HOVER),
+            theme::c::rgb(t::BTN_BG_ACTIVE),
+            theme::c::rgb(t::TEXT_MUTED),
+        ),
+        PinBtnTone::On => (
+            Some(theme::c::rgb(t::ACCENT)),
+            theme::c::rgb(t::ACCENT_HOVER),
+            theme::c::rgb(t::ACCENT_ACTIVE),
+            theme::c::rgb(t::TEXT_ON_ACCENT),
+        ),
+        PinBtnTone::Danger => (
+            None,
+            theme::c::rgb(t::DANGER),
+            theme::c::rgb(t::DANGER_ACTIVE),
+            theme::c::rgb(t::TEXT_ON_ACCENT),
+        ),
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .size(px(PIN_TITLE_BTN))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .when_some(bg, |d, c| d.bg(c))
+        .hover(move |d| d.bg(hover))
+        .active(move |d| d.bg(active))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| TooltipLabel { text: tooltip.into() }).into()
+        })
+        .child(icon.size(px(15.0)).text_color(fg))
+        .on_mouse_down(MouseButton::Left, on_mouse_down)
 }
 
 impl PinWindowView {
@@ -4234,19 +4665,26 @@ impl PinWindowView {
             image: build_render_image_from_pixels(frame.width, frame.height, frame.pixels),
             focus_handle: cx.focus_handle(),
             is_always_on_top: false,
-            hovered_button: None,
         }
     }
 }
 
 impl Render for PinWindowView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::assets::icons as app_icon;
+
         let image = self.image.clone();
         let focus_handle = self.focus_handle.clone();
-        let is_always_on_top = self.is_always_on_top;
-        let hovered_button = self.hovered_button;
+        let is_on_top = self.is_always_on_top;
         let entity = cx.entity().downgrade();
+        // 固定出来的图片尺寸（物理像素）：贴在标题栏中间，用户一眼知道
+        // 这张固定图多大（旧版标题栏中间是纯空白，只有拖拽功能）。
+        let img_size = image.size(0);
+        let size_label = theme::format_size(img_size.width.0 as f32, img_size.height.0 as f32);
 
+        // 图片画布：`paint_canvas.flex_1()` 独占标题栏以下的全部空间，且根容器
+        // **不画描边**——边框会按 border-box 吃掉内容盒 2px，图片因此被缩放
+        // 到 (w-2)×(h-2) 渲染，"1:1 固定"就名不副实了。
         let paint_canvas = canvas(
             move |_, _, _| image.clone(),
             move |bounds, image, window, _cx| {
@@ -4260,131 +4698,65 @@ impl Render for PinWindowView {
             },
         );
 
-        let entity_for_pin = entity.clone();
-        let is_on_top = is_always_on_top;
+        let entity_for_top = entity.clone();
 
         div()
             .track_focus(&focus_handle)
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgba(0x00000088))
-            .border_1()
-            .border_color(rgba(0xffffff22))
+            .bg(theme::c::rgb(theme::tokens::PANEL_BG))
             .child(
-                // 自定义标题栏
+                // ── 自定义标题栏 ────────────────────────────────────────
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .h(px(32.0))
-                    .px(px(6.0))
-                    .gap(px(6.0))
-                    .bg(rgba(0x353535ee))
-                    .text_color(rgba(0xffffffff))
-                    // 左侧：置顶按钮
-                    .child(
-                        div()
-                            .id("pin-always-on-top")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(28.0))
-                            .h(px(28.0))
-                            .rounded(px(4.0))
-                            .when(
-                                is_on_top
-                                    || hovered_button
-                                        == Some(
-                                            HoveredButton::AlwaysOnTop,
-                                        ),
-                                |d| {
-                                    let alpha = if is_on_top
-                                        && hovered_button
-                                            == Some(
-                                                HoveredButton::AlwaysOnTop,
-                                            )
-                                    {
-                                        0x66
-                                    } else if is_on_top {
-                                        0x55
-                                    } else {
-                                        0x44
-                                    };
-                                    d.bg(rgba(0xffffff00 | alpha))
-                                },
-                            )
-                            .on_hover({
-                                let entity = entity_for_pin.clone();
-                                move |hovered: &bool,
-                                      _window: &mut Window,
-                                      app: &mut App| {
-                                    let _ = entity.update(
-                                        app,
-                                        |this, cx| {
-                                            if *hovered {
-                                                this.hovered_button =
-                                                    Some(
-                                                        HoveredButton::AlwaysOnTop,
-                                                    );
-                                            } else if this
-                                                .hovered_button
-                                                == Some(
-                                                    HoveredButton::AlwaysOnTop,
-                                                )
-                                            {
-                                                this.hovered_button =
-                                                    None;
-                                            }
-                                            cx.notify();
-                                        },
-                                    );
-                                }
-                            })
-                            .tooltip(|_window, app| {
-                                app.new(|_cx| TooltipLabel {
-                                    text: "固定".into(),
-                                })
-                                .into()
-                            })
-                            .child(
-                                Icon::new(IconName::ArrowUp)
-                                    .size(px(14.0)),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                {
-                                    let entity = entity_for_pin.clone();
-                                    move |_ev: &MouseDownEvent,
-                                          window: &mut Window,
-                                          app: &mut App| {
-                                        let new_state = !is_on_top;
-                                        #[cfg(any(target_os = "linux", target_os = "windows"))]
-                                        send_wm_state_above(
-                                            window, new_state,
-                                        );
-                                        let _ = entity.update(
-                                            app,
-                                            |this, cx| {
-                                                this.is_always_on_top =
-                                                    new_state;
-                                                cx.notify();
-                                            },
-                                        );
-                                    }
-                                },
-                            ),
-                    )
-                    // 中间：可拖拽空白区域
+                    .flex_none()
+                    .h(px(PIN_TITLEBAR_H))
+                    .px(px(4.0))
+                    .gap(px(2.0))
+                    .bg(theme::c::rgb(theme::tokens::PANEL_BG))
+                    .border_b_1()
+                    .border_color(theme::c::rgb(theme::tokens::DIVIDER))
+                    // 左侧：置顶开关（开启=蓝色实心）
+                    .child(pin_title_button(
+                        "pin-always-on-top",
+                        Icon::empty().path(if is_on_top {
+                            app_icon::PIN
+                        } else {
+                            app_icon::PIN_OFF
+                        }),
+                        if is_on_top {
+                            PinBtnTone::On
+                        } else {
+                            PinBtnTone::Neutral
+                        },
+                        if is_on_top { "取消置顶" } else { "置顶" },
+                        move |_ev: &MouseDownEvent, window: &mut Window, app: &mut App| {
+                            let new_state = !is_on_top;
+                            #[cfg(any(target_os = "linux", target_os = "windows"))]
+                            send_wm_state_above(window, new_state);
+                            let _ = entity_for_top.update(app, |this, cx| {
+                                this.is_always_on_top = new_state;
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    // 中间：尺寸信息 + 可拖拽空白区
                     .child(
                         div()
                             .flex_1()
                             .h_full()
+                            .flex()
+                            .items_center()
+                            .pl(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(theme::c::rgb(theme::tokens::TEXT_MUTED))
+                            .child(size_label)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                move |_ev: &MouseDownEvent,
-                                      window: &mut Window,
-                                      _app: &mut App| {
+                                move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
                                     // Windows 上 gpui_windows 未实现 start_window_move
                                     // （gpui::PlatformWindow 默认 no-op），用 Win32 原生
                                     // 标题栏拖拽：ReleaseCapture + WM_NCLBUTTONDOWN(HTCAPTION)。
@@ -4418,199 +4790,37 @@ impl Render for PinWindowView {
                                 },
                             ),
                     )
-                    // 右侧：最小化、最大化、关闭
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .id("pin-minimize")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .rounded(px(4.0))
-                                    .when(
-                                        hovered_button
-                                            == Some(
-                                                HoveredButton::Minimize,
-                                            ),
-                                        |d| d.bg(rgba(0xffffff44)),
-                                    )
-                                    .on_hover({
-                                        let entity = entity.clone();
-                                        move |hovered: &bool,
-                                              _window: &mut Window,
-                                              app: &mut App| {
-                                            let _ = entity.update(
-                                                app,
-                                                |this, cx| {
-                                                    if *hovered {
-                                                        this.hovered_button =
-                                                            Some(
-                                                                HoveredButton::Minimize,
-                                                            );
-                                                    } else if this
-                                                        .hovered_button
-                                                        == Some(
-                                                            HoveredButton::Minimize,
-                                                        )
-                                                    {
-                                                        this.hovered_button =
-                                                            None;
-                                                    }
-                                                    cx.notify();
-                                                },
-                                            );
-                                        }
-                                    })
-                                    .tooltip(|_window, app| {
-                                        app.new(|_cx| TooltipLabel {
-                                            text: "最小化".into(),
-                                        })
-                                        .into()
-                                    })
-                                    .child(
-                                        Icon::new(IconName::Minimize)
-                                            .size(px(14.0)),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_ev: &MouseDownEvent,
-                                              window: &mut Window,
-                                              _app: &mut App| {
-                                            #[cfg(any(target_os = "linux", target_os = "windows"))]
-                                            pin_minimize_window(window);
-                                        },
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("pin-maximize")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .rounded(px(4.0))
-                                    .when(
-                                        hovered_button
-                                            == Some(
-                                                HoveredButton::Maximize,
-                                            ),
-                                        |d| d.bg(rgba(0xffffff44)),
-                                    )
-                                    .on_hover({
-                                        let entity = entity.clone();
-                                        move |hovered: &bool,
-                                              _window: &mut Window,
-                                              app: &mut App| {
-                                            let _ = entity.update(
-                                                app,
-                                                |this, cx| {
-                                                    if *hovered {
-                                                        this.hovered_button =
-                                                            Some(
-                                                                HoveredButton::Maximize,
-                                                            );
-                                                    } else if this
-                                                        .hovered_button
-                                                        == Some(
-                                                            HoveredButton::Maximize,
-                                                        )
-                                                    {
-                                                        this.hovered_button =
-                                                            None;
-                                                    }
-                                                    cx.notify();
-                                                },
-                                            );
-                                        }
-                                    })
-                                    .tooltip(|_window, app| {
-                                        app.new(|_cx| TooltipLabel {
-                                            text: "最大化".into(),
-                                        })
-                                        .into()
-                                    })
-                                    .child(
-                                        Icon::new(IconName::Maximize)
-                                            .size(px(14.0)),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_ev: &MouseDownEvent,
-                                              window: &mut Window,
-                                              _app: &mut App| {
-                                            #[cfg(any(target_os = "linux", target_os = "windows"))]
-                                            pin_toggle_maximize(window);
-                                        },
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("pin-close")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .rounded(px(4.0))
-                                    .when(
-                                        hovered_button
-                                            == Some(HoveredButton::Close),
-                                        |d| d.bg(rgba(0xe81123cc)),
-                                    )
-                                    .on_hover({
-                                        let entity = entity.clone();
-                                        move |hovered: &bool,
-                                              _window: &mut Window,
-                                              app: &mut App| {
-                                            let _ = entity.update(
-                                                app,
-                                                |this, cx| {
-                                                    if *hovered {
-                                                        this.hovered_button =
-                                                            Some(
-                                                                HoveredButton::Close,
-                                                            );
-                                                    } else if this
-                                                        .hovered_button
-                                                        == Some(
-                                                            HoveredButton::Close,
-                                                        )
-                                                    {
-                                                        this.hovered_button =
-                                                            None;
-                                                    }
-                                                    cx.notify();
-                                                },
-                                            );
-                                        }
-                                    })
-                                    .tooltip(|_window, app| {
-                                        app.new(|_cx| TooltipLabel {
-                                            text: "关闭".into(),
-                                        })
-                                        .into()
-                                    })
-                                    .child(
-                                        Icon::new(IconName::Close)
-                                            .size(px(14.0)),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_ev: &MouseDownEvent,
-                                              window: &mut Window,
-                                              _app: &mut App| {
-                                            window.remove_window();
-                                        },
-                                    ),
-                            ),
-                    ),
+                    // 右侧：最小化 / 最大化 / 关闭
+                    .child(pin_title_button(
+                        "pin-minimize",
+                        Icon::new(IconName::Minimize),
+                        PinBtnTone::Neutral,
+                        "最小化",
+                        move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
+                            #[cfg(any(target_os = "linux", target_os = "windows"))]
+                            pin_minimize_window(window);
+                        },
+                    ))
+                    .child(pin_title_button(
+                        "pin-maximize",
+                        Icon::new(IconName::Maximize),
+                        PinBtnTone::Neutral,
+                        "最大化",
+                        move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
+                            #[cfg(any(target_os = "linux", target_os = "windows"))]
+                            pin_toggle_maximize(window);
+                        },
+                    ))
+                    .child(pin_title_button(
+                        "pin-close",
+                        Icon::new(IconName::Close),
+                        PinBtnTone::Danger,
+                        "关闭",
+                        // 关闭按钮固定在拖拽区之外：鼠标按下即关，不等抬起。
+                        move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
+                            window.remove_window();
+                        },
+                    )),
             )
             .child(paint_canvas.flex_1())
             .on_key_down(|ev: &KeyDownEvent, window, _cx| {
@@ -4830,8 +5040,6 @@ fn pin_toggle_maximize(window: &mut Window) {
     }
 }
 
-/// 在新线程中启动独立的 GPUI 窗口，展示标注后的截图
-
 /// 主线程 → GPUI 线程的命令
 enum OverlayCommand {
     /// 打开截图覆盖窗口；`reply` 由 OverlayView::commit 发回结果
@@ -5013,10 +5221,12 @@ fn ensure_started() -> Sender<OverlayCommand> {
 /// 常驻 GPUI 应用线程：跑一个 `QuitMode::Explicit` 的应用，命令循环在
 /// 应用内打开/关闭窗口，事件循环永不退出（除非进程退出）。
 fn run_overlay_app(rx: Receiver<OverlayCommand>) {
-    // 注册 gpui-component-assets 提供默认 Lucide 图标 svg 资源。
-    // 不调用时 IconName::XXX 渲染会找不到 svg、按钮看不出图标。
+    // 资源源：**项目自带图标**（assets/icons/ui，路径前缀 app-icons/）优先，
+    // 其余回退 gpui-component 内置的 Lucide 图标集（icons/*.svg，IconName::XXX）。
+    // 见 `crate::assets::AppAssets`：不注册资源源时 svg 取不到字节，
+    // 按钮只剩文字、图标全空。
     application()
-        .with_assets(gpui_component_assets::Assets)
+        .with_assets(crate::assets::AppAssets)
         // QuitMode::Explicit：窗口关闭不自动退出；只有显式 cx.quit() 才结束
         // 事件循环。这是避免 gpui_windows::WindowsPlatform::run 末尾
         // ExitProcess(0) 杀进程的关键。
@@ -5024,6 +5234,11 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
         .run(move |cx: &mut App| {
             // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
             gpui_component::init(cx);
+
+            // 全局切到**深色主题**：截图工具栏、二级弹层、Pin 标题栏、滚动进度窗、
+            // OCR 面板都是深色玻璃风格，组件默认的浅色主题会让它们内部弹出的
+            // 组件（tooltip / Button 变体 / 滚动条 / 文本选区）白得发亮、风格割裂。
+            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
             // 把内置 Noto Sans CJK SC Regular/Bold 注册进 GPUI text system，
             // 这样预览文字用 family="Noto Sans CJK SC" + weight=BOLD 时能命中
@@ -5047,6 +5262,10 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 let mut ocr_pin: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut update_prompt: Option<WindowHandle<gpui_component::Root>> = None;
+                // UI 视觉调试：SCREENSHOT_RS_UI_PROBE=pin|progress|ocr|update 时，
+                // 应用一起来就把对应的独立窗口摆出来，方便用截图脚本核对样式
+                // （正常使用不带该环境变量，这里是空操作）。
+                probe_aux_windows(&mut progress, &mut update_prompt, async_cx);
                 loop {
                     match rx.try_recv() {
                         Ok(OverlayCommand::Capture { frame, screen_bounds, reply }) => {
@@ -5322,8 +5541,9 @@ fn reuse_overlay_window(
 ) {
     // —— 与 open_overlay_in_app 相同的窗口/裁剪参数计算 ——
     // 帧尺寸在下方 move 进 (display, original) 前先取出，供对齐诊断使用
-    let frame_w = frame.width;
-    let frame_h = frame.height;
+    // （Windows 分支的 schedule_overlay_client_align 会用）
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    let (frame_w, frame_h) = (frame.width, frame.height);
     let win_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
         origin: point(px(0.), px(0.)),
         size: Size::new(px(screen_bounds.size.x), px(screen_bounds.size.y)),
@@ -5491,6 +5711,86 @@ fn unpark_overlay_window(window: &mut Window) {
 #[cfg(not(target_os = "linux"))]
 fn unpark_overlay_window(_window: &mut Window) {}
 
+/// UI 视觉调试用的辅助窗口探针（见 [`OverlayView::apply_ui_probe`]）
+///
+/// 只认环境变量 `SCREENSHOT_RS_UI_PROBE`，取值：
+/// - `progress`：开一个假的滚动进度浮窗（计数器会自增，能看到"进行中"的样子）
+/// - `pin`：开一个固定窗，内容是一张合成的测试图（核对标题栏与 1:1 绘制）
+/// - `update`：开「发现新版本」提示窗
+///
+/// 多个值可用 `,` 组合。正常使用不带该变量，函数体不执行任何逻辑。
+fn probe_aux_windows(
+    progress: &mut Option<WindowHandle<ProgressView>>,
+    update_prompt: &mut Option<WindowHandle<gpui_component::Root>>,
+    cx: &mut AsyncApp,
+) {
+    let Ok(spec) = std::env::var("SCREENSHOT_RS_UI_PROBE") else {
+        return;
+    };
+    let wants = |k: &str| spec.split(',').any(|p| p.trim() == k || p.trim().starts_with(&format!("{k}:")));
+
+    if wants("progress") {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let moving = Arc::new(AtomicBool::new(false));
+        let bottom = Arc::new(AtomicBool::new(false));
+        // confirming 是 Arc<AtomicBool>（见 ProgressView 字段）
+        let confirming = Arc::new(AtomicBool::new(false));
+        let height = Arc::new(AtomicU32::new(1284));
+        let region = ub::Bounds::new(ub::Point::new(320.0, 240.0), ub::Point::new(1280.0, 900.0));
+        let screen = ub::Bounds::new(ub::Point::ZERO, ub::Point::new(1920.0, 1080.0));
+        let opened = cx.update(|cx| {
+            open_progress_window(
+                cancel, done, height, moving, bottom, confirming, false, region, screen, cx,
+            )
+        });
+        match opened {
+            Ok(h) => *progress = Some(h),
+            Err(e) => tracing::warn!("[UI 探针] 打开进度窗失败: {e}"),
+        }
+    }
+
+    if wants("update") {
+        match cx.update(|cx| open_update_prompt_in_app("9.9.9".to_string(), cx)) {
+            Ok(h) => *update_prompt = Some(h),
+            Err(e) => tracing::warn!("[UI 探针] 打开更新提示窗失败: {e}"),
+        }
+    }
+
+    if wants("pin") {
+        // 合成一张 360x240 的测试图：四角彩色 + 中间渐变，方便判断是否 1:1
+        let (w, h) = (360u32, 240u32);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let r = (x * 255 / w.max(1)) as u8;
+                let g = (y * 255 / h.max(1)) as u8;
+                let b = if (x / 12 + y / 12) % 2 == 0 { 0xF0 } else { 0x40 };
+                px.extend_from_slice(&[r, g, b, 0xFF]);
+            }
+        }
+        let frame = CapturedFrame {
+            width: w,
+            height: h,
+            pixels: px,
+        };
+        cx.update(|cx| {
+            open_pin_in_app(
+                PinPayload { frame, origin_x: 120.0, origin_y: 120.0, sx: 1.0, sy: 1.0 },
+                cx,
+            );
+        });
+    }
+}
+
+/// 滚动截屏进度浮窗：面板高度
+const PROGRESS_PANEL_H: f32 = 46.0;
+/// 滚动截屏进度浮窗：面板宽度（图标 + 文案 + 计数 + 两个按钮）
+const PROGRESS_PANEL_W: f32 = 344.0;
+/// 滚动截屏进度浮窗：窗口内边距（面板四周留白，给阴影用；窗口背景为 Transparent）
+const PROGRESS_PAD: f32 = 12.0;
+
 /// 滚动截屏进度小窗视图（auto/manual 共用；manual 显示「完成」按钮）
 struct ProgressView {
     cancel: Arc<AtomicBool>,
@@ -5499,6 +5799,10 @@ struct ProgressView {
     /// 引擎每轮更新的「内容是否在动」标志：静止时才显示「完成」按钮
     moving: Arc<AtomicBool>,
     /// 引擎每轮更新的「最近一帧底部是否含内容」：点「完成」时据此弹确认
+    ///
+    /// 当前 UI 不再读它（点「完成」直接结束，理由见 `ProgressView::render`），
+    /// 但引擎仍在写、命令通道仍要传，保留字段以免动到滚动引擎的公共接口。
+    #[allow(dead_code)]
     bottom_has_content: Arc<AtomicBool>,
     /// 确认态标志：点「完成」且底部有内容时置 true，弹「可能没滚到底」确认
     confirming: Arc<AtomicBool>,
@@ -5506,82 +5810,118 @@ struct ProgressView {
 }
 
 impl Render for ProgressView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let height = self.progress.load(Ordering::Relaxed);
         let confirming_now = self.manual && self.confirming.load(Ordering::Relaxed);
-        let text = if confirming_now {
+        let label = if confirming_now {
             // 确认态：提示用户可能还没滚到底
             "底部可能还有内容？".to_string()
         } else if self.manual {
-            format!("手动滚动截屏中… {height}px")
+            "手动滚动截屏中…".to_string()
         } else {
-            format!("滚动截屏中… {height}px")
+            "滚动截屏中…".to_string()
         };
+        let busy = self.moving.load(Ordering::Relaxed);
+        let mono = cx.theme().mono_font_family.clone();
+
+        // 浮窗外观：深色玻璃面板 + 柔和阴影。窗口铺满但四边留 PROGRESS_PAD，
+        // 面板在其中（窗口背景 Transparent，圆角外与阴影区自然透出桌面）。
         div()
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .px(px(12.0))
-            .h(px(44.0))
+            .size_full()
+            .p(px(PROGRESS_PAD))
             .child(
                 div()
                     .flex()
-                    .flex_1()
                     .items_center()
-                    .child(div().text_sm().child(text)),
-            )
-            .when(confirming_now, {
-                let confirming = self.confirming.clone();
-                let done = self.done.clone();
-                // 确认态：继续滚动 / 确定结束
-                move |b| {
-                    b.child(
-                        Button::new("scroll-continue")
-                            .label("继续滚动")
-                            .compact()
-                            .with_size(gpui_component::Size::Small)
-                            .on_click(move |_, _, _| confirming.store(false, Ordering::Relaxed)),
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .size_full()
+                    .bg(theme::c::rgb(theme::tokens::PANEL_BG))
+                    .text_color(theme::c::rgb(theme::tokens::TEXT))
+                    .rounded(px(theme::r::PANEL))
+                    .border_1()
+                    .border_color(theme::c::rgb(theme::tokens::PANEL_BORDER))
+                    .shadow(theme::panel_shadow())
+                    .child(
+                        Icon::new(IconName::LoaderCircle)
+                            .size(px(15.0))
+                            .text_color(theme::c::rgb(theme::tokens::ACCENT)),
                     )
                     .child(
-                        Button::new("scroll-confirm-done")
-                            .label("确定结束")
-                            .compact()
-                            .with_size(gpui_component::Size::Small)
-                            .on_click(move |_, _, _| done.store(true, Ordering::Relaxed)),
+                        div()
+                            .flex_none()
+                            .text_size(px(13.0))
+                            .text_color(theme::c::rgb(theme::tokens::TEXT))
+                            .child(label),
                     )
-                }
-            })
-            // 完成按钮：**始终显示**（不再随 moving 显隐，避免按钮忽隐忽现、行宽变化
-            // 导致「取消」跟着左右抖动）。内容在动时**置灰禁用**（手动滚动动画未落定
-            // 不可点，避免最后一段还没拼进去就结束）；静止时恢复可点。自动模式因引擎
-            // 每轮自动滚动、`moving` 恒为 false，完成按钮始终可点（随时可停止）。点
-            // 「完成」直接结束（不再弹「底部可能还有内容？」确认）：vxe-table 这类内容
-            // 始终填满视口的表格，`bottom_has_content` 几乎永远为 true，若以它作为确认
-            // 条件，用户明明滚到底了点「完成」还会被追问「继续滚动」。
-            .when(!confirming_now, {
-                let done = self.done.clone();
-                let moving_now = self.moving.load(Ordering::Relaxed);
-                move |b| {
-                    b.child(
-                        Button::new("scroll-done")
-                            .label("完成")
-                            .compact()
-                            .with_size(gpui_component::Size::Small)
-                            .disabled(moving_now)
-                            .on_click(move |_, _, _| {
-                                done.store(true, Ordering::Relaxed);
-                            }),
+                    // 计数用等宽字体 + 固定宽度右对齐：数字从 "7px" 涨到 "1284px"
+                    // 时不会推着右侧按钮左右抖动。
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(74.0))
+                            .text_right()
+                            .font_family(mono)
+                            .text_size(px(13.0))
+                            .text_color(theme::c::rgb(theme::tokens::TEXT_MUTED))
+                            .child(format!("{height}px")),
                     )
-                }
-            })
-            .child({
-                let cancel = self.cancel.clone();
-                Button::new("scroll-cancel")
-                    .label("取消")
-                    .compact()
-                    .with_size(gpui_component::Size::Small)
-                    .on_click(move |_, _, _| cancel.store(true, Ordering::Relaxed))
-            })
+                    .child(div().flex_1())
+                    .when(confirming_now, {
+                        let confirming = self.confirming.clone();
+                        let done = self.done.clone();
+                        // 确认态：继续滚动 / 确定结束
+                        move |b| {
+                            b.child(bar_button(
+                                "scroll-continue",
+                                icon_label_content(Icon::new(IconName::ArrowLeft), "继续滚动"),
+                                ToolbarBtnStyle::Neutral,
+                                false,
+                                move |_, _, _| confirming.store(false, Ordering::Relaxed),
+                            ))
+                            .child(bar_button(
+                                "scroll-confirm-done",
+                                icon_label_content(Icon::new(IconName::Check), "确定结束"),
+                                ToolbarBtnStyle::Success,
+                                false,
+                                move |_, _, _| done.store(true, Ordering::Relaxed),
+                            ))
+                        }
+                    })
+                    // 完成按钮：**始终显示**（不再随 moving 显隐，避免按钮忽隐忽现、行宽变化
+                    // 导致「取消」跟着左右抖动）。内容在动时**置灰禁用**（手动滚动动画未落定
+                    // 不可点，避免最后一段还没拼进去就结束）；静止时恢复可点。自动模式因引擎
+                    // 每轮自动滚动、`moving` 恒为 false，完成按钮始终可点（随时可停止）。点
+                    // 「完成」直接结束（不再弹「底部可能还有内容？」确认）：vxe-table 这类内容
+                    // 始终填满视口的表格，`bottom_has_content` 几乎永远为 true，若以它作为确认
+                    // 条件，用户明明滚到底了点「完成」还会被追问「继续滚动」。
+                    .when(!confirming_now, {
+                        let done = self.done.clone();
+                        move |b| {
+                            b.child(
+                                bar_button(
+                                    "scroll-done",
+                                    icon_label_content(Icon::new(IconName::Check), "完成"),
+                                    ToolbarBtnStyle::Success,
+                                    busy,
+                                    move |_, _, _| {
+                                        done.store(true, Ordering::Relaxed);
+                                    },
+                                ),
+                            )
+                        }
+                    })
+                    .child({
+                        let cancel = self.cancel.clone();
+                        bar_button(
+                            "scroll-cancel",
+                            icon_label_content(Icon::new(IconName::Close), "取消"),
+                            ToolbarBtnStyle::Danger,
+                            false,
+                            move |_, _, _| cancel.store(true, Ordering::Relaxed),
+                        )
+                    }),
+            )
     }
 }
 
@@ -5616,9 +5956,11 @@ fn open_progress_window(
     let sx = f32::from(dbounds.size.width) / screen_px.size.x.max(1.0);
     let sy = f32::from(dbounds.size.height) / screen_px.size.y.max(1.0);
 
-    // 自动/手动模式都显示「完成」+「取消」两个按钮，窗口统一加宽
-    let win_w = 360.0;
-    const WIN_H: f32 = 44.0;
+    // 自动/手动模式都显示「完成」+「取消」两个按钮，窗口统一加宽。
+    // 窗口本身用 Transparent 背景，四边留 PROGRESS_PAD 的空隙给面板阴影，
+    // 这样浮窗才有圆角 + 立体感（不透明窗口会把圆角外画成方块底色）。
+    let win_w = PROGRESS_PANEL_W + PROGRESS_PAD * 2.0;
+    const WIN_H: f32 = PROGRESS_PANEL_H + PROGRESS_PAD * 2.0;
     let dw = f32::from(dbounds.size.width);
     let dh = f32::from(dbounds.size.height);
     // 兜底角落：右下、左下、右上、左上
@@ -5708,7 +6050,7 @@ fn open_progress_window(
                 origin,
                 size: Size::new(px(win_w), px(WIN_H)),
             })),
-            window_background: WindowBackgroundAppearance::Opaque,
+            window_background: WindowBackgroundAppearance::Transparent,
             titlebar: None,
             kind: WindowKind::PopUp,
             is_movable: false,
@@ -5732,52 +6074,63 @@ struct UpdatePromptView {
 }
 
 impl Render for UpdatePromptView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::assets::icons as app_icon;
+        use theme::tokens as t;
+
         let status = self.status.load(Ordering::Relaxed);
         let err: String = self.error.lock().map(|g| g.clone()).unwrap_or_default();
-        // 读取全局主题（自适应明暗），仅取颜色，避免跨渲染借用 cx。
-        let colors = cx.theme().colors;
         let (title, body) = match status {
-            0 => ("发现新版本".to_string(), "新版本已发布，是否立即下载并安装？".to_string()),
-            1 => ("正在更新…".to_string(), "正在下载并安装新版本，请稍候…".to_string()),
+            0 => (
+                "发现新版本".to_string(),
+                "新版本已发布，是否立即下载并安装？".to_string(),
+            ),
+            1 => (
+                "正在更新…".to_string(),
+                "正在下载并安装新版本，请稍候…".to_string(),
+            ),
             2 => ("更新完成".to_string(), "已更新，正在重启应用…".to_string()),
-            _ => ("更新失败".to_string(), if err.is_empty() { "请稍后重试".into() } else { err }),
+            _ => (
+                "更新失败".to_string(),
+                if err.is_empty() { "请稍后重试".into() } else { err },
+            ),
         };
-        // 状态强调色：待确认/更新中=蓝，完成=绿，失败=红
+        // 状态语义色：待确认/更新中=强调蓝，完成=绿，失败=红。
+        // 标题图标、圆点、版本徽标都用它，整窗只有一处强调色，不花。
         let accent = match status {
-            2 => colors.success,
-            -1 => colors.danger,
-            _ => colors.info,
+            2 => theme::c::rgb(t::SUCCESS),
+            -1 => theme::c::rgb(t::DANGER),
+            _ => theme::c::rgb(t::ACCENT),
         };
-        // 按钮颜色：Hsla 是 Copy，可在各 move 闭包里按值捕获，避免 colors 被整体 move。
-        let primary_bg = colors.primary;
-        let primary_fg = colors.primary_foreground;
-        let secondary_bg = colors.secondary;
-        let secondary_fg = colors.secondary_foreground;
-        // 整窗填不透明背景：否则下层窗口颜色会穿透到提示窗，观感很差。标题行
-        // 用「强调色圆点 + 粗体标题 + 版本徽标」，正文用 muted 色，底部弹性占位
-        // 把按钮推到窗底。
+        let status_icon = match status {
+            2 => Icon::new(IconName::CircleCheck),
+            -1 => Icon::new(IconName::TriangleAlert),
+            // 下载/安装进行中：环形箭头（静止图形，不引入动画以免无谓重绘）
+            1 => Icon::new(IconName::LoaderCircle),
+            _ => Icon::empty().path(app_icon::SPARKLES),
+        };
+
         div()
-            .w_full()
-            .h_full()
-            .bg(colors.background)
+            .size_full()
             .flex()
             .flex_col()
             .px(px(22.0))
             .py(px(18.0))
-            .gap(px(12.0))
-            // 标题行（强调色圆点 + 粗体标题 + 版本徽标）
+            .gap(px(10.0))
+            .bg(theme::c::rgb(t::PANEL_BG))
+            .text_color(theme::c::rgb(t::TEXT))
+            // ── 标题行：状态图标 + 标题 + 版本徽标 ──────────────────────
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(9.0))
-                    .child(div().size(px(9.0)).rounded_full().bg(accent))
+                    .child(status_icon.size(px(19.0)).text_color(accent))
                     .child(
                         div()
                             .text_xl()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(colors.foreground)
+                            .text_color(theme::c::rgb(t::TEXT))
                             .child(title),
                     )
                     .child(
@@ -5786,120 +6139,115 @@ impl Render for UpdatePromptView {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .px(px(9.0))
                             .py(px(2.0))
-                            .rounded_md()
-                            .bg(accent.opacity(0.12))
+                            .rounded(px(theme::r::CHIP))
+                            .bg(accent.opacity(0.16))
                             .text_color(accent)
                             .child(format!("v{}", self.new_version)),
                     ),
             )
-            // 正文（muted 次级色）
+            // ── 正文 ────────────────────────────────────────────────────
             .child(
                 div()
                     .text_sm()
-                    .text_color(colors.muted_foreground)
+                    .text_color(theme::c::rgb(t::TEXT_MUTED))
                     .child(body),
             )
-            // 弹性占位：把按钮行推到窗底
+            // 弹性占位：把按钮行推到窗底（窗口高度可被 WM 拉伸时也贴底）
             .child(div().flex_1())
-            // 分隔线 + 按钮行（右对齐）
+            // ── 分隔线 + 按钮行（右对齐）─────────────────────────────────
             .child(
                 div()
-                    .mt(px(14.0))
-                    .border_t_1()
-                    .border_color(colors.border)
+                    .mt(px(12.0))
                     .pt(px(12.0))
+                    .border_t_1()
+                    .border_color(theme::c::rgb(t::DIVIDER))
                     .flex()
                     .justify_end()
                     .items_center()
-                    .gap(px(10.0))
-                    // 待确认或失败时显示「立即更新」（失败可重试）；更新中/完成时不显示
-                    .when(status == 0 || status == -1, {
-                        let status = self.status.clone();
+                    .gap(px(8.0))
+                    // 主按钮：待确认 → 「立即更新」；失败 → 「重试」；
+                    // 更新中 → 同位置的**禁用占位**（换文案不换位置，避免按钮
+                    // 突然消失导致「稍后」左右跳动）。
+                    .when(status != 2, {
+                        let status_state = self.status.clone();
                         let error = self.error.clone();
+                        let in_progress = status == 1;
+                        let label = if status == -1 { "重试" } else { "立即更新" };
                         move |b| {
-                            b.child(
-                                div()
-                                    .id("update-start")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(28.0))
-                                    .px(px(18.0))
-                                    .rounded_md()
-                                    .bg(primary_bg)
-                                    .text_color(primary_fg)
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .cursor_pointer()
-                                    .on_click(move |_, _, _| {
-                                        // 后台执行：下载并替换运行中的二进制，完成后更新状态
-                                        status.store(1, Ordering::Relaxed);
-                                        let status = status.clone();
-                                        let error = error.clone();
-                                        std::thread::spawn(move || {
-                                            match crate::update::apply_update() {
-                                                Ok(_) => {
-                                                    // 短暂显示「更新完成」，再自动重启到新版本。
-                                                    status.store(2, Ordering::Relaxed);
-                                                    std::thread::sleep(std::time::Duration::from_millis(700));
-                                                    crate::update::restart_app();
-                                                }
-                                                Err(e) => {
-                                                    {
-                                                        let mut guard = error
-                                                            .lock()
-                                                            .unwrap_or_else(|p| p.into_inner());
-                                                        *guard = e;
-                                                    }
-                                                    status.store(-1, Ordering::Relaxed);
-                                                }
+                            let content = div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    Icon::empty()
+                                        .path(app_icon::DOWNLOAD)
+                                        .size(px(15.0)),
+                                )
+                                .child(label);
+                            b.child(ui_button(
+                                "update-start",
+                                content,
+                                ToolbarBtnStyle::Accent,
+                                BtnSize::Dialog,
+                                true,
+                                in_progress,
+                                None,
+                                move |_, _, _| {
+                                    // 后台执行：下载并替换运行中的二进制，完成后更新状态
+                                    status_state.store(1, Ordering::Relaxed);
+                                    let status = status_state.clone();
+                                    let error = error.clone();
+                                    std::thread::spawn(move || {
+                                        match crate::update::apply_update() {
+                                            Ok(_) => {
+                                                // 短暂显示「更新完成」，再自动重启到新版本。
+                                                status.store(2, Ordering::Relaxed);
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(700),
+                                                );
+                                                crate::update::restart_app();
                                             }
-                                        });
-                                    })
-                                    .child("立即更新"),
-                            )
+                                            Err(e) => {
+                                                {
+                                                    let mut guard = error
+                                                        .lock()
+                                                        .unwrap_or_else(|p| p.into_inner());
+                                                    *guard = e;
+                                                }
+                                                status.store(-1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    });
+                                },
+                            ))
                         }
                     })
                     // 已完成：只留「关闭」
                     .when(status == 2, {
                         move |b| {
-                            b.child(
-                                div()
-                                    .id("update-close")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .h(px(28.0))
-                                    .px(px(18.0))
-                                    .rounded_md()
-                                    .bg(secondary_bg)
-                                    .text_color(secondary_fg)
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .cursor_pointer()
-                                    .on_click(move |_, window, _| window.remove_window())
-                                    .child("关闭"),
-                            )
+                            b.child(ui_button(
+                                "update-close",
+                                label_text("关闭"),
+                                ToolbarBtnStyle::Success,
+                                BtnSize::Dialog,
+                                true,
+                                false,
+                                None,
+                                move |_, window, _| window.remove_window(),
+                            ))
                         }
                     })
                     // 「稍后」始终显示（更新中也可关闭）
-                    .child(
-                        div()
-                            .id("update-dismiss")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(28.0))
-                            .px(px(18.0))
-                            .rounded_md()
-                            .bg(secondary_bg)
-                            .text_color(secondary_fg)
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .on_click(move |_, window, _| window.remove_window())
-                            .child("稍后"),
-                    ),
+                    .child(ui_button(
+                        "update-dismiss",
+                        label_text("稍后"),
+                        ToolbarBtnStyle::Neutral,
+                        BtnSize::Dialog,
+                        true,
+                        false,
+                        None,
+                        move |_, window, _| window.remove_window(),
+                    )),
             )
     }
 }
@@ -5981,9 +6329,8 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
     const MIN_IMG_W: f32 = 150.0;
     let scale = (MIN_IMG_W / img_w).max(1.0);
     // 自定义标题栏高度（原生标题栏已移除，由 PinWindowView render 绘制）
-    const CUSTOM_TITLEBAR_H: f32 = 32.0;
     let win_w = px(img_w * scale);
-    let win_h = px(img_h * scale + CUSTOM_TITLEBAR_H);
+    let win_h = px(img_h * scale + PIN_TITLEBAR_H);
     // 使用 Normal 窗口：支持 start_window_move / 键盘事件等 WM 交互
     tracing::info!(
         "[Pin] open window: origin=({:.0},{:.0}) img_logical={:.1}x{:.1} img_physical={}x{} win_size={:.1}x{:.1} scale={:.2}",
@@ -6002,7 +6349,7 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
     // 图像实际渲染在 client y=33（边框1px + 标题栏32px）。窗口先按
     // target_y = origin_y - 32 请求，创建后由 `schedule_client_top_adjustment`
     // 延迟到 App 借期外动态校正客户端位置（见下），跨平台无需硬编码偏移量。
-    let target_y = origin_y - CUSTOM_TITLEBAR_H;
+    let target_y = origin_y - PIN_TITLEBAR_H;
 
     cx.open_window(
         WindowOptions {
@@ -6032,7 +6379,10 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
             schedule_client_top_adjustment(
                 cx,
                 window_hwnd(window),
-                (origin_y - 33.0) as i32,
+                // 图片从 client y = PIN_TITLEBAR_H 开始绘制（根容器不再画 1px
+                // 描边，所以不再是 33），把客户端顶移到 origin_y - 32 即可让
+                // 图片与原始选区严格对齐。
+                (origin_y - PIN_TITLEBAR_H) as i32,
             );
 
             let actual = window.bounds();
@@ -6230,6 +6580,8 @@ impl OcrModelsView {
 impl Render for OcrModelsView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         use crate::ocr::paddle::{FileStatus, ModelSnapshot};
+        use theme::tokens as t;
+        use gpui::relative;
         let snap: ModelSnapshot = crate::ocr::paddle::model_snapshot();
         let downloading = snap.downloading;
         let downloading_tier = snap.downloading_tier.clone();
@@ -6267,13 +6619,13 @@ impl Render for OcrModelsView {
                 let (mark, mark_color) = if downloading
                     && file_rows_current_file.as_deref() == Some(f.name)
                 {
-                    ("下载中…", gpui::rgba(0x42A5F5FF))
+                    ("下载中…", theme::c::rgb(t::ACCENT))
                 } else {
                     match &f.status {
-                        FileStatus::Ready => ("✓ 已存在", gpui::rgba(0x4CAF50FF)),
-                        FileStatus::Missing => ("未下载", gpui::rgba(0x9E9E9EFF)),
-                        FileStatus::Downloading => ("下载中…", gpui::rgba(0x42A5F5FF)),
-                        FileStatus::Error(_) => ("失败", gpui::rgba(0xEF5350FF)),
+                        FileStatus::Ready => ("✓ 已存在", theme::c::rgb(t::SUCCESS)),
+                        FileStatus::Missing => ("未下载", theme::c::rgb(t::TEXT_MUTED)),
+                        FileStatus::Downloading => ("下载中…", theme::c::rgb(t::ACCENT)),
+                        FileStatus::Error(_) => ("失败", theme::c::rgb(t::DANGER)),
                     }
                 };
                 let size_text = f
@@ -6284,7 +6636,7 @@ impl Render for OcrModelsView {
                     .local_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "（本地无此文件）".into());
+                    .unwrap_or_else(|| "本地无此文件".into());
                 let url = f.url.clone();
                 let tier_for_btn = file_rows_tier.clone();
                 let name_for_btn = f.name.to_string();
@@ -6319,11 +6671,11 @@ impl Render for OcrModelsView {
                             .gap(px(6.0))
                             .child(div().text_color(mark_color).text_sm().child(gpui::SharedString::from(mark)))
                             .child(div().flex_1().text_sm().child(gpui::SharedString::from(f.name)))
-                            .child(div().text_color(gpui::rgba(0x9E9E9EFF)).text_xs().child(gpui::SharedString::from(size_text)))
+                            .child(div().text_color(theme::c::rgb(t::TEXT_MUTED)).text_xs().child(gpui::SharedString::from(size_text)))
                             .child(if file_rows_bundled {
                                 // 内置档（small）：随应用包分发，无单文件下载按钮
                                 div()
-                                    .text_color(gpui::rgba(0x8BC34AFF))
+                                    .text_color(theme::c::rgb(t::SUCCESS))
                                     .text_xs()
                                     .child("内置")
                                     .into_any_element()
@@ -6364,13 +6716,13 @@ impl Render for OcrModelsView {
                             })                            )
                     .child(
                         div()
-                            .text_color(gpui::rgba(0x808080FF))
+                            .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.8))
                             .text_xs()
                             .child(gpui::SharedString::from(path_text)),
                     )
                     .child(
                         div()
-                            .text_color(gpui::rgba(0x5C6BC0FF))
+                            .text_color(theme::c::rgb(t::TEXT_MUTED))
                             .text_xs()
                             .child(gpui::SharedString::from(url)),
                     )
@@ -6382,9 +6734,9 @@ impl Render for OcrModelsView {
                 .rounded_md()
                 .border_1()
                 .border_color(if selected {
-                    gpui::rgba(0x42A5F5FF)
+                    theme::c::rgb(t::ACCENT)
                 } else {
-                    gpui::rgba(0x2E2E2EFF)
+                    theme::c::rgb(t::DIVIDER)
                 })
                 // 档位头：名称 + 说明在前，激活 / 重新下载按钮都在行尾
                 .child(
@@ -6397,16 +6749,16 @@ impl Render for OcrModelsView {
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(if selected {
-                                    gpui::rgba(0x42A5F5FF)
+                                    theme::c::rgb(t::ACCENT)
                                 } else {
-                                    gpui::rgba(0xE6E6E6FF)
+                                    theme::c::rgb(t::TEXT)
                                 })
                                 .child(gpui::SharedString::from(tier.clone())),
                         )
                         .child(
                             div()
                                 .flex_1()
-                                .text_color(gpui::rgba(0x9E9E9EFF))
+                                .text_color(theme::c::rgb(t::TEXT_MUTED))
                                 .text_xs()
                                 .child(gpui::SharedString::from(note)),
                         )
@@ -6452,7 +6804,7 @@ impl Render for OcrModelsView {
                         // 整档按钮：仅非内置档（medium）显示下载；内置档（small）随应用包分发
                         .child(if bundled {
                             div()
-                                .text_color(gpui::rgba(0x8BC34AFF))
+                                .text_color(theme::c::rgb(t::SUCCESS))
                                 .text_xs()
                                 .child("已随应用内置")
                                 .into_any_element()
@@ -6508,8 +6860,8 @@ impl Render for OcrModelsView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(gpui::rgba(0x181818FF))
-            .text_color(gpui::rgba(0xE6E6E6FF))
+            .bg(theme::c::rgb(t::PANEL_BG))
+            .text_color(theme::c::rgb(t::TEXT))
             .track_focus(&self.focus_handle)
             .child(
                 div()
@@ -6522,10 +6874,10 @@ impl Render for OcrModelsView {
                     // 缓存目录说明
                     .child(
                         div()
-                            .text_color(gpui::rgba(0x808080FF))
+                            .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.8))
                             .text_xs()
                             .child(gpui::SharedString::from(format!(
-                                "缓存目录：{cache_dir}（模型查找顺序：OCR_MODEL_DIR / 项目 models/PP-OCRv6 / 缓存）"
+                                "缓存目录：{cache_dir}"
                             ))),
                     )
                     .children(tier_blocks)
@@ -6540,11 +6892,11 @@ impl Render for OcrModelsView {
                             .py(px(8.0))
                             .rounded_md()
                             .border_1()
-                            .border_color(gpui::rgba(0xEF535088))
-                            .bg(gpui::rgba(0xEF535020))
+                            .border_color(theme::c::rgb(t::DANGER).opacity(0.55))
+                            .bg(theme::c::rgb(t::DANGER).opacity(0.14))
                             .child(
                                 div()
-                                    .text_color(gpui::rgba(0xEF5350FF))
+                                    .text_color(theme::c::rgb(t::DANGER))
                                     .text_xs()
                                     .child(gpui::SharedString::from(format!("{t}：{msg}"))),
                             )
@@ -6566,42 +6918,52 @@ impl Render for OcrModelsView {
                             .gap(px(4.0))
                             .child(
                                 div()
-                                    .text_color(gpui::rgba(0x42A5F5FF))
+                                    .text_color(theme::c::rgb(t::ACCENT))
                                     .text_sm()
                                     .child(gpui::SharedString::from(format!(
                                         "正在下载：{pct_text}"
                                     ))),
                             )
                             .child(
+                                // 进度条：轨道铺满可用宽度，填充用**百分比宽度**
+                                // （旧实现写死 480px，而窗口内容宽约 736px，进度
+                                // 到 100% 也只填到 65%，看起来"永远下不完"）。
                                 div()
+                                    .relative()
                                     .w_full()
                                     .h(px(6.0))
                                     .rounded_full()
-                                    .bg(gpui::rgba(0x2A2A2AFF))
+                                    .bg(theme::c::rgb(t::PROGRESS_TRACK))
                                     .child(
                                         div()
+                                            .absolute()
+                                            .left(px(0.0))
+                                            .top(px(0.0))
                                             .h_full()
                                             .rounded_full()
-                                            .w(px(480.0 * pct.unwrap_or(0.0) as f32 / 100.0))
-                                            .bg(gpui::rgba(0x42A5F5FF)),
+                                            .w(relative(
+                                                (pct.unwrap_or(0.0) as f32 / 100.0)
+                                                    .clamp(0.0, 1.0),
+                                            ))
+                                            .bg(theme::c::rgb(t::ACCENT)),
                                     ),
                             )
                     } else {
                         div().child(match &last_download {
                             Some(Ok(())) => div()
-                                .text_color(gpui::rgba(0x4CAF50FF))
+                                .text_color(theme::c::rgb(t::SUCCESS))
                                 .text_sm()
                                 .child("✓ 最近一次下载完成"),
                             Some(Err(e)) => div()
-                                .text_color(gpui::rgba(0xEF5350FF))
+                                .text_color(theme::c::rgb(t::DANGER))
                                 .text_sm()
                                 .child(gpui::SharedString::from(format!(
                                     "最近一次下载失败：{e}"
                                 ))),
                             None => div()
-                                .text_color(gpui::rgba(0x808080FF))
+                                .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.8))
                                 .text_xs()
-                                .child("未执行过下载（切换档位或首次 OCR 时会自动下载缺失模型）"),
+                                .child("尚未下载模型"),
                         })
                     }),
             )
@@ -6705,6 +7067,7 @@ impl OcrPinView {
 
 impl Render for OcrPinView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use theme::tokens as t;
         let image = self.image.clone();
         let img_w = self.img_w;
         let img_h = self.img_h;
@@ -6718,7 +7081,7 @@ impl Render for OcrPinView {
                 .justify_center()
                 .child(
                     div()
-                        .text_color(gpui::rgba(0x9E9E9EFF))
+                        .text_color(theme::c::rgb(t::TEXT_MUTED))
                         .text_sm()
                         .child(gpui::SharedString::from("OCR 识别中…")),
                 ),
@@ -6784,8 +7147,8 @@ impl Render for OcrPinView {
             .id("ocr-pin")
             .size_full()
             .flex()
-            .bg(gpui::rgba(0x181818FF))
-            .text_color(gpui::rgba(0xE6E6E6FF))
+            .bg(theme::c::rgb(t::PANEL_BG))
+            .text_color(theme::c::rgb(t::TEXT))
             .track_focus(&self.focus_handle)
             // Ctrl+C / Cmd+C 复制选中文字、Ctrl+A / Cmd+A 全选。
             // 用 arboard 长存剪贴板（GPUI write_to_clipboard 在 X11 不可靠），
@@ -6823,8 +7186,17 @@ impl Render for OcrPinView {
                     .bg(gpui::rgba(0x000000FF))
                     .child(paint),
             )
-            // 右侧结果区（固定宽度 360）
-            .child(div().w(px(360.0)).h_full().child(right))
+            // 右侧结果区（固定宽度 360）：左侧加一条 1px 竖分隔线。
+            // 左右两块都是纯黑底，图片又按比例 letterbox（四周本来就有黑边），
+            // 没有这条线时分不清"图片到哪结束、文字从哪开始"。
+            .child(
+                div()
+                    .w(px(360.0))
+                    .h_full()
+                    .border_l_1()
+                    .border_color(theme::c::rgb(t::DIVIDER))
+                    .child(right),
+            )
     }
 }
 

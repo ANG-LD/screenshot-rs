@@ -197,11 +197,14 @@ impl AppState {
             // （会整帧 clone 进 RgbaImage 并写盘，拖慢每次截图）；需要时设
             // SCREENSHOT_RS_DEBUG_DUMP=1 再启动。
             if std::env::var("SCREENSHOT_RS_DEBUG_DUMP").as_deref() == Ok("1") {
-                if let Some(img) =
-                    image::RgbaImage::from_raw(clipped.width, clipped.height, clipped.pixels.clone())
-                {
-                    let _ = img.save("/tmp/final_debug.png");
-                }
+                // 借用像素直接编码，不再 clone 整帧再交给 RgbaImage::from_raw
+                let _ = image::save_buffer(
+                    "/tmp/final_debug.png",
+                    &clipped.pixels,
+                    clipped.width,
+                    clipped.height,
+                    image::ExtendedColorType::Rgba8,
+                );
             }
             self.clipboard.write_frame(&clipped)?;
             tracing::info!("截图已复制到剪贴板（{}x{}）", clipped.width, clipped.height);

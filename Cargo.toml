@@ -134,6 +134,19 @@ embed-resource = "3"
 gpui-component = { path = "third_party/gpui-component/crates/ui" }
 gpui-component-assets = { path = "third_party/gpui-component/crates/assets" }
 
+[profile.dev]
+opt-level = 1            # 轻量优化，平衡编译速度和文件大小
+codegen-units = 16       # 保持快速编译
+debug = "limited"        # 有限的调试信息
+split-debuginfo = "unpacked"
+strip = "debuginfo"      # 移除调试信息但保留符号表
+
+[profile.dev.package]
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+
 [profile.release]
 opt-level = "z"          # 优化目标为大小 (size optimization)
 lto = "fat"              # 完整的链接时优化 (full LTO)

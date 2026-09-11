@@ -3,6 +3,7 @@
 //! 暴露所有子模块给集成测试和外部调用者。
 
 pub mod app;
+pub mod assets;
 pub mod capture;
 pub mod clipboard;
 pub mod config;

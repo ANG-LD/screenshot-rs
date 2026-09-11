@@ -28,3 +28,8 @@ models/paddle/*.part
 .dev.log
 .dev.pid
 
+
+# UI 视觉调试产物：X11 截图（.dev-shots/*.png）与隔离的 XDG_RUNTIME_DIR
+# （托盘图标要求 XDG_RUNTIME_DIR 可写，调试时指到仓库内 .dev-runtime）
+.dev-shots/
+.dev-runtime/
