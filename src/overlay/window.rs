@@ -1140,10 +1140,10 @@ const POPOVER_EDGE_MARGIN: f32 = 8.0;
 /// 自己先算准，不能让 snap 去挪。
 /// 实测：粗细弹层 12 列色板 ≈ 190px（留出余量）
 const POPOVER_EST_H_STROKE: f32 = 210.0;
-/// 文字弹层更高（标签 + 字号档位 + 两组色板），实测 ≈ 257px；
-/// 取 300 是为了兜住"字号档位换行成两行"的情况（+30px），
+/// 文字弹层更高（标签 + 字号档位 + 两组色板），实测 ≈ 250px（字号档位现在是
+/// 固定宽度、**保证一行**，见 `fixed_chip_button`）；取 280 兜住各平台字体行高差异。
 /// 估计值偏大只会让弹层偶尔多向上展开，偏小则会被 snap 推回来盖住按钮。
-const POPOVER_EST_H_TEXT: f32 = 300.0;
+const POPOVER_EST_H_TEXT: f32 = 280.0;
 /// 工具栏距离选区上沿的距离（px）
 const TOOLBAR_OFFSET_Y: f32 = 8.0;
 
@@ -1314,6 +1314,9 @@ impl ToolbarBtnStyle {
 enum BtnSize {
     Toolbar,
     Chip,
+    /// **固定宽度**的档位 chip（字号 / 粗细）：左右内边距收紧，
+    /// 让固定宽度里给数字留足空间（见 [`fixed_chip_button`]）
+    ChipDense,
     /// 对话框按钮：高度同工具栏，左右内边距更宽（中文按钮不至于挤）
     Dialog,
 }
@@ -1324,6 +1327,7 @@ impl BtnSize {
         match self {
             BtnSize::Toolbar => (theme::m::BTN_H, theme::r::BTN, theme::m::BTN_PAD_X),
             BtnSize::Chip => (theme::m::CHIP, theme::r::CHIP, 7.0),
+            BtnSize::ChipDense => (theme::m::CHIP, theme::r::CHIP, 4.0),
             BtnSize::Dialog => (theme::m::BTN_H, theme::r::BTN, 15.0),
         }
     }
@@ -1782,6 +1786,17 @@ const SWATCH_COLS: usize = 12;
 /// 色板格间距（px）
 const SWATCH_GAP: f32 = 8.0;
 
+/// 弹层内容区左右内边距（px）
+const POPOVER_PAD: f32 = 10.0;
+
+/// `字号` / `粗细` 档位行的 chip 间距（px）——比色板间距紧，给「一行排完」留余量
+const CHIP_ROW_GAP: f32 = 3.0;
+/// 字号档位 chip 的固定宽度（px）：11 档 → 11×28 + 10×3 = 338 ≤ 弹层内容宽 352
+const FONT_SIZE_CHIP_W: f32 = 28.0;
+/// 粗细档位 chip 的固定宽度（px）：内含「按线宽加粗的白线(14) + 间距(5) + 数字」≈26
+/// → 8 档：8×40 + 7×3 = 341 ≤ 352
+const LW_CHIP_W: f32 = 40.0;
+
 /// 色板「当前色」判定容差（RGB 欧氏距离）
 ///
 /// 默认红 (255,0,0) 与色板红 (230,34,34) 的距离约 49，取 60 既能覆盖这种
@@ -1802,13 +1817,17 @@ fn swatch_grid_width() -> f32 {
 }
 
 /// 弹层容器：深色玻璃面板
+///
+/// 宽度 = 色板网格宽 + 左右内边距 + 左右 1px 描边。**描边必须算进宽度**：
+/// gpui 是 border-box（宽度含内边距与描边），漏掉这 2px 会让网格比内容盒宽
+/// 2px —— 右侧色块贴到描边上、与左侧 10px 留白不对称（弹层本来就要与网格左右对齐）。
 fn popover_panel() -> gpui::Div {
     div()
         .flex()
         .flex_col()
         .gap(px(9.0))
-        .p(px(10.0))
-        .w(px(swatch_grid_width() + 20.0))
+        .p(px(POPOVER_PAD))
+        .w(px(swatch_grid_width() + POPOVER_PAD * 2.0 + 2.0))
         .bg(theme::c::rgb(theme::tokens::POPOVER_BG))
         .rounded(px(theme::r::PANEL))
         .border_1()
@@ -1827,9 +1846,13 @@ fn section_label(text: &'static str) -> impl IntoElement {
 }
 
 /// chip 里的纯文本（字号/字重统一，颜色由外层 text_color 决定）
+///
+/// `whitespace_nowrap`：短标签（"64" / "加粗" / "稍后"）任何情况下都不许折行——
+/// 档位 chip 是固定高度，一旦折成两行就会溢出按钮边框（见 [`fixed_chip_button`]）。
 fn label_text(text: impl Into<gpui::SharedString>) -> impl IntoElement {
     div()
         .flex_none()
+        .whitespace_nowrap()
         .text_size(px(12.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .line_height(gpui::relative(1.0))
@@ -1872,6 +1895,40 @@ fn chip_button(
         ToolbarBtnStyle::Neutral
     };
     bar_button(id, content, tone, false, on_click)
+}
+
+/// **固定宽度**的档位 chip（字号 / 粗细）：宽度与字体无关，保证一行排得下
+///
+/// 动机（用户反馈）：`字号`/`粗细` 档位行原来用文字自然宽度排，在 Windows 上
+/// （Segoe UI 字宽与 Linux 默认字体不同）总宽刚好越过弹层内容宽 352px →
+/// `flex_wrap` 把最后一个档位挤到第二行。固定宽度后总宽是常量，字体/DPI 无关：
+/// - 字号：11 × 28 + 10 × 3 = 338 ≤ 352
+/// - 粗细： 8 × 40 +  7 × 3 = 341 ≤ 352
+/// （回归测试见 `popover_chip_rows_fit_one_line`）
+fn fixed_chip_button(
+    id: impl Into<gpui::ElementId>,
+    width: f32,
+    content: impl IntoElement,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let tone = if selected {
+        ToolbarBtnStyle::Accent
+    } else {
+        ToolbarBtnStyle::Neutral
+    };
+    // ChipDense：内边距收紧到 4px，28px 宽的字号 chip 里仍有 20px 放数字
+    ui_button(
+        id,
+        content,
+        tone,
+        BtnSize::ChipDense,
+        true,
+        false,
+        None,
+        on_click,
+    )
+    .w(px(width))
 }
 
 /// 图标 + 文字的按钮内容（颜色由外层按钮的 text_color 统一决定）
@@ -2069,13 +2126,16 @@ fn render_text_popover_content(
 ) -> gpui::Div {
     use crate::overlay::toolbar::FONT_SIZES;
 
-    // 1) 字号档位（自动换行成多行）
-    let mut size_row = div().flex().flex_wrap().gap(px(4.0)).items_center();
+    // 1) 字号档位：**固定宽度 chip、不换行**，一行排完全部 11 档
+    //    （用文字自然宽度排会在 Windows 上溢出内容宽 352px → 换行，见
+    //    `fixed_chip_button` 的注释）
+    let mut size_row = div().flex().items_center().gap(px(CHIP_ROW_GAP));
     for (i, &size) in FONT_SIZES.iter().enumerate() {
         let weak_s = weak.clone();
         let is_current = (cur_size - size).abs() < f32::EPSILON;
-        size_row = size_row.child(chip_button(
+        size_row = size_row.child(fixed_chip_button(
             ("font-size", i),
+            FONT_SIZE_CHIP_W,
             label_text(format!("{}", size as i32)),
             is_current,
             move |_, _, cx| {
@@ -2135,12 +2195,14 @@ fn render_stroke_popover_content(
 ) -> gpui::Div {
     use crate::overlay::toolbar::LINE_WIDTHS;
 
-    let mut width_row = div().flex().flex_wrap().gap(px(4.0)).items_center();
+    // 粗细档位：同样固定宽度 + 不换行（理由见 `fixed_chip_button`）
+    let mut width_row = div().flex().items_center().gap(px(CHIP_ROW_GAP));
     for (i, &lw) in LINE_WIDTHS.iter().enumerate() {
         let weak_lw = weak.clone();
         let is_current = (cur_lw - lw).abs() < f32::EPSILON;
-        width_row = width_row.child(chip_button(
+        width_row = width_row.child(fixed_chip_button(
             ("lw", i),
+            LW_CHIP_W,
             // 线宽 chip：一条按比例加粗的线段 + 数字，比纯数字更直观
             div()
                 .flex()
@@ -4569,6 +4631,15 @@ struct PinWindowView {
     image: Arc<RenderImage>,
     focus_handle: FocusHandle,
     is_always_on_top: bool,
+    /// 放大前的窗口矩形（物理像素：left, top, 宽, 高）；`Some` = 当前处于放大态。
+    ///
+    /// 只有 Windows 需要自己记状态：那边的「放大」是自绘实现（固定尺寸窗口
+    /// 没有 `WS_MAXIMIZEBOX`，Win32 不认 `ShowWindow(SW_MAXIMIZE)`，见
+    /// [`toggle_pin_maximize`]）。Linux 交给窗口管理器（EWMH），无需回读。
+    /// 放大期间窗口会被临时置顶（否则压不住 topmost 的任务栏），
+    /// 还原时按 `is_always_on_top` 恢复 z 序。
+    #[cfg(target_os = "windows")]
+    maximize_restore: Option<(i32, i32, i32, i32)>,
 }
 
 /// Pin 窗口标题栏高度
@@ -4655,6 +4726,8 @@ impl PinWindowView {
             image: build_render_image_from_pixels(frame.width, frame.height, frame.pixels),
             focus_handle: cx.focus_handle(),
             is_always_on_top: false,
+            #[cfg(target_os = "windows")]
+            maximize_restore: None,
         }
     }
 }
@@ -4675,20 +4748,48 @@ impl Render for PinWindowView {
         // 图片画布：`paint_canvas.flex_1()` 独占标题栏以下的全部空间，且根容器
         // **不画描边**——边框会按 border-box 吃掉内容盒 2px，图片因此被缩放
         // 到 (w-2)×(h-2) 渲染，"1:1 固定"就名不副实了。
+        //
+        // 绘制时**等比贴合 + 居中**（不是拉伸到 bounds）：正常尺寸下窗口就是按图片
+        // 尺寸开的，贴合矩形 == bounds（与拉伸等价、仍是 1:1）；「最大化」后窗口
+        // 比例 ≠ 图片比例，拉伸会把图片压扁，必须自己算贴合矩形（见 `contain_scale`）。
         let paint_canvas = canvas(
             move |_, _, _| image.clone(),
             move |bounds, image, window, _cx| {
-                let _ = window.paint_image(
-                    bounds,
-                    Default::default(),
-                    image.clone(),
-                    0,
-                    false,
+                let dims = image.size(0);
+                let sf = window.scale_factor();
+                let img_w = dims.width.0 as f32 / sf;
+                let img_h = dims.height.0 as f32 / sf;
+                let k = contain_scale(
+                    img_w,
+                    img_h,
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
                 );
+                let fit_w = px(img_w * k);
+                let fit_h = px(img_h * k);
+                let fit = Bounds {
+                    origin: point(
+                        bounds.origin.x + (bounds.size.width - fit_w) / 2.0,
+                        bounds.origin.y + (bounds.size.height - fit_h) / 2.0,
+                    ),
+                    size: Size::new(fit_w, fit_h),
+                };
+                let _ = window.paint_image(fit, Default::default(), image.clone(), 0, false);
             },
         );
 
         let entity_for_top = entity.clone();
+        let entity_for_max = entity.clone();
+        // 放大态下按钮语义变「还原」。只有 Windows 自持该状态（见
+        // `PinWindowView::maximize_restore`）；Linux 由窗口管理器持有，无法回读。
+        #[cfg(target_os = "windows")]
+        let max_tip: &'static str = if self.maximize_restore.is_some() {
+            "还原"
+        } else {
+            "最大化"
+        };
+        #[cfg(not(target_os = "windows"))]
+        let max_tip: &'static str = "最大化";
 
         div()
             .track_focus(&focus_handle)
@@ -4799,9 +4900,52 @@ impl Render for PinWindowView {
                         // 「口」= 组件内置矩形工具的同一字形（方形描边）
                         Icon::empty().path(crate::assets::icons::SQUARE),
                         PinBtnTone::Neutral,
-                        "最大化",
-                        move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
-                            #[cfg(any(target_os = "linux", target_os = "windows"))]
+                        max_tip,
+                        move |_ev: &MouseDownEvent, window: &mut Window, app: &mut App| {
+                            // ── Windows：自绘「放大 / 还原」──────────────────────
+                            // Pin 窗口是固定尺寸窗口（没有 WS_MAXIMIZEBOX），
+                            // `ShowWindow(SW_MAXIMIZE)` 在 Win32 里是空操作——
+                            // 旧实现正因此「点了没反应」，改成自己算几何 + SetWindowPos：
+                            // 铺满**整屏**（rcMonitor，含任务栏）并临时置顶，见
+                            // `toggle_pin_maximize`。
+                            //
+                            // 必须延后到 App 借期外执行：SetWindowPos 会**同步**派发
+                            // WM_SIZE / WM_MOVE，gpui 的 resize/moved 回调要重新借用
+                            // App，在这里直接调会报 "RefCell already borrowed"
+                            //（与 `schedule_client_top_adjustment` 同一原因）。
+                            #[cfg(target_os = "windows")]
+                            {
+                                let Some(hwnd) = window_hwnd(window) else { return };
+                                let weak = entity_for_max.clone();
+                                let hwnd_key = hwnd as usize;
+                                app.spawn(async move |cx| {
+                                    // 等一帧，确保已退出当前鼠标事件回调（App 借期）
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(16))
+                                        .await;
+                                    // 状态在任务里读（而不是点击时读）：连点两次时以最新
+                                    // 状态为准，不会用「放大前」的旧值再放大一次。
+                                    // `on_top` = 标题栏「置顶」开关的当前状态，还原时用它
+                                    // 恢复 z 序（放大期间窗口是被我们临时置顶的）。
+                                    let (restore, on_top) = weak
+                                        .read_with(cx, |this, _| {
+                                            (this.maximize_restore, this.is_always_on_top)
+                                        })
+                                        .unwrap_or((None, false));
+                                    let state = toggle_pin_maximize(
+                                        hwnd_key as *mut core::ffi::c_void,
+                                        restore,
+                                        on_top,
+                                    );
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.maximize_restore = state;
+                                        cx.notify();
+                                    });
+                                })
+                                .detach();
+                            }
+                            // Linux：交给窗口管理器（EWMH _NET_WM_STATE_MAXIMIZED_*）
+                            #[cfg(target_os = "linux")]
                             pin_toggle_maximize(window);
                         },
                     ))
@@ -5021,17 +5165,126 @@ fn pin_minimize_window(window: &mut Window) {
     }
 }
 
+/// Pin 窗口「放大 / 还原」（Windows 自绘实现）
+///
+/// **为什么不用 `ShowWindow(SW_MAXIMIZE)`**：Pin 窗口按「截取的实际尺寸」1:1 创建
+/// （`is_resizable: false`），gpui_windows 因此不给它加 `WS_THICKFRAME` /
+/// `WS_MAXIMIZEBOX`；而 Win32 只对「可缩放」窗口执行最大化 —— 旧实现直接调
+/// `ShowWindow`，在 Windows 上就是**空操作**（用户反馈「固定窗口点放大没效果」）。
+///
+/// 这里自己算几何：
+/// - **放大**：记住当前窗口矩形 → `SetWindowPos` 把窗口铺满当前显示器**整屏**
+///   （`rcMonitor`，含任务栏区域）并**临时置顶** —— 任务栏本身是 topmost 窗口，
+///   普通窗口即使盖在它上面也会被它压在下面，不置顶就「铺不满」；图片由画布
+///   等比贴合居中显示，不会被拉伸变形（见 `PinWindowView` 的 `paint_canvas`）；
+/// - **还原**：`SetWindowPos` 回记住的矩形，并把 z 序恢复成 `on_top`（标题栏
+///   「置顶」开关的当前状态）；放大期间那个开关的图标可能显示为「未置顶」，
+///   但窗口实际是置顶的（再点一次「置顶」会切回未置顶，任务栏随之露出）。
+///
+/// 返回新的状态：`Some(矩形)` = 已放大（矩形供还原），`None` = 已还原。
+///
+/// 调用方必须**在 App 借期外**调用（见 `pin-maximize` 按钮处的说明）。
 #[cfg(target_os = "windows")]
-fn pin_toggle_maximize(window: &mut Window) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsZoomed, ShowWindow, SW_MAXIMIZE, SW_RESTORE,
+fn toggle_pin_maximize(
+    hwnd: *mut core::ffi::c_void,
+    restore: Option<(i32, i32, i32, i32)>,
+    on_top: bool,
+) -> Option<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        ClientToScreen, GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
-    if let Some(h) = window_hwnd(window) {
-        unsafe {
-            let zoomed = IsZoomed(h) != 0;
-            ShowWindow(h, if zoomed { SW_RESTORE } else { SW_MAXIMIZE });
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowRect, SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST,
+        SWP_NOACTIVATE,
+    };
+
+    unsafe {
+        // ── 还原：回到放大前的位置与尺寸，并恢复原有 z 序 ───────────────────
+        if let Some((x, y, w, h)) = restore {
+            SetWindowPos(
+                hwnd,
+                if on_top { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE,
+            );
+            tracing::info!("[Pin] restore to ({x},{y}) {w}x{h} topmost={on_top}");
+            return None;
         }
+
+        // ── 放大：窗口铺满当前显示器整屏（含任务栏）────────────────────────
+        let mut wr: RECT = std::mem::zeroed();
+        let mut cr: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut wr) == 0 || GetClientRect(hwnd, &mut cr) == 0 {
+            return None;
+        }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+            return None;
+        }
+        // rcMonitor = 整屏（含任务栏区域），rcWork = 工作区（留出任务栏）。
+        // 用户要的是「铺满整屏」，所以取 rcMonitor；配合下面的 HWND_TOPMOST 才能真正
+        // 盖住任务栏（任务栏是 topmost，非置顶窗口压不住它）。
+        let target = mi.rcMonitor;
+        // 非客户区：这个自绘标题栏窗口实际是 **左 8 / 上 0 / 右 8 / 下 8**
+        //（日志实测 frame=16x8；gpui 的 WM_NCCALCSIZE 处理只吃掉了上边框）。
+        // 要让**客户区**（我们绘制的面板）铺满整屏，窗口矩形必须：
+        //   尺寸 = 目标 + 非客户区总量；位置 = 目标 − 客户端在窗口内的偏移。
+        // 只加尺寸不反向偏移的话，客户端会整体右下偏 8px —— 左边露出 8px 桌面、
+        // 图片右边被屏幕裁掉 8px（用户反馈「没铺满」就是这个）。
+        let mut pt: POINT = std::mem::zeroed();
+        if ClientToScreen(hwnd, &mut pt) == 0 {
+            return None;
+        }
+        let nc_left = pt.x - wr.left;
+        let nc_top = pt.y - wr.top;
+        let frame_w = (wr.right - wr.left) - cr.right;
+        let frame_h = (wr.bottom - wr.top) - cr.bottom;
+        let win_w = (target.right - target.left) + frame_w;
+        let win_h = (target.bottom - target.top) + frame_h;
+        let (x, y) = (target.left - nc_left, target.top - nc_top);
+
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            win_w,
+            win_h,
+            SWP_NOACTIVATE,
+        );
+        tracing::info!(
+            "[Pin] maximize -> window=({x},{y}) {win_w}x{win_h} topmost \
+             (client={}x{} at ({},{}) target=({},{}) {}x{}, nc={nc_left},{nc_top} \
+             frame={frame_w}x{frame_h})",
+            win_w - frame_w,
+            win_h - frame_h,
+            x + nc_left,
+            y + nc_top,
+            target.left,
+            target.top,
+            target.right - target.left,
+            target.bottom - target.top,
+        );
+        Some((wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top))
     }
+}
+
+/// 等比 contain 的缩放系数：图片按此系数缩放后能**完整放进** `avail_w × avail_h`。
+///
+/// Pin 窗口「最大化」后窗口比例 ≠ 图片比例（窗口铺满屏幕），画布不能拉伸到
+/// bounds（会把图片压扁），而要按这个系数贴合 + 居中（空出来的部分露出面板底色）。
+/// 正常尺寸下窗口就是按图片开的，系数恒为 1（贴合矩形 == 画布，仍是 1:1）。
+/// 退化输入（0/负尺寸）返回 1，绝不产生 0 或负的绘制尺寸。
+fn contain_scale(img_w: f32, img_h: f32, avail_w: f32, avail_h: f32) -> f32 {
+    if img_w <= 0.0 || img_h <= 0.0 || avail_w <= 0.0 || avail_h <= 0.0 {
+        return 1.0;
+    }
+    (avail_w / img_w).min(avail_h / img_h)
 }
 
 /// 主线程 → GPUI 线程的命令
@@ -7377,6 +7630,76 @@ fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 二级弹层的「字号 / 粗细」档位行必须**一行排得下**。
+    ///
+    /// 回归的是用户反馈：档位 chip 原来用文字自然宽度排，Windows 的系统字体比
+    /// Linux 默认字体宽，总宽刚好越过弹层内容宽（= 色板网格宽 352px）→ 最后一个
+    /// 档位被挤到第二行。现在 chip 是固定宽度，总宽与字体/DPI 无关，这个测试把
+    /// 「固定宽度之和 ≤ 内容宽」锁死，后续加档位/改宽度会先在这里炸。
+    #[test]
+    fn popover_chip_rows_fit_one_line() {
+        use crate::overlay::toolbar::{FONT_SIZES, LINE_WIDTHS};
+        let content_w = swatch_grid_width();
+        let sizes_w = FONT_SIZES.len() as f32 * FONT_SIZE_CHIP_W
+            + (FONT_SIZES.len() - 1) as f32 * CHIP_ROW_GAP;
+        let widths_w = LINE_WIDTHS.len() as f32 * LW_CHIP_W
+            + (LINE_WIDTHS.len() - 1) as f32 * CHIP_ROW_GAP;
+        assert!(
+            sizes_w <= content_w,
+            "字号档位一行放不下：{sizes_w} > {content_w}（调 FONT_SIZE_CHIP_W / CHIP_ROW_GAP）"
+        );
+        assert!(
+            widths_w <= content_w,
+            "粗细档位一行放不下：{widths_w} > {content_w}（调 LW_CHIP_W / CHIP_ROW_GAP）"
+        );
+    }
+
+    /// 固定宽度里必须放得下 chip 内容：字号 chip 要放两位数字（最大 64），
+    /// 粗细 chip 要放「14px 线段 + 5px 间距 + 一位数字」。
+    #[test]
+    fn popover_chip_widths_leave_room_for_content() {
+        let pad = BtnSize::ChipDense.metrics().2;
+        assert!(
+            FONT_SIZE_CHIP_W - pad * 2.0 >= 20.0,
+            "字号 chip 内容区过窄：{}",
+            FONT_SIZE_CHIP_W - pad * 2.0
+        );
+        // 线宽 chip 内容：14（线段）+ 5（间距）+ 2 位余量
+        assert!(
+            LW_CHIP_W - pad * 2.0 >= 26.0,
+            "粗细 chip 内容区过窄：{}",
+            LW_CHIP_W - pad * 2.0
+        );
+    }
+
+    /// Pin 窗口「最大化」后图片的贴合：等比 contain —— 不变形、完整可见、
+    /// 且至少一个方向铺满（另一个方向居中留边）。
+    #[test]
+    fn pin_maximize_fit_keeps_aspect_and_fills_canvas() {
+        // 画布 = 铺满工作区后的图片区（1920 × 1040，即工作区高减去标题栏）。
+        // 3:2 的图：按高度贴合、宽度居中留边
+        let k = contain_scale(300.0, 200.0, 1920.0, 1040.0);
+        let (w, h) = (300.0 * k, 200.0 * k);
+        assert!(w <= 1920.0 + 1e-3 && h <= 1040.0 + 1e-3, "溢出画布: {w}x{h}");
+        assert!((h - 1040.0).abs() < 1e-3, "未铺满高度: {h}");
+        assert!((w / h - 1.5).abs() < 1e-4, "比例被破坏: {w}x{h}");
+
+        // 宽图（1920×400）：宽度贴合、高度留边。旧实现是把窗口按图片比例缩到
+        // 400 高 → 看起来「放大后高度不是整屏」，现在窗口铺满、图片等比贴合
+        let k = contain_scale(1920.0, 400.0, 1920.0, 1040.0);
+        let (w, h) = (1920.0 * k, 400.0 * k);
+        assert!(w <= 1920.0 + 1e-3 && h <= 1040.0 + 1e-3, "溢出画布: {w}x{h}");
+        assert!((w - 1920.0).abs() < 1e-3, "未铺满宽度: {w}");
+        assert!(h < 1040.0, "宽图不应拉伸到满高（保持比例）: {h}");
+
+        // 正常尺寸（画布 == 图片）恒为 1:1
+        assert!((contain_scale(640.0, 480.0, 640.0, 480.0) - 1.0).abs() < 1e-6);
+
+        // 退化输入不得产生 0/负的绘制尺寸
+        assert_eq!(contain_scale(0.0, 480.0, 640.0, 480.0), 1.0);
+        assert_eq!(contain_scale(640.0, 480.0, 0.0, 480.0), 1.0);
+    }
 
     /// 手柄样式必须落在正确的位置上：上下边才是横胶囊、左右边才是竖胶囊、四角
     /// 必须是圆点。`handle_positions()` 的顺序一旦变化，这里先炸——而不是等用户
