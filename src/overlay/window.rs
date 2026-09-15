@@ -97,6 +97,15 @@ struct IncrFreehand {
 pub struct OverlayView {
     /// 捕获帧的 GPUI 渲染图（已转 BGRA）
     frame_image: Arc<RenderImage>,
+    /// 待释放的图像：GPUI 的 `RenderImage` 在 GPU atlas 里占一块瓦片，换图后不显式
+    /// `window.drop_image()` 就永不回收——`RenderImage` 没有 Drop 实现，而全仓此前
+    /// 一处 drop_image 都没调，于是拖动/画线时每秒新建几十张整幅图，显存单调增长
+    /// 直到关闭窗口（4K 帧一张 ≈33MB 的像素，上传后还占 atlas 瓦片）。
+    ///
+    /// 这里只挂"已经被替换掉、不再被任何状态引用"的图，在下一帧 render 开头统一释放。
+    /// **滞后一帧是必须的**：本帧刚 paint 进场景的图还没上传到 atlas，立刻回收会画不出来
+    /// （与 Zed 自己的 remote_video_track_view 同做法：留当前帧，下一帧释放上一帧）。
+    pending_image_drops: Vec<Arc<RenderImage>>,
     /// 屏幕边界（逻辑像素，与 GPUI 坐标系一致）
     screen_bounds: ub::Bounds,
     /// 覆盖窗口在屏幕上的客户端区原点（逻辑像素）。
@@ -319,6 +328,7 @@ impl OverlayView {
                 frame.height,
                 frame.pixels.clone(),
             ),
+            pending_image_drops: Vec::new(),
             screen_bounds,
             client_origin,
             selection: SelectionState::new(screen_bounds),
@@ -378,8 +388,12 @@ impl OverlayView {
         // 注意：不要改成"拷贝+转换合并"的一次遍历——基准实测 debug 构建下
         // 合并版 25.9ms/帧 vs clone+原地转换 12.4ms/帧（debug 下 Vec::clone
         // 走优化的 memcpy，显式 u32 循环无优化反而慢 2 倍）。
-        self.frame_image =
-            build_render_image_from_pixels(frame.width, frame.height, frame.pixels.clone());
+        // 用 replace 取得旧图并挂起释放：直接赋值会让旧帧的 atlas 瓦片永久泄漏
+        let old_frame_image = std::mem::replace(
+            &mut self.frame_image,
+            build_render_image_from_pixels(frame.width, frame.height, frame.pixels.clone()),
+        );
+        self.pending_image_drops.push(old_frame_image);
         self.screen_bounds = screen_bounds;
         self.client_origin = client_origin;
         self.selection = SelectionState::new(screen_bounds);
@@ -388,8 +402,15 @@ impl OverlayView {
         self.toolbar = ToolbarState::default();
         self.drawing = DrawingState::new();
         self.in_progress = None;
-        self.shape_layer_cache = None;
-        self.freehand_incr = None;
+        // 清缓存前交出旧图：形状层缓存是"全部形状联合 bbox"的整幅光栅，
+        // 大的能到整屏，直接置 None 就把这块 atlas 瓦片永久留下了
+        if let Some(old) = self.shape_layer_cache.take() {
+            self.pending_image_drops.push(old.image);
+        }
+        // 置空前先把持有的增量图挂起释放，否则这张图就留在了 atlas 里
+        if let Some((old, _)) = self.freehand_incr.take().and_then(|st| st.image) {
+            self.pending_image_drops.push(old);
+        }
         self.text_input = None;
         self.text_input_anchor = BoundsPoint::ZERO;
         self.text_input_rect = ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO);
@@ -739,7 +760,10 @@ impl OverlayView {
         // Freehand 松手：清空增量层（曲线已进 committed，与矩形等单层显示，
         // 避免多层叠加在重渲染时抖动/消失又出现）
         if matches!(normalized, DrawCommand::Freehand { .. }) {
-            self.freehand_incr = None;
+            // 置空前先把持有的增量图挂起释放，否则这张图就留在了 atlas 里
+        if let Some((old, _)) = self.freehand_incr.take().and_then(|st| st.image) {
+            self.pending_image_drops.push(old);
+        }
         }
         self.drawing.push(normalized);
         // 绘制完成后自动选中，方便用户二次编辑（Mosaic 画笔不支持拖拽编辑）
@@ -3193,7 +3217,10 @@ fn update_in_progress_incr(
             );
             st.rendered = now;
             let img = build_render_image_from_pixels(bw, bh, st.frame.pixels.clone());
-            st.image = Some((img, bounds));
+            // 替换旧图：拖动时每帧都换一张，不释放就是每帧漏一块瓦片
+            if let Some((old, _)) = st.image.replace((img, bounds)) {
+                self_.pending_image_drops.push(old);
+            }
         }
         st.image.clone()
     } else {
@@ -3244,6 +3271,9 @@ fn update_in_progress_incr(
             "freehand_incr: rebuild bbox=({:.0},{:.0} {}x{}) pts={}",
             ox, oy, bw, bh, now
         );
+        if let Some((old, _)) = self_.freehand_incr.take().and_then(|st| st.image) {
+            self_.pending_image_drops.push(old);
+        }
         self_.freehand_incr = Some(IncrFreehand {
             frame,
             origin: (ox, oy),
@@ -3737,9 +3767,17 @@ fn run_ocr_sync(
     // （实测放大 2 倍识别结果与耗时均无变化）。
     let up = image::RgbImage::from_raw(w, h, rgb).unwrap_or_else(|| image::RgbImage::new(w, h));
 
-    // 写入预处理后的调试 PNG（用系统临时目录，Linux 的 /tmp 在 Windows/macOS 上不存在）
+    // 写出预处理后的调试 PNG。**必须门控**：这是给排查识别问题时用的，
+    // 之前无条件执行——每次 OCR/翻译都要对整幅预处理图做 PNG 编码加写盘
+    // （选区常几百 KB~几 MB，4K 全屏 >20MB），白花几十到几百毫秒。
+    // 门控变量与 capture/linux.rs、app.rs 里的调试 dump 保持一致。
+    let debug_enabled = std::env::var("SCREENSHOT_RS_DEBUG_DUMP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let debug_path = std::env::temp_dir().join("screenshot_ocr_debug.png");
-    if let Err(e) = up.save(&debug_path) {
+    if !debug_enabled {
+        // 不写盘，直接继续识别
+    } else if let Err(e) = up.save(&debug_path) {
         tracing::error!("OCR: 保存调试 PNG 失败: {}", e);
     } else {
         tracing::info!(
@@ -3766,6 +3804,11 @@ fn run_ocr_sync(
 
 impl Render for OverlayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 上一帧的绘制已经上传完成，这时释放它替换掉的图才是安全的
+        for image in std::mem::take(&mut self.pending_image_drops) {
+            // drop_image 返回 Result（失败只记日志），显式忽略避免 unused_must_use
+            let _ = window.drop_image(image);
+        }
         // dim 遮罩直接到位（无淡入动画）——动画造成"两次变暗"的视觉，感知上拖慢响应
 
         let frame_image = self.frame_image.clone();
@@ -3809,6 +3852,7 @@ impl Render for OverlayView {
                 .filter(|c| is_shape_command(c))
                 .map(|c| &**c)
                 .collect();
+            let prev_layer = self.shape_layer_cache.take();
             self.shape_layer_cache =
                 rasterize_shapes(&committed, scale_factor, window, 1).map(|(image, bounds)| {
                     ShapeLayerCache {
@@ -3818,6 +3862,10 @@ impl Render for OverlayView {
                         bounds,
                     }
                 });
+            // 上一版形状层已经没有任何引用了，挂起释放
+            if let Some(old) = prev_layer {
+                self.pending_image_drops.push(old.image);
+            }
         }
         let committed_shape_layer = self
             .shape_layer_cache
@@ -3837,7 +3885,13 @@ impl Render for OverlayView {
                 }
                 Some(ip) if is_shape_command(ip) => {
                     let done = self.freehand_incr.as_ref().and_then(|st| st.image.clone());
-                    (done, rasterize_shapes(&[&**ip], scale_factor, window, 1))
+                    let fresh = rasterize_shapes(&[&**ip], scale_factor, window, 1);
+                    // 这张图只在这一帧被 paint，之后没有任何状态引用它——挂起，
+                    // 下一帧释放。画箭头/矩形时每次鼠标移动都会新建一张整幅光栅图。
+                    if let Some((img, _)) = &fresh {
+                        self.pending_image_drops.push(img.clone());
+                    }
+                    (done, fresh)
                 }
                 // 松手后 Freehand 已在 committed（单层），不再用 freehand_incr
                 _ => (None, None),
