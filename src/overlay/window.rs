@@ -7837,6 +7837,28 @@ impl Render for SettingsView {
                     .child(
                         gpui_component::input::Input::new(&self.hotkey_input).w_full(),
                     )
+                    // 写哪个文件、以及"改了到底算不算数"，都在这里说清楚：
+                    // 少了这行，用户遇到"改了没生效"只能猜（环境变量优先级更高时就是这样）。
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.7))
+                            .child(gpui::SharedString::from(format!(
+                                "配置文件：{}",
+                                crate::config::config_file_display()
+                            ))),
+                    )
+                    .child(
+                        match crate::config::hotkey_env_override() {
+                            Some(v) => status_chip(
+                                format!("环境变量 SCREENSHOT_RS_HOTKEY={v} 优先级更高，会覆盖这里的设置"),
+                                t::DANGER,
+                                t::DANGER_SOFT,
+                            )
+                            .into_any_element(),
+                            None => div().into_any_element(),
+                        },
+                    )
                     .child(
                         div()
                             .flex()

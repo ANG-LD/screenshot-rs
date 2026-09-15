@@ -64,6 +64,13 @@ fn config_path() -> Option<PathBuf> {
         .or_else(|| dirs::config_dir().map(|d| d.join("screenshot-rs").join("config.toml")))
 }
 
+/// 当前生效的配置文件路径（设置窗口用来显示"改到哪去了"）。
+pub fn config_file_display() -> String {
+    config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "（找不到配置文件路径）".to_string())
+}
+
 /// 静默加载：配置文件不存在 / 读取失败 / 解析失败均回落默认，不 panic。
 fn load_quiet() -> Config {
     ensure_config_file();
@@ -131,7 +138,38 @@ pub fn ocr_model_dir() -> Option<PathBuf> {
 /// 截图触发热键：env `SCREENSHOT_RS_HOTKEY` > 配置 `hotkey.screenshot` > `alt+s`。
 /// 解析由 `hotkey::parse_hotkey` 负责；这里只负责取值，不做校验（解析失败时
 /// 热键服务会 warn 并回退默认键，应用照常启动）。
+/// 运行期刚保存过的热键覆盖值：`(配置文件路径, 热键)`。
+///
+/// 为什么需要它：`config()` 是启动时**一次性**加载的 `static`，改完配置写回文件后
+/// 内存里那份还是旧值——表现就是"设置里改成 alt+d，重新打开窗口又显示 alt+s"，
+/// 用户会以为没保存成功（实际文件已写对，重启后也生效）。这里存一份覆盖值，
+/// 让保存后的读取立刻拿到新值。
+///
+/// 按配置文件路径区分，是为了让测试里 `SCREENSHOT_RS_CONFIG` 指向不同文件时互不串味。
+static HOTKEY_OVERRIDE: std::sync::Mutex<Option<(PathBuf, String)>> =
+    std::sync::Mutex::new(None);
+
+/// 环境变量 `SCREENSHOT_RS_HOTKEY` 是否正在覆盖配置里的热键。
+///
+/// 它优先级最高：设了它，设置窗口里怎么改都不会生效——所以要在界面上明确提醒，
+/// 否则用户会一直以为是自己没保存成功。
+pub fn hotkey_env_override() -> Option<String> {
+    std::env::var("SCREENSHOT_RS_HOTKEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 pub fn hotkey_screenshot() -> String {
+    // 刚保存的值优先，且只在同一个配置文件下生效
+    if let Some(path) = config_path() {
+        if let Ok(g) = HOTKEY_OVERRIDE.lock() {
+            if let Some((p, spec)) = g.as_ref() {
+                if p == &path {
+                    return spec.clone();
+                }
+            }
+        }
+    }
     std::env::var("SCREENSHOT_RS_HOTKEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -273,6 +311,10 @@ pub fn persist_hotkey_screenshot(spec: &str) -> Result<(), String> {
         out.push('\n');
     }
     std::fs::write(&path, out).map_err(|e| format!("写入配置文件失败: {e}"))?;
+    // 写盘成功才更新内存覆盖值：让设置窗口立刻显示新键，不用重启
+    if let Ok(mut g) = HOTKEY_OVERRIDE.lock() {
+        *g = Some((path.clone(), spec.to_string()));
+    }
     tracing::info!("已持久化截图热键 {spec} → {}", path.display());
     Ok(())
 }
@@ -309,6 +351,10 @@ fn expand_home(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// 环境变量是进程级全局，改它的测试必须串行：并行跑时一个测试会把临时目录删掉，
+    /// 另一个正写到一半就报 "No such file or directory"，失败原因还跟被测逻辑无关。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::*;
 
     fn parse_config(contents: &str) -> Option<Config> {
@@ -316,12 +362,32 @@ mod tests {
     }
 
     /// `[hotkey]` 段：值缺失/为空白时回落默认 alt+s（配置模板里默认是注释掉的）。
+    /// 回归：`config()` 是启动时一次性加载的 static，改完写回文件不会更新内存那份，
+    /// 表现就是"设置里改成 alt+d，重新打开窗口还显示 alt+s"（用户以为没保存成功）。
+    #[test]
+    fn persisted_hotkey_is_readable_immediately() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("srs-hotkey-now-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[hotkey]\n").unwrap();
+        std::env::set_var("SCREENSHOT_RS_CONFIG", &path);
+        std::env::remove_var("SCREENSHOT_RS_HOTKEY");
+
+        persist_hotkey_screenshot("alt+d").unwrap();
+        assert_eq!(hotkey_screenshot(), "alt+d", "保存后必须立刻读回新值");
+
+        std::env::remove_var("SCREENSHOT_RS_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 热键持久化：写进已有段、重复写是替换不是追加、老配置缺段时补段头。
     ///
     /// 第三点最容易出错：直接往文件末尾追加 `screenshot = ...` 会落进**上一个段**，
     /// 读取时被当成那个段的键——用户改了等于没改。
     #[test]
     fn persist_hotkey_writes_into_section_without_duplicating() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("srs-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
