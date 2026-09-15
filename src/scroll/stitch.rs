@@ -32,7 +32,7 @@
 //!   胜；候选含 s=0、平票取最小 s —— 内容没动时 s=0 满命中，静止帧与周期假偏移
 //!   都无法胜出（宁缺毋滥，不拼重复）。
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 
 use super::MIN_SCROLL;
 use crate::capture::CapturedFrame;
@@ -64,16 +64,13 @@ const STRICT_OVERLAP: usize = 80;
 /// 每行的匹配签名：8 列 × 3 通道的 3×3 局部平均（预计算，避免重复 box_avg）。
 type RowAvg = [u8; VCOLS * 3];
 
-/// `find_scroll_delta` 的可复用中间缓冲（避免每帧反复 malloc）。
+/// 打分类判定函数共用的**可变**中间缓冲（避免每帧反复 malloc）。
+///
+/// 只放「每次调用都要被重写的打分中间量」；帧签名（行哈希 / 行签名）**不在这里**——
+/// 它们是**只读**的输入，由 [`FrameSig`] 一次算好、全程借用传递，见那里的注释。
 struct StitchScratch {
-    vcols: Vec<usize>,
-    ma: Vec<RowAvg>,
-    mb: Vec<RowAvg>,
     /// 候选列表：(匹配行数, s)，按匹配行数降序
     cands: Vec<(usize, usize)>,
-    /// 精层用的整行哈希（a 帧 / b 帧）
-    ha: Vec<u64>,
-    hb: Vec<u64>,
     /// `score_candidates` 每偏移的匹配行数（counts[s]），跨调用复用避免反复分配
     counts: Vec<usize>,
     /// 相邻行差 d[r] 及其后缀和 / 后缀纹理计数：把「每偏移现算 band_has_energy」
@@ -88,12 +85,7 @@ struct StitchScratch {
 impl Default for StitchScratch {
     fn default() -> Self {
         Self {
-            vcols: Vec::with_capacity(VCOLS),
-            ma: Vec::new(),
-            mb: Vec::new(),
             cands: Vec::new(),
-            ha: Vec::new(),
-            hb: Vec::new(),
             counts: Vec::new(),
             energy_d: Vec::new(),
             energy_sum: Vec::new(),
@@ -103,16 +95,254 @@ impl Default for StitchScratch {
     }
 }
 
+// ─────────────── 帧签名：一次算好、全程借用传递 ───────────────
+//
+// 一轮滚动迭代里，同一对帧的两种签名原先要在多个判定函数里各算一遍：
+// `plan_append` 自己 fill 一次、`try_append_scrolled` 再调一次 `plan_append`、
+// `find_scroll_delta` / `estimate_scroll_delta` / `force_estimate_scroll_delta` 各填
+// 一次行签名、`fixed_bottom_band` / `fixed_bands` / `scroll_up_delta` 又各自
+// `Vec::new()` + 两次 `fill_row_hashes`。实测**每轮哈希填 6 次、行签名填 8 次**
+// （理想各 2 次，即 a、b 各一次），1080p 下白烧 6~11ms CPU。
+//
+// 现在把「帧 → 签名」这件事收进 [`FrameSig`]：`OnceCell` 保证每帧每层只算一次，
+// 所有判定函数改成读 `&FramePair`（借用），签名本身不再被重算。判定逻辑一字未改。
+
+/// 一帧的两种签名，**惰性**计算：哪一层被读到才算哪一层。
+///
+/// 惰性很关键：`find_scroll_delta` 只用行签名、`fixed_bottom_band` 只用整行哈希，
+/// 若构造时就两层都算，等于给这些单层路径白加一半时间。
+pub struct FrameSig<'a> {
+    /// 被签名的原始帧（惰性计算时还要读它的像素）
+    f: &'a CapturedFrame,
+    w: usize,
+    h: usize,
+    /// 整行哈希（精层：固定栏识别 + 有信息行命中率）
+    ha: OnceCell<Vec<u64>>,
+    /// 8 列 × 3 通道的 3×3 局部平均（粗层：行匹配计数 + 能量门）
+    ma: OnceCell<Vec<RowAvg>>,
+}
+
+impl<'a> FrameSig<'a> {
+    /// 只记下这一帧，签名留到真正被读时再算。尺寸非法（0 宽/高）→ `None`。
+    pub fn new(f: &'a CapturedFrame) -> Option<Self> {
+        let w = f.width as usize;
+        let h = f.height as usize;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some(Self {
+            f,
+            w,
+            h,
+            ha: OnceCell::new(),
+            ma: OnceCell::new(),
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.w
+    }
+
+    pub fn height(&self) -> usize {
+        self.h
+    }
+
+    /// 整行哈希（首次读取时计算，其后复用同一份）。
+    pub fn hashes(&self) -> &[u64] {
+        self.ha.get_or_init(|| {
+            let mut out = Vec::new();
+            fill_row_hashes(self.f, self.w, self.h, &mut out);
+            out
+        })
+    }
+
+    /// 行签名（首次读取时计算，其后复用同一份）。
+    pub fn avgs(&self) -> &[RowAvg] {
+        self.ma.get_or_init(|| {
+            // vcols 只依赖 w：这里现建一个 8 元素的 Vec，代价可忽略（相比 1080p 全帧扫描）
+            let mut vcols = Vec::with_capacity(VCOLS);
+            fill_vcols(self.w, &mut vcols);
+            let mut out = Vec::new();
+            fill_row_avgs(self.f, self.w, self.h, &vcols, &mut out);
+            out
+        })
+    }
+}
+
+/// 一对帧的签名包（a = 锚/较早帧，b = 新帧）：**每轮迭代只建一次**，之后随便借。
+///
+/// 尺寸不一致（或任一帧非法）→ `None`。旧代码里每个判定函数各写一遍的尺寸校验
+/// 收敛到这一处：各函数在尺寸不符时的返回值恰好都是「否」/0，语义不变。
+pub struct FrameSigs<'a> {
+    sa: FrameSig<'a>,
+    sb: FrameSig<'a>,
+}
+
+impl<'a> FrameSigs<'a> {
+    pub fn new(a: &'a CapturedFrame, b: &'a CapturedFrame) -> Option<Self> {
+        let sa = FrameSig::new(a)?;
+        let sb = FrameSig::new(b)?;
+        if sa.width() != sb.width() || sa.height() != sb.height() {
+            return None;
+        }
+        Some(Self { sa, sb })
+    }
+
+    /// (a, b) 帧对
+    pub fn pair(&self) -> FramePair<'_, 'a> {
+        FramePair {
+            a: &self.sa,
+            b: &self.sb,
+        }
+    }
+
+    /// (b, a) 反向帧对：向上滚判定用，复用同一批签名，一个像素都不重扫
+    pub fn reversed(&self) -> FramePair<'_, 'a> {
+        FramePair {
+            a: &self.sb,
+            b: &self.sa,
+        }
+    }
+}
+
+/// 帧对视图：只持有两帧签名的引用，构造是 O(1)。
+///
+/// 所有需要帧签名的判定（精层/粗层/固定栏/向上滚）都从这里进；打分用的可变缓冲
+/// 仍在线程局部的 [`StitchScratch`] 里（每次调用瞬时借用，互不干扰）。
+///
+/// 注意：这些入口会 `borrow_mut` 线程局部 scratch，所以 `StitchScratch` 的各个
+/// `*_impl` 之间只能直接互调，**不得**再回到这些 wrapper（`RefCell` 二次借用会 panic）。
+pub struct FramePair<'s, 'f> {
+    a: &'s FrameSig<'f>,
+    b: &'s FrameSig<'f>,
+}
+
+impl<'s, 'f> FramePair<'s, 'f> {
+    pub fn a(&self) -> &'f CapturedFrame {
+        self.a.f
+    }
+
+    pub fn b(&self) -> &'f CapturedFrame {
+        self.b.f
+    }
+
+    pub fn width(&self) -> usize {
+        self.a.w
+    }
+
+    pub fn height(&self) -> usize {
+        self.a.h
+    }
+
+    /// 精层判定（见 [`plan_append`]）
+    pub fn plan_append(&self) -> Option<AppendPlan> {
+        SCRATCH.with(|s| s.borrow_mut().plan_append_impl(self))
+    }
+
+    /// 严格重叠检测（见 [`find_scroll_delta`]）
+    pub fn find_scroll_delta(&self) -> Option<usize> {
+        SCRATCH.with(|s| s.borrow_mut().find_scroll_delta_impl(self))
+    }
+
+    /// 宽松最佳偏移估计（见 [`estimate_scroll_delta`]）
+    pub fn estimate_scroll_delta(&self, force: bool) -> Option<usize> {
+        SCRATCH.with(|s| s.borrow_mut().estimate_scroll_delta_impl(self, force))
+    }
+
+    /// 反向（向上滚）判定：对本帧对做精层判定后按同一套门槛过滤
+    /// （见 [`scroll_up_delta`]）。
+    pub fn scroll_up_delta(&self) -> Option<usize> {
+        let plan = self.plan_append()?;
+        if plan.s >= MIN_SCROLL && plan.via_exact && plan.permille >= EXACT_PERMILLE_MIN {
+            Some(plan.s)
+        } else {
+            None
+        }
+    }
+
+    /// 固定栏（见 [`fixed_bands`]）
+    pub fn fixed_bands(&self) -> (usize, usize) {
+        bands_from_hashes(self.a.hashes(), self.b.hashes(), self.height())
+    }
+
+    /// 固定底栏（见 [`fixed_bottom_band`]）
+    pub fn fixed_bottom_band(&self) -> usize {
+        band_from_identical_tail(self.b.hashes(), self.a.hashes(), self.height())
+    }
+
+    /// 精层：在滚动内容区里找**有信息行命中率**最高的偏移，返回 (s, 命中率‰, 有信息行数)。
+    ///
+    /// 候选从 0 开始（0 = 内容没动）；打分只在内容区 `[ft, ft + content_h - s)` 内进行，
+    /// 命中率更高者胜、平票保留更小的 s（周期内容取最小倍数不跳过内容；内容没动时
+    /// s=0 满命中，天然否决周期假偏移）。
+    fn exact_aligned_offset(
+        &self,
+        ft: usize,
+        content_h: usize,
+        max_s: usize,
+    ) -> Option<(usize, usize, usize)> {
+        let (ha, hb) = (self.a.hashes(), self.b.hashes());
+        let mut best: Option<(usize, usize, usize)> = None;
+        for s in 0..=max_s {
+            let n = content_h.saturating_sub(s);
+            if n < EXACT_INFO_MIN {
+                break;
+            }
+            let mut info = 0usize;
+            let mut hit = 0usize;
+            for i in ft..ft + n {
+                if !(row_informative(hb, i) || row_informative(ha, s + i)) {
+                    continue;
+                }
+                info += 1;
+                if hb[i] == ha[s + i] {
+                    hit += 1;
+                }
+            }
+            if info < EXACT_INFO_MIN {
+                continue;
+            }
+            let permille = hit * 1000 / info;
+            if best.is_none_or(|(_, bp, _)| permille > bp) {
+                best = Some((s, permille, info));
+            }
+        }
+        best
+    }
+
+    /// 追加行（内容区末尾 s 行，即 `[ft + content_h - s, ft + content_h)`）里有多少行是
+    /// anchor **已经显示过的内容**（整行哈希命中 anchor 的内容区）。
+    ///
+    /// 真实滚动追加的是「从未出现过」的新内容 → 该值应接近 0；周期性内容的假大偏移
+    /// 会把 anchor 里已有的行再拼一遍（重复拼接）→ 该值很高。
+    fn duplicated_rows(&self, s: usize, ft: usize, content_h: usize) -> usize {
+        if content_h == 0 || s == 0 {
+            return 0;
+        }
+        let (ha, hb) = (self.a.hashes(), self.b.hashes());
+        let start = ft + content_h - s.min(content_h);
+        let end = ft + content_h;
+        let mut dup = 0usize;
+        for i in start..end.min(hb.len()) {
+            let hash = hb[i];
+            if ha[ft..end.min(ha.len())].contains(&hash) {
+                dup += 1;
+            }
+        }
+        dup
+    }
+}
+
 impl StitchScratch {
     /// 前进检查：a 与 b 同位置逐行匹配率 ≥ 阈值，说明内容基本没滚动（相同帧 /
     /// 几乎未滚），任何候选 s 的匹配都是「内容自相似」的假峰，必须拒绝。
     ///
     /// 返回 `None` 表示内容没动（调用方应视为无滚动）；`Some(())` 表示内容动了。
-    fn content_moved(&self, h: usize) -> bool {
+    fn content_moved(&self, ma: &[RowAvg], mb: &[RowAvg], h: usize) -> bool {
         let mut same = 0u32;
         let total = h as u32;
         for r in 0..h {
-            if row_matches(&self.ma[r], &self.mb[r]) {
+            if row_matches(&ma[r], &mb[r]) {
                 same += 1;
             }
         }
@@ -126,7 +356,16 @@ impl StitchScratch {
     ///
     /// `max_s` 控制最大滚动量：严格检测用 `min(h-MIN_OVERLAP, MAX_SCROLL)`；
     /// 宽松估计允许滚到接近整个帧高（快速滚动无重叠时也能取到最可能偏移）。
-    fn score_candidates(&mut self, h: usize, max_s: usize) -> Option<(usize, usize)> {
+    ///
+    /// `ma`/`mb` 由调用方从帧签名里借来（见 [`FrameSig::avgs`]）：签名只算一次，
+    /// 这里只写自己的打分缓冲。
+    fn score_candidates(
+        &mut self,
+        ma: &[RowAvg],
+        mb: &[RowAvg],
+        h: usize,
+        max_s: usize,
+    ) -> Option<(usize, usize)> {
         self.cands.clear();
         if max_s == 0 {
             return None;
@@ -140,7 +379,7 @@ impl StitchScratch {
         self.energy_d.clear();
         self.energy_d.resize(h, 0);
         for r in 1..h {
-            self.energy_d[r] = row_avg_diff(&self.ma[r], &self.ma[r - 1]);
+            self.energy_d[r] = row_avg_diff(&ma[r], &ma[r - 1]);
         }
         self.energy_sum.clear();
         self.energy_sum.resize(h + 1, 0);
@@ -170,13 +409,13 @@ impl StitchScratch {
         self.counts.clear();
         self.counts.resize(max_s + 1, 0);
         for r in 0..h {
-            let mb_r = &self.mb[r];
+            let mb_r = &mb[r];
             let end = (h - r).min(max_s + 1);
             if end < 2 {
                 continue;
             }
             // 用切片迭代代替下标：一轮里 3 次下标访问的边界检查全部消失
-            let rows = &self.ma[r + 1..r + end];
+            let rows = &ma[r + 1..r + end];
             let oks = &self.energy_ok[1..end];
             let cnts = &mut self.counts[1..end];
             for ((ma_row, ok), cnt) in rows.iter().zip(oks).zip(cnts.iter_mut()) {
@@ -199,19 +438,11 @@ impl StitchScratch {
     }
 
     /// 严格重叠检测（保持原有语义，唯一性 + 匹配率分档判真滚动）。
-    fn find_scroll_delta(&mut self, a: &CapturedFrame, b: &CapturedFrame) -> Option<usize> {
-        if a.width != b.width || a.height != b.height {
-            return None;
-        }
-        let w = a.width as usize;
-        let h = a.height as usize;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        fill_vcols(w, &mut self.vcols);
-        fill_row_avgs(a, w, h, &self.vcols, &mut self.ma);
-        fill_row_avgs(b, w, h, &self.vcols, &mut self.mb);
-        if !self.content_moved(h) {
+    fn find_scroll_delta_impl(&mut self, pair: &FramePair<'_, '_>) -> Option<usize> {
+        let h = pair.height();
+        // 尺寸校验已收敛到 `FrameSigs::new`（不一致就构造不出帧对）
+        let (ma, mb) = (pair.a.avgs(), pair.b.avgs());
+        if !self.content_moved(ma, mb, h) {
             return None;
         }
 
@@ -219,7 +450,7 @@ impl StitchScratch {
         if max_s == 0 {
             return None;
         }
-        let Some((best_count, best_s)) = self.score_candidates(h, max_s) else {
+        let Some((best_count, best_s)) = self.score_candidates(ma, mb, h, max_s) else {
             return None;
         };
         // 候选过少：band_has_energy 拒绝了绝大多数 s（重叠带几乎无纹理——低能量
@@ -315,24 +546,15 @@ impl StitchScratch {
     /// 防止只靠一个闪烁元素的无滚动帧被误拼。
     ///
     /// `force=false` 为保守路径（原语义）。
-    fn estimate_scroll_delta(
+    fn estimate_scroll_delta_impl(
         &mut self,
-        a: &CapturedFrame,
-        b: &CapturedFrame,
+        pair: &FramePair<'_, '_>,
         force: bool,
     ) -> Option<usize> {
-        if a.width != b.width || a.height != b.height {
-            return None;
-        }
-        let w = a.width as usize;
-        let h = a.height as usize;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        fill_vcols(w, &mut self.vcols);
-        fill_row_avgs(a, w, h, &self.vcols, &mut self.ma);
-        fill_row_avgs(b, w, h, &self.vcols, &mut self.mb);
-        if !force && !self.content_moved(h) {
+        let h = pair.height();
+        // 尺寸校验已收敛到 `FrameSigs::new`（不一致就构造不出帧对）
+        let (ma, mb) = (pair.a.avgs(), pair.b.avgs());
+        if !force && !self.content_moved(ma, mb, h) {
             return None;
         }
 
@@ -342,7 +564,7 @@ impl StitchScratch {
         if max_s == 0 {
             return None;
         }
-        let Some((best_count, best_s)) = self.score_candidates(h, max_s) else {
+        let Some((best_count, best_s)) = self.score_candidates(ma, mb, h, max_s) else {
             return None;
         };
         let n_best = h - best_s;
@@ -368,16 +590,19 @@ thread_local! {
 /// 返回 b 相对 a 向下滚动的行数 s。
 ///
 /// 若内容没动 / 无法可靠判定（空白、歧义、动画中间帧、匹配不上）→ `None`。
+///
+/// 单次调用入口（wrapper）：自己建帧签名。一轮迭代里要连做好几项判定时，请用
+/// [`FrameSigs`] 建一次签名、再对 [`FramePair`] 调各项判定，签名就不会重算。
 pub fn find_scroll_delta(a: &CapturedFrame, b: &CapturedFrame) -> Option<usize> {
-    SCRATCH.with(|s| s.borrow_mut().find_scroll_delta(a, b))
+    FrameSigs::new(a, b)?.pair().find_scroll_delta()
 }
 
-/// 宽松最佳偏移估计（见 [`StitchScratch::estimate_scroll_delta`]）。
+/// 宽松最佳偏移估计（见 [`FrameSigs`] / [`FramePair::estimate_scroll_delta`]）。
 ///
 /// 与严格检测的区别：放弃唯一性门槛，取匹配行数最多的偏移，宁肯有一行缝也不丢段。
 /// 用于手动滚动时快速滚动 / 虚拟表格重建行导致的「严格检测测不出 → 丢内容」。
 pub fn estimate_scroll_delta(a: &CapturedFrame, b: &CapturedFrame) -> Option<usize> {
-    SCRATCH.with(|s| s.borrow_mut().estimate_scroll_delta(a, b, false))
+    FrameSigs::new(a, b)?.pair().estimate_scroll_delta(false)
 }
 
 /// 强制版宽松估计：跳过 `content_moved` 的「没动」关卡（见 [`estimate_scroll_delta`]）。
@@ -387,7 +612,7 @@ pub fn estimate_scroll_delta(a: &CapturedFrame, b: &CapturedFrame) -> Option<usi
 /// 「没滚动」而返回 None，导致整段内容被丢弃（长图跳号）。强制版仍受 `best_count`
 /// 下限约束，防止无滚动帧被误拼。
 pub fn force_estimate_scroll_delta(a: &CapturedFrame, b: &CapturedFrame) -> Option<usize> {
-    SCRATCH.with(|s| s.borrow_mut().estimate_scroll_delta(a, b, true))
+    FrameSigs::new(a, b)?.pair().estimate_scroll_delta(true)
 }
 
 /// 计算在偏移 `s` 下，重叠带（a 的 [s..h] 与 b 的 [0..h-s]）的平均像素差
@@ -630,20 +855,14 @@ fn row_informative(hashes: &[u64], i: usize) -> bool {
 ///
 /// 这些行不随内容滚动（页头、页脚、分页栏、悬浮条、播放控制条），是「固定栏」；
 /// 中间剩下的就是滚动内容区。上限各 h/2（超过说明整帧基本没动）。
+///
+/// 单次调用入口（wrapper）：内部走 [`FramePair::fixed_bands`]，整行哈希只算这一对帧
+/// 一遍；一轮迭代里还要做别的判定时，请共用同一个 [`FrameSigs`]。
 pub fn fixed_bands(a: &CapturedFrame, b: &CapturedFrame) -> (usize, usize) {
-    if a.width != b.width || a.height != b.height {
-        return (0, 0);
+    match FrameSigs::new(a, b) {
+        Some(sigs) => sigs.pair().fixed_bands(),
+        None => (0, 0),
     }
-    let w = a.width as usize;
-    let h = a.height as usize;
-    if w == 0 || h == 0 {
-        return (0, 0);
-    }
-    let mut ha = Vec::new();
-    let mut hb = Vec::new();
-    fill_row_hashes(a, w, h, &mut ha);
-    fill_row_hashes(b, w, h, &mut hb);
-    bands_from_hashes(&ha, &hb, h)
 }
 
 /// 从整行哈希流求固定栏长度（见 [`fixed_bands`]）。哈希是 64 位 FNV，碰撞概率可忽略。
@@ -695,20 +914,13 @@ fn run_textured(hashes: &[u64], from: usize, to: usize) -> bool {
 /// 是「整条纯色 + 顶部细线」，纯色块就是底栏自己的一部分，减掉它就把底栏判矮了——
 /// 于是又回到上面那条灾难路径。回归测试见
 /// `scroll::manual_diag_tests::synth_solid_leading_footer_does_not_duplicate_content`。
+///
+/// 单次调用入口（wrapper）：内部走 [`FramePair::fixed_bottom_band`]。
 pub fn fixed_bottom_band(a: &CapturedFrame, b: &CapturedFrame) -> usize {
-    if a.width != b.width || a.height != b.height {
-        return 0;
+    match FrameSigs::new(a, b) {
+        Some(sigs) => sigs.pair().fixed_bottom_band(),
+        None => 0,
     }
-    let w = a.width as usize;
-    let h = a.height as usize;
-    if w == 0 || h == 0 {
-        return 0;
-    }
-    let mut ha = Vec::new();
-    let mut hb = Vec::new();
-    fill_row_hashes(a, w, h, &mut ha);
-    fill_row_hashes(b, w, h, &mut hb);
-    band_from_identical_tail(&hb, &ha, h)
 }
 
 /// 供**判定阶段**使用的底栏估计（此时还没测出滚动量，也还没有长图可对照）。
@@ -756,13 +968,12 @@ fn band_from_identical_tail(hb: &[u64], ha: &[u64], h: usize) -> usize {
 /// 的一对帧也会给出 1~30 的噪声偏移（周期性内容 / 模糊帧），一旦把它当成「向上滚」，
 /// 引擎每轮都会走进「保持基线、不拼接」的分支——用户明明在向下滚，静止帧却全被
 /// 白白错过，长图最后只剩第一页。
+///
+/// 单次调用入口（wrapper）：判定的帧对是 (cur, prev)（顺序与 [`plan_append`] 的
+/// (anchor, frame) 相反）。调用方若已经为 (prev, cur) 建过 [`FrameSigs`]，请直接用
+/// `sigs.reversed().scroll_up_delta()`——那样一个签名都不用重算。
 pub fn scroll_up_delta(cur: &CapturedFrame, prev: &CapturedFrame) -> Option<usize> {
-    let plan = plan_append(cur, prev)?;
-    if plan.s >= MIN_SCROLL && plan.via_exact && plan.permille >= EXACT_PERMILLE_MIN {
-        Some(plan.s)
-    } else {
-        None
-    }
+    FrameSigs::new(cur, prev)?.pair().scroll_up_delta()
 }
 
 /// 精层决策结果（见 [`plan_append`]）。
@@ -785,104 +996,29 @@ pub struct AppendPlan {
 }
 
 impl StitchScratch {
-    /// 精层：在滚动内容区里找**有信息行命中率**最高的偏移，返回 (s, 命中率‰, 有信息行数)。
+    /// 精层决策的**实现**：帧签名由 `pair` 借入（各算一次），这里只写打分缓冲。
     ///
-    /// 候选从 0 开始（0 = 内容没动）；打分只在内容区 `[ft, ft + content_h - s)` 内进行，
-    /// 命中率更高者胜、平票保留更小的 s（周期内容取最小倍数不跳过内容；内容没动时
-    /// s=0 满命中，天然否决周期假偏移）。
-    fn exact_aligned_offset(
-        &mut self,
-        ft: usize,
-        content_h: usize,
-        max_s: usize,
-    ) -> Option<(usize, usize, usize)> {
-        let mut best: Option<(usize, usize, usize)> = None;
-        for s in 0..=max_s {
-            let n = content_h.saturating_sub(s);
-            if n < EXACT_INFO_MIN {
-                break;
-            }
-            let mut info = 0usize;
-            let mut hit = 0usize;
-            for i in ft..ft + n {
-                if !(row_informative(&self.hb, i) || row_informative(&self.ha, s + i)) {
-                    continue;
-                }
-                info += 1;
-                if self.hb[i] == self.ha[s + i] {
-                    hit += 1;
-                }
-            }
-            if info < EXACT_INFO_MIN {
-                continue;
-            }
-            let permille = hit * 1000 / info;
-            if best.is_none_or(|(_, bp, _)| permille > bp) {
-                best = Some((s, permille, info));
-            }
-        }
-        best
-    }
-
-    /// 追加行（内容区末尾 s 行，即 `[ft + content_h - s, ft + content_h)`）里有多少行是
-    /// anchor **已经显示过的内容**（整行哈希命中 anchor 的内容区）。
-    ///
-    /// 真实滚动追加的是「从未出现过」的新内容 → 该值应接近 0；周期性内容的假大偏移
-    /// 会把 anchor 里已有的行再拼一遍（重复拼接）→ 该值很高。
-    fn duplicated_rows(&self, s: usize, ft: usize, content_h: usize) -> usize {
-        if content_h == 0 || s == 0 {
-            return 0;
-        }
-        let start = ft + content_h - s.min(content_h);
-        let end = ft + content_h;
-        let mut dup = 0usize;
-        for i in start..end.min(self.hb.len()) {
-            let hash = self.hb[i];
-            if self.ha[ft..end.min(self.ha.len())].contains(&hash) {
-                dup += 1;
-            }
-        }
-        dup
-    }
-}
-
-/// 决定这一帧该怎么拼：**精层优先**（整行哈希确认 + 固定栏识别），精层不够可信时
-/// 回落粗层（采样签名，抗噪但分辨率低）。
-///
-/// 返回 `None` = 这一帧不可可靠拼接，调用方应保留基线等下一帧（宁缺毋滥）：
-///   * 内容没动（含「只有固定栏在动」的静止帧）——精层 s=0 胜出即判否；
-///   * 内容区太小（整帧几乎都是固定栏）；
-///   * 精层与粗层都测不出可靠偏移；
-///   * 粗层给出的偏移疑似重复拼接（追加行大段是 anchor 已有内容）。
-pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<AppendPlan> {
-    if anchor.width != frame.width || anchor.height != frame.height {
-        return None;
-    }
-    let w = anchor.width as usize;
-    let h = anchor.height as usize;
-    if w == 0 || h == 0 {
-        return None;
-    }
-    SCRATCH.with(|sc| {
-        let mut sc = sc.borrow_mut();
+    /// 与旧版的差别仅在于「签名从哪来」：旧版自己 `fill_row_hashes` 填 `self.ha/hb`，
+    /// 现在读 `pair` 的哈希；判定式、分支、返回值一字未改。
+    fn plan_append_impl(&mut self, pair: &FramePair<'_, '_>) -> Option<AppendPlan> {
+        let h = pair.height();
         // 整行哈希只算一遍：固定栏、纹理判定、打分都用它（省掉重复的全帧扫描）。
-        fill_row_hashes(anchor, w, h, &mut sc.ha);
-        fill_row_hashes(frame, w, h, &mut sc.hb);
+        let (ha, hb) = (pair.a.hashes(), pair.b.hashes());
         // 固定栏：帧首/帧尾在同一位置逐行相同 → 不随内容滚动。**底栏必须排除**，
         // 否则每拼一帧就复制一条底栏进长图（判矮还会让窗口往回退、重复可见内容）。
-        let (raw_ft, _) = bands_from_hashes(&sc.ha, &sc.hb, h);
+        let (raw_ft, _) = bands_from_hashes(ha, hb, h);
         // 顶栏同理：顶栏里与内容区相邻的纯色/空白块不含信息，还会把内容区压小
         // （大滚动量被 max_s 拒掉 = 「只拼一页」），因此从**判定起点**里去掉；
         // `plan.top` 仍报告识别到的顶栏高度。
         let mut ft = raw_ft;
-        while ft > 0 && sc.hb[ft - 1] == sc.hb[ft] {
+        while ft > 0 && hb[ft - 1] == hb[ft] {
             ft -= 1;
         }
         // 判定阶段先用 `band_for_metric`（尾部相同段 − 纯色块）估底栏：这里只需要内容区
         // 里有足够多「有信息行」，纯色块会把内容区压小、把大滚动量拒掉。真正决定追加
         // 窗口位置的是返回值里的 `band`，用的是「宁可多算」的 `band_from_identical_tail`
         //（见 `fixed_bottom_band`：判矮会重复拼入可见内容，判高只是少几行纯色）。
-        let band = band_for_metric(&sc.ha, &sc.hb, h);
+        let band = band_for_metric(ha, hb, h);
         let content_h = h.saturating_sub(ft).saturating_sub(band);
         if content_h < MIN_SCROLL + EXACT_INFO_MIN {
             // 内容区太小：整帧几乎没动（静止帧 ft+fb≈h）或全被固定栏占满 → 无法判定
@@ -892,11 +1028,11 @@ pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<Appe
         if max_s < MIN_SCROLL {
             return None;
         }
-        let exact = sc.exact_aligned_offset(ft, content_h, max_s);
+        let exact = pair.exact_aligned_offset(ft, content_h, max_s);
         let (s, info, permille, via_exact) = match exact {
             // 精层满命中但指向「没动」（s=0 胜出）／内容区无信息行 → 内容确实没滚，
             // 直接否（静止帧不拼重复）；仅当粗层给出可信偏移时才用粗层结果。
-            Some((0, _, _)) | None => match sc.find_scroll_delta(anchor, frame) {
+            Some((0, _, _)) | None => match self.find_scroll_delta_impl(pair) {
                 Some(s_c) if s_c >= MIN_SCROLL => (s_c, 0, 0, false),
                 _ => return None,
             },
@@ -905,7 +1041,7 @@ pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<Appe
             }
             Some((s_e, permille, info)) => {
                 // 精层命中率不高：动画中间帧（亚像素混合 → 逐字节不等）居多，交粗层。
-                match sc.find_scroll_delta(anchor, frame) {
+                match self.find_scroll_delta_impl(pair) {
                     // 粗层与精层指向同一偏移 → 互相印证，采信精层
                     Some(s_c) if s_c.abs_diff(s_e) <= 2 => (s_e, info, permille, true),
                     Some(s_c) => (s_c, info, permille, false),
@@ -922,14 +1058,14 @@ pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<Appe
         // 重复拼接否决：只用于**粗层**给出的偏移（精层已被逐字节确认）。
         // 周期假峰会给出「多滚一截」的偏移，其追加行大段是 anchor 已有内容。
         if !via_exact {
-            let dup = sc.duplicated_rows(s, ft, content_h);
+            let dup = pair.duplicated_rows(s, ft, content_h);
             if s >= EXACT_INFO_MIN && dup * 2 > s {
                 tracing::debug!("plan: reject_dup s={s} dup={dup} new={s} band={band}");
                 return None;
             }
         }
         // 追加窗口用「宁可多算」的底栏判定（见 fixed_bottom_band），理由见那里的注释。
-        let band = band_from_identical_tail(&sc.hb, &sc.ha, h);
+        let band = band_from_identical_tail(hb, ha, h);
         Some(AppendPlan {
             s,
             band,
@@ -939,7 +1075,25 @@ pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<Appe
             via_exact,
             confident: via_exact && permille >= EXACT_PERMILLE_CONFIDENT,
         })
-    })
+    }
+}
+
+/// 决定这一帧该怎么拼：**精层优先**（整行哈希确认 + 固定栏识别），精层不够可信时
+/// 回落粗层（采样签名，抗噪但分辨率低）。
+///
+/// 返回 `None` = 这一帧不可可靠拼接，调用方应保留基线等下一帧（宁缺毋滥）：
+///   * 内容没动（含「只有固定栏在动」的静止帧）——精层 s=0 胜出即判否；
+///   * 内容区太小（整帧几乎都是固定栏）；
+///   * 精层与粗层都测不出可靠偏移；
+///   * 粗层给出的偏移疑似重复拼接（追加行大段是 anchor 已有内容）。
+///
+/// 单次调用入口（wrapper）：自己建帧签名。
+///
+/// 一轮迭代里既要判精层、又要判粗层、还要看固定底栏时，请用 [`FrameSigs`] 建一次
+/// 签名并复用同一批 [`FramePair`]，否则每项判定都会把整帧重扫一遍（这正是本次要
+/// 消除的重复：实测每轮行哈希白算 6 次、行签名白算 8 次）。
+pub fn plan_append(anchor: &CapturedFrame, frame: &CapturedFrame) -> Option<AppendPlan> {
+    FrameSigs::new(anchor, frame)?.pair().plan_append()
 }
 
 
@@ -1164,15 +1318,67 @@ mod tests {
         for (label, a, b) in cases {
             let h = a.height as usize;
             let max_s = h.saturating_sub(MIN_OVERLAP);
+            // 行签名现在由 FrameSig 提供（一次算好、借用传递），与生产路径同源
+            let sigs = FrameSigs::new(&a, &b).expect("尺寸一致");
+            let pair = sigs.pair();
+            let (ma, mb) = (pair.a.avgs(), pair.b.avgs());
             let mut sc = StitchScratch::default();
-            fill_vcols(W, &mut sc.vcols);
-            fill_row_avgs(&a, W, h, &sc.vcols, &mut sc.ma);
-            fill_row_avgs(&b, W, h, &sc.vcols, &mut sc.mb);
-            let got = sc.score_candidates(h, max_s);
-            let (want_best, want_cands) = naive(&sc.ma, &sc.mb, h, max_s);
+            let got = sc.score_candidates(ma, mb, h, max_s);
+            let (want_best, want_cands) = naive(ma, mb, h, max_s);
             assert_eq!(got, want_best, "{label}: best 偏移不一致");
             assert_eq!(sc.cands, want_cands, "{label}: 候选表逐项不一致");
         }
+    }
+
+    /// 帧签名的**备忘录化契约**（本轮性能改造的核心，判定逻辑本身一行未改）：
+    ///  1. 同一帧的同一种签名只算一次——再次读取拿到的必须是**同一块**内存
+    ///     （哈希 0.9ms/帧、行签名 0.2~0.4ms/帧，重复算就是每轮白烧 6~11ms）；
+    ///  2. 不论走 `FramePair` 还是各自建签名的旧 wrapper，判定结果必须逐位一致；
+    ///  3. 反向帧对 (b, a) 复用同一批签名（向上滚判定不再重扫整帧）。
+    #[test]
+    fn frame_sigs_compute_once_and_match_wrappers() {
+        const W: usize = 160;
+        const H: usize = 240;
+        let a = frame(W, H);
+        let b = scrolled(&a, W, H, 70);
+        let sigs = FrameSigs::new(&a, &b).expect("尺寸一致");
+        let pair = sigs.pair();
+
+        // 1. 惰性 + 只算一次：两次读取是同一块内存
+        assert!(std::ptr::eq(pair.a.hashes(), pair.a.hashes()), "行哈希被算了两次");
+        assert!(std::ptr::eq(pair.b.hashes(), pair.b.hashes()), "行哈希被算了两次");
+        assert!(std::ptr::eq(pair.a.avgs(), pair.a.avgs()), "行签名被算了两次");
+        assert!(std::ptr::eq(pair.b.avgs(), pair.b.avgs()), "行签名被算了两次");
+
+        // 2. 与旧入口（各自建签名）结果一致
+        assert_eq!(pair.plan_append(), plan_append(&a, &b), "plan_append 结果不一致");
+        assert_eq!(
+            pair.find_scroll_delta(),
+            find_scroll_delta(&a, &b),
+            "find_scroll_delta 结果不一致"
+        );
+        assert_eq!(
+            pair.estimate_scroll_delta(false),
+            estimate_scroll_delta(&a, &b),
+            "estimate_scroll_delta 结果不一致"
+        );
+        assert_eq!(
+            pair.estimate_scroll_delta(true),
+            force_estimate_scroll_delta(&a, &b),
+            "force_estimate_scroll_delta 结果不一致"
+        );
+        assert_eq!(
+            pair.fixed_bottom_band(),
+            fixed_bottom_band(&a, &b),
+            "fixed_bottom_band 结果不一致"
+        );
+        assert_eq!(pair.fixed_bands(), fixed_bands(&a, &b), "fixed_bands 结果不一致");
+
+        // 3. 反向帧对共享签名（向上滚判定与向下滚判定读同一份哈希）
+        let rev = sigs.reversed();
+        assert!(std::ptr::eq(rev.a.hashes(), pair.b.hashes()));
+        assert!(std::ptr::eq(rev.b.hashes(), pair.a.hashes()));
+        assert_eq!(rev.scroll_up_delta(), scroll_up_delta(&b, &a), "向上滚判定结果不一致");
     }
 
     /// 整行哈希的**语义契约**（性能重写后必须继续成立）：
@@ -1783,3 +1989,4 @@ mod tests {
         }
     }
 }
+

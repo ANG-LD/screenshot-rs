@@ -130,25 +130,40 @@ fn download_lock() -> &'static Mutex<()> {
     DOWNLOAD_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// 模型文件的查找目录（**不含**缓存目录），顺序即优先级：
+/// 显式目录（`OCR_MODEL_DIR` / 配置）→ 应用包内置（打包资源）→ 项目 `models/PP-OCRv6`。
+///
+/// 单独抽出来是因为这个序列**每次求值都要做真 I/O**：`ocr_model_dir()` 要读
+/// 配置、`bundled_resource_dirs()` 要 `current_exe()`（readlink）+ 若干
+/// `is_dir`/`exists`、`current_dir()` 也是一次系统调用，合起来每求值一次约十几次
+/// syscall。原来这些都在「每个模型文件」的内层循环里，3 个文件就是三遍；
+/// 而 `locate_tier_files` 被模型管理窗口每 300ms 调一次，纯属白烧。
+/// 现在由调用方在循环外求值一次，循环里只 join + exists。
+fn search_dirs_no_cache() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    dirs.extend(crate::config::ocr_model_dir());
+    dirs.extend(bundled_resource_dirs());
+    dirs.extend(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")));
+    dirs
+}
+
+/// 完整查找顺序：`search_dirs_no_cache()` 之后追加缓存目录（下载落地的位置）。
+/// 顺序必须与各调用点原来的 chain 一致，否则命中行为会变。
+fn search_dirs(cache_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = search_dirs_no_cache();
+    dirs.push(cache_dir.to_path_buf());
+    dirs
+}
+
 /// 检查指定档位三件套是否本地齐全（显式目录 / 项目 models/PP-OCRv6 / 缓存）。
 /// 返回 `Ok(())` 齐全；`Err` 携带缺失文件名列表。
 pub fn tier_ready(tier: &str) -> Result<(), Vec<String>> {
     let cache_dir = crate::config::ocr_cache_dir();
+    // 查找目录在循环外只求值一次（见 search_dirs_no_cache 的注释）
+    let dirs = search_dirs(&cache_dir);
     let mut missing = Vec::new();
     for name in model_names_for_tier(tier) {
-        let mut exists = false;
-        for dir in crate::config::ocr_model_dir()
-            .into_iter()
-            .chain(bundled_resource_dirs())
-            .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
-            .chain(std::iter::once(cache_dir.clone()))
-        {
-            if dir.join(name).exists() {
-                exists = true;
-                break;
-            }
-        }
-        if !exists {
+        if !dirs.iter().any(|d| d.join(name).exists()) {
             missing.push(name.to_string());
         }
     }
@@ -313,23 +328,14 @@ const MODEL_BASE_URL: &str = "https://github.com/GreatV/oar-ocr/releases/downloa
 /// 给定档位三个文件的本地查找结果
 fn locate_tier_files(tier: &str, cache_dir: &Path) -> Vec<ModelFileInfo> {
     let names = model_names_for_tier(tier);
+    // 查找顺序：显式目录 → 应用包内置（打包资源）→ 项目 models/PP-OCRv6 → 缓存。
+    // 目录序列在**循环外**求值一次：它内部有 current_exe/current_dir 等系统调用，
+    // 放在内层 map 里就变成每个文件重来一遍（3 倍），而本函数每 300ms 被调一次。
+    let dirs = search_dirs(cache_dir);
     names
         .iter()
         .map(|name| {
-            // 查找顺序：显式目录 → 应用包内置（打包资源）→ 项目 models/PP-OCRv6 → 缓存
-            let mut local = None;
-            for dir in crate::config::ocr_model_dir()
-                .into_iter()
-                .chain(bundled_resource_dirs())
-                .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
-                .chain(std::iter::once(cache_dir.to_path_buf()))
-            {
-                let p = dir.join(name);
-                if p.exists() {
-                    local = Some(p);
-                    break;
-                }
-            }
+            let local = dirs.iter().map(|d| d.join(name)).find(|p| p.exists());
             let (status, size) = match &local {
                 Some(p) => match p.metadata() {
                     Ok(md) => (FileStatus::Ready, Some(md.len())),
@@ -352,20 +358,25 @@ fn locate_tier_files(tier: &str, cache_dir: &Path) -> Vec<ModelFileInfo> {
 pub fn model_snapshot() -> ModelSnapshot {
     let current = effective_tier();
     let cache_dir = crate::config::ocr_cache_dir();
+    // 先在**锁外**把两档的文件状态查完（locate_tier_files 要做一堆文件系统 I/O）。
+    // 原来 `manager().lock()` 在最前面，整个探测过程都持锁：下载线程每写一块都要
+    // `update_progress()` 抢同一把锁，于是每 300ms 一次的窗口重绘会把下载进度更新
+    // 挡在门外。锁内现在只拷贝字段，不碰文件系统。
+    let tiers: Vec<TierStatus> = ["small", "medium"]
+        .iter()
+        .map(|tier| TierStatus {
+            tier: (*tier).to_string(),
+            note: tier_note(tier),
+            selected: *tier == current,
+            bundled: *tier == "small", // small 随应用包内置，无需下载
+            files: locate_tier_files(tier, &cache_dir),
+        })
+        .collect();
     let state = manager().lock().unwrap_or_else(|e| e.into_inner());
     ModelSnapshot {
         base_url: MODEL_BASE_URL.to_string(),
         cache_dir: cache_dir.clone(),
-        tiers: ["small", "medium"]
-            .iter()
-            .map(|tier| TierStatus {
-                tier: (*tier).to_string(),
-                note: tier_note(tier),
-                selected: *tier == current,
-                bundled: *tier == "small", // small 随应用包内置，无需下载
-                files: locate_tier_files(tier, &cache_dir),
-            })
-            .collect(),
+        tiers,
         downloading: state.downloading,
         downloading_tier: state.current_tier.clone(),
         batch_download: state.batch,
@@ -384,13 +395,11 @@ fn update_progress(name: &str, downloaded: u64, total: Option<u64>) {
 }
 
 /// 模型文件是否在任意查找目录存在（OCR_MODEL_DIR / 应用包内置 / 项目 models/PP-OCRv6 / 缓存）。
-fn file_located(name: &str, cache_dir: &Path) -> bool {
-    crate::config::ocr_model_dir()
-        .into_iter()
-        .chain(bundled_resource_dirs())
-        .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
-        .chain(std::iter::once(cache_dir.to_path_buf()))
-        .any(|d| d.join(name).exists())
+///
+/// 参数是**已经求值好的**查找目录（见 `search_dirs_no_cache` 的注释）：调用方一次
+/// 求值、多次复用，避免每问一个文件就把 current_exe/current_dir 那套系统调用重来一遍。
+fn file_located(name: &str, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|d| d.join(name).exists())
 }
 
 /// HTTP 客户端：30s 读空闲超时——下载中断时（取消/网络卡住）能及时返回，
@@ -536,7 +545,9 @@ fn download_tier_force(
         .map_err(|e| format!("创建 OCR 模型缓存目录失败: {e}"))?;
     // 整批进度：预估需下载文件的总大小，进度条跨文件单调递增到 100%
     // 批量下载(force=false)：只下载三处目录都没有的文件，total 只累加这些
-    let need = |name: &str| force || !file_located(name, cache_dir);
+    // 查找目录只求值一次（每个文件都重来一遍 current_exe/current_dir 是纯浪费）
+    let dirs = search_dirs(cache_dir);
+    let need = |name: &str| force || !file_located(name, &dirs);
     let batch_total: Option<u64> = names
         .iter()
         .copied()
@@ -631,11 +642,10 @@ fn ensure_models_impl(
 ) -> Result<[PathBuf; 3], String> {
     let [det, rec, dict] = model_names();
     let tier = effective_tier();
-    for dir in crate::config::ocr_model_dir()
-        .into_iter()
-        .chain(bundled_resource_dirs())
-        .chain(std::env::current_dir().ok().map(|d| d.join("models").join("PP-OCRv6")))
-    {
+    // 前三个查找目录在循环外求值一次；缓存目录单独处理（下面的下载分支要在
+    // 缓存里落地，语义与命中顺序都和原来一致，所以这里不把它并进循环）
+    let probe_dirs = search_dirs_no_cache();
+    for dir in &probe_dirs {
         let paths = [dir.join(det), dir.join(rec), dir.join(dict)];
         if paths.iter().all(|p| p.exists()) {
             tracing::info!("OCR: 使用本地模型目录 {}（档位 {tier}）", dir.display());
@@ -658,8 +668,10 @@ fn ensure_models_impl(
         cancel_background_download();
         let _guard = download_lock().lock().map_err(|_| "下载锁失效".to_string())?;
         // 整批进度：只累加三处目录都没有的文件大小
+        // 查找目录（含缓存）同样只求值一次，供下面每个文件复用
         let all_names = [det, rec, dict];
-        let need = |name: &str| !file_located(name, cache_dir);
+        let dirs = search_dirs(cache_dir);
+        let need = |name: &str| !file_located(name, &dirs);
         let batch_total: Option<u64> = all_names
             .iter()
             .copied()
@@ -676,7 +688,7 @@ fn ensure_models_impl(
                 if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
                     return Err("下载已取消（engine 接管）".into());
                 }
-                if file_located(name, cache_dir) {
+                if file_located(name, &dirs) {
                     // 别处目录已有，无需下载到缓存
                     batch_offset += known_file_size(name).unwrap_or(0);
                     continue;

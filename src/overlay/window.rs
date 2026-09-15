@@ -3141,9 +3141,10 @@ fn is_shape_command(c: &DrawCommand) -> bool {
 /// 复用 commit 路径的 `commands::apply_commands` 逐像素解析式 AA，得到与最终成图
 /// 一致的平滑线条。返回 `None` 若无形状。
 /// 增量画 Freehand 当前笔画到 freehand_incr（累积层）：
-/// 每帧只画新增段；bbox 计算与 rasterize_shapes 一致（pad=lw/2+1，
-/// origin=floor，size=ceil）→ 与提交成图像素级一致。
-/// 返回 (图, bounds) 供 paint。
+/// 每帧只画新增段；buffer 矩形覆盖整笔包围盒（origin/尺寸都取整 + 对齐 32px 网格）
+/// 时直接复用，笔尖跑出 buffer 才重建。origin 取整保证绘制偏移的整数性，
+/// 因此线与提交路径（rasterize_shapes）光栅化到同一像素。
+/// 返回 (图, bounds) 供 paint，bounds 恒等于 buffer 矩形。
 fn update_in_progress_incr(
     self_: &mut OverlayView,
     _window: &Window,
@@ -3175,34 +3176,35 @@ fn update_in_progress_incr(
     let cur_max_x = max_x + pad;
     let cur_max_y = max_y + pad;
 
-    // 联合 bbox = 旧 buffer + 当前笔画（累积所有 Freehand）
-    let (mut all_min_x, mut all_min_y, mut all_max_x, mut all_max_y) =
-        (cur_min_x, cur_min_y, cur_max_x, cur_max_y);
-    if let Some(old) = &self_.freehand_incr {
-        all_min_x = all_min_x.min(old.origin.0);
-        all_min_y = all_min_y.min(old.origin.1);
-        all_max_x = all_max_x.max(old.origin.0 + old.frame.width as f32);
-        all_max_y = all_max_y.max(old.origin.1 + old.frame.height as f32);
-    }
-    let ox = all_min_x.floor();
-    let oy = all_min_y.floor();
-    let bw = (all_max_x.ceil() - ox).max(1.0) as u32;
-    let bh = (all_max_y.ceil() - oy).max(1.0) as u32;
-
-    // bounds（逻辑，与 rasterize_shapes 的 floor origin + ceil size 一致）
-    let bounds = ub::Bounds {
-        origin: ub::Point::new(ox, oy),
-        size: ub::Point::new(bw as f32, bh as f32),
-    };
-
-    // buffer 是否可复用（同原点同尺寸同线宽）
+    // 复用判据：已有 buffer 的矩形**覆盖**当前笔画包围盒即可，不再要求逐像素相等。
+    // 旧判据比对的是"旧 buffer ∪ 当前笔画 bbox"算出的 origin/size，笔尖每往外扩 1px
+    // 这个并集就变一次 → 立刻掉回重建分支（vec![0; A] 清零 + 交集拷贝 + A 克隆 +
+    // rgba_to_bgra + GPU 上传，约 6×缓冲字节）；而画笔只会落在 buffer 内部，图层位置
+    // 完全由 bounds 决定，所以只要 buffer 覆盖住这一笔，画出来就是像素级一致的。
     let reusable = match &self_.freehand_incr {
-        Some(st) => st.origin == (ox, oy) && st.frame.width == bw && st.frame.height == bh && st.lw == lw,
+        Some(st) => {
+            st.lw == lw
+                && st.origin.0 <= cur_min_x
+                && st.origin.1 <= cur_min_y
+                && st.origin.0 + st.frame.width as f32 >= cur_max_x
+                && st.origin.1 + st.frame.height as f32 >= cur_max_y
+        }
         None => false,
     };
 
     if reusable {
         let st = self_.freehand_incr.as_mut().unwrap();
+        // 复用分支的 bounds 只能取自 buffer 自身矩形，不能重算成当前笔画的 bbox：
+        // paint_raster 会把图像拉伸到 bounds，留了余量的 buffer 比 bbox 大，
+        // 拿 bbox 当 bounds 会让整层线条整体错位/缩放。
+        let ox = st.origin.0;
+        let oy = st.origin.1;
+        let bw = st.frame.width;
+        let bh = st.frame.height;
+        let bounds = ub::Bounds {
+            origin: ub::Point::new(ox, oy),
+            size: ub::Point::new(bw as f32, bh as f32),
+        };
         if now > st.rendered {
             // 增量：画新段（rendered-1 起重叠点连接），Exact 两端（与全量中间顶点一致）
             let start = st.rendered.saturating_sub(1);
@@ -3224,7 +3226,39 @@ fn update_in_progress_incr(
         }
         st.image.clone()
     } else {
-        // 重建：拷贝旧 buffer + 画当前笔画（含旧 Freehand 由拷贝保留）
+        // 重建：拷贝旧 buffer + 续画当前笔画（已画像素由交集拷贝保留）
+        //
+        // 矩形 = (当前笔画包围盒 + 50% 余量, clamp 32..256) ∪ 旧 buffer 矩形，再对齐
+        // 32px 网格。余量把同一笔画内的重建频率从"每外扩 1px 一次"降到"每几十~几百
+        // px 一次"（1200×700 的一笔在旧逻辑下几乎每帧都要重建约 20MB 的缓冲）。
+        // 余量**只按当前笔画算**：若像旧代码那样先并上旧矩形再留余量，每重建一次就
+        // 再多一份余量，缓冲随重建次数线性膨胀（实测一笔 1200px 会涨到 69MB）。
+        const INCR_GRID: f32 = 32.0;
+        let span = (cur_max_x - cur_min_x).max(cur_max_y - cur_min_y);
+        let slack = (span * 0.5).clamp(INCR_GRID, 256.0);
+        let (mut all_min_x, mut all_max_x) = (cur_min_x - slack, cur_max_x + slack);
+        let (mut all_min_y, mut all_max_y) = (cur_min_y - slack, cur_max_y + slack);
+        // 并上旧 buffer 矩形：它可能比"当前笔画+余量"更大（同一笔此前的像素还在里面），
+        // 必须完整包含它——重建仍从 rendered-1 处续画，依赖的正是旧像素被完整保留。
+        // 网格对齐只向外扩，新矩形因此恒 ⊇ 旧矩形。
+        if let Some(old) = &self_.freehand_incr {
+            all_min_x = all_min_x.min(old.origin.0);
+            all_min_y = all_min_y.min(old.origin.1);
+            all_max_x = all_max_x.max(old.origin.0 + old.frame.width as f32);
+            all_max_y = all_max_y.max(old.origin.1 + old.frame.height as f32);
+        }
+        // origin 向下取整到网格、右下角向上取整：整数 origin + 整数尺寸，
+        // bounds 与 buffer 才能逐像素对应
+        let ox = (all_min_x / INCR_GRID).floor() * INCR_GRID;
+        let oy = (all_min_y / INCR_GRID).floor() * INCR_GRID;
+        let bw = (((all_max_x / INCR_GRID).ceil() * INCR_GRID - ox) as u32).max(1);
+        let bh = (((all_max_y / INCR_GRID).ceil() * INCR_GRID - oy) as u32).max(1);
+        // bounds（逻辑）：必须与 buffer 矩形逐像素一致——paint_raster 按 bounds
+        // 拉伸图像，对不上会让整层线条位移/缩放
+        let bounds = ub::Bounds {
+            origin: ub::Point::new(ox, oy),
+            size: ub::Point::new(bw as f32, bh as f32),
+        };
         let mut frame = CapturedFrame {
             width: bw,
             height: bh,
@@ -3267,7 +3301,8 @@ fn update_in_progress_incr(
             );
         }
         let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
-        tracing::info!(
+        // debug 而非 info：默认 filter 就是 info，留着等于每帧一次 format + stdout 写
+        tracing::debug!(
             "freehand_incr: rebuild bbox=({:.0},{:.0} {}x{}) pts={}",
             ox, oy, bw, bh, now
         );
@@ -5116,13 +5151,27 @@ fn pin_title_button(
 }
 
 impl PinWindowView {
-    fn new(frame: CapturedFrame, cx: &mut Context<Self>) -> Self {
+    fn new(frame: CapturedFrame, window: &mut Window, cx: &mut Context<Self>) -> Self {
         tracing::info!(
             "[Pin] PinWindowView::new: frame={}x{}",
             frame.width, frame.height
         );
+        let image = build_render_image_from_pixels(frame.width, frame.height, frame.pixels);
+        // 这张图在整个窗口生命周期里只被 paint、从不被替换，所以没有"上一帧的旧图"
+        // 可挂起——泄漏发生在窗口销毁时：Arc 被丢，可 `RenderImage` 没有 Drop，
+        // atlas 瓦片会一直留到进程退出（每固定一张图漏一块整图瓦片）。
+        // 因此注册系统级关窗回调（Alt+F4 / 任务栏关闭 / WM_CLOSE），在窗口真正
+        // 消失前把它从 atlas 摘掉。`drop_image` 只是删除缓存条目（图若再画会重新
+        // 上传），幂等且安全。
+        // 注意：自绘标题栏的关闭按钮与 Esc 走 `Window::remove_window()`，只在本帧
+        // 标记 removed、不触发该回调，那两条路径在 render 里单独释放。
+        let image_for_close = image.clone();
+        window.on_window_should_close(cx, move |window, _cx| {
+            let _ = window.drop_image(image_for_close.clone());
+            true
+        });
         Self {
-            image: build_render_image_from_pixels(frame.width, frame.height, frame.pixels),
+            image,
             focus_handle: cx.focus_handle(),
             is_always_on_top: false,
         }
@@ -5134,6 +5183,11 @@ impl Render for PinWindowView {
         use crate::assets::icons as app_icon;
 
         let image = self.image.clone();
+        // 自绘关闭按钮 / Esc 走 `window.remove_window()`（只标记本帧移除，不触发
+        // 系统关窗回调），所以这两条路径各自带一份 Arc，在关窗前把 atlas 瓦片摘掉。
+        // 视图销毁后没人再持有这张图，不释放就随窗口一起漏在 atlas 里。
+        let image_for_btn_close = self.image.clone();
+        let image_for_esc_close = self.image.clone();
         let focus_handle = self.focus_handle.clone();
         let is_on_top = self.is_always_on_top;
         let entity = cx.entity().downgrade();
@@ -5282,13 +5336,15 @@ impl Render for PinWindowView {
                         "关闭",
                         // 关闭按钮固定在拖拽区之外：鼠标按下即关，不等抬起。
                         move |_ev: &MouseDownEvent, window: &mut Window, _app: &mut App| {
+                            let _ = window.drop_image(image_for_btn_close.clone());
                             window.remove_window();
                         },
                     )),
             )
             .child(paint_canvas.flex_1())
-            .on_key_down(|ev: &KeyDownEvent, window, _cx| {
+            .on_key_down(move |ev: &KeyDownEvent, window, _cx| {
                 if ev.keystroke.key == "escape" {
+                    let _ = window.drop_image(image_for_esc_close.clone());
                     window.remove_window();
                 }
             })
@@ -5856,7 +5912,18 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                             // 同一类窗口只保留一个：关掉旧的，开新的（左图右文）
                             let slot = if translate { &mut trans_pin } else { &mut ocr_pin };
                             if let Some(old) = slot.take() {
-                                let _ = old.update(async_cx, |_, window, _| window.remove_window());
+                                let _ = old.update(async_cx, |root, window, cx| {
+                                    // 关旧窗时顺手把左图从 atlas 摘掉：`remove_window()` 只是
+                                    // 把窗口标记为本帧移除，视图随后被销毁，Arc 掉了但
+                                    // `RenderImage` 没有 Drop，瓦片不会自己回收 → 每次
+                                    // OCR/翻译都漏一块"选区大小"的 atlas 瓦片。
+                                    // 只在类型对得上时释放，拿不到就照旧关窗。
+                                    if let Ok(view) = root.view().clone().downcast::<OcrPinView>() {
+                                        let img = view.read(cx).image.clone();
+                                        let _ = window.drop_image(img);
+                                    }
+                                    window.remove_window();
+                                });
                             }
                             match async_cx.update(|cx| open_result_pin_in_app(payload, translate, cx)) {
                                 Ok(handle) => *slot = Some(handle),
@@ -7061,7 +7128,7 @@ fn open_pin_in_app(payload: PinPayload, cx: &mut App) {
                 }
             }
 
-            let view = cx.new(|cx| PinWindowView::new(pin_frame, cx));
+            let view = cx.new(|cx| PinWindowView::new(pin_frame, window, cx));
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
             view
@@ -8185,18 +8252,29 @@ struct OcrPinView {
 }
 
 impl OcrPinView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         frame: CapturedFrame,
         text: Option<String>,
         disp_w: f32,
         disp_h: f32,
         translate: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let (w, h, pixels) = (frame.width, frame.height, frame.pixels);
         let img = build_render_image_from_pixels(w, h, pixels);
         let needs_download =
             translate && !crate::translate::models_ready(&crate::translate::model_dir());
+        // 左图同样只在构造时建一次、此后只被 paint：窗口销毁时 Arc 掉了，atlas
+        // 瓦片却不会回收 → 每次 OCR/翻译漏一块"选区大小"的瓦片。
+        // 用户点标题栏 X / Alt+F4 走系统关窗回调，这里顺手摘掉；程序内"关旧开新"
+        // 走 `Window::remove_window()`（不触发该回调），在调用点另行释放。
+        let img_for_close = img.clone();
+        window.on_window_should_close(cx, move |window, _cx| {
+            let _ = window.drop_image(img_for_close.clone());
+            true
+        });
         Self {
             translate,
             needs_download,
@@ -8406,7 +8484,9 @@ fn open_result_pin_in_app(
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, translate, cx));
+            let view = cx.new(|cx| {
+                OcrPinView::new(frame, None, disp_w, disp_h, translate, window, cx)
+            });
             let h = view.read(cx).focus_handle.clone();
             h.focus(window, cx);
             // 包 gpui-component Root：TextView 的鼠标选择控制器依赖 Root 的

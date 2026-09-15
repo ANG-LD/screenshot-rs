@@ -397,14 +397,21 @@ pub fn run_scroll_capture(
 
             // 优先用精层判定滚动量（整行哈希 + 固定栏识别）：比 8 列采样签名更准，
             // 同时给出固定底栏行数（追加时排除，避免每帧把页脚复制进长图）。
-            let mut plan = stitch::plan_append(&a, &b);
+            //
+            // 帧签名（整行哈希 / 8 列行签名）这一轮**只算一次**：下面所有判定
+            // （粗层 `find_scroll_delta`、兜底估计、固定底栏）都借用同一份，且
+            // `try_append_scrolled` 直接收下这里已算出的 plan，不再重算一遍。
+            let mut sigs = stitch::FrameSigs::new(&a, &b);
+            let mut plan = sigs.as_ref().and_then(|s| s.pair().plan_append());
             // 内容在变动但检测失败（平滑滚动动画未结束）→ 多等一次重抓同一内容
             if plan.is_none() && frames_differ(&a, &b) {
                 std::thread::sleep(EXTRA_SETTLE);
                 if let Ok(b2) = capture.capture_area(x, y, w, h) {
                     if b2.width == a.width && b2.height == a.height {
-                        plan = stitch::plan_append(&a, &b2);
                         b = b2;
+                        // 换了帧 → 旧签名作废，重建一组（依旧只算一次）
+                        sigs = stitch::FrameSigs::new(&a, &b);
+                        plan = sigs.as_ref().and_then(|s| s.pair().plan_append());
                     }
                 }
             }
@@ -463,9 +470,18 @@ pub fn run_scroll_capture(
                     // 内容动了但严格检测不出：先用宽松估计尽力拼一段（**不丢内容**，
                     // 这是「滚动只拼一页」之外内容缺失的直接原因），再减半步长，让
                     // 下一轮的滚动量更小、重叠带更大、更容易被严格检测测出。
-                    if let Some(s) =
-                        try_append_scrolled(&a, &b, frame_w, &mut stitched, &mut stitched_h, false)
-                    {
+                    // 复用本轮已算好的签名与 plan（`plan` 此处必为 None，正是上面那次判定）。
+                    let appended = sigs.as_ref().and_then(|sg| {
+                        try_append_scrolled(
+                            &sg.pair(),
+                            plan,
+                            frame_w,
+                            &mut stitched,
+                            &mut stitched_h,
+                            false,
+                        )
+                    });
+                    if let Some(s) = appended {
                         progress_h.store(stitched_h, Ordering::Relaxed);
                         if ticks > 1 {
                             ticks = ticks.div_ceil(2);
@@ -502,16 +518,17 @@ pub fn run_scroll_capture(
                     // 这里先试健壮的 try_append_scrolled（内部用 mean_unaligned_diff 把关
                     // 「真动了」 vs 静止/闪烁），成功即拼接续滚，避免一页。
                     if energy >= TEXTURED_ENERGY && !fd {
-                        if let Some(s) =
+                        let appended = sigs.as_ref().and_then(|sg| {
                             try_append_scrolled(
-                                &a,
-                                &b,
+                                &sg.pair(),
+                                plan,
                                 frame_w,
                                 &mut stitched,
                                 &mut stitched_h,
                                 false,
                             )
-                        {
+                        });
+                        if let Some(s) = appended {
                             a = b;
                             streak = 0;
                             blank_streak = 0;
@@ -675,16 +692,14 @@ pub fn run_scroll_capture(
                                 // 严格+估计兜底：relocate 已用大滚动把内容移过，这里把
                                 // 移进来的这段拼上，避免「只拼一页」时丢掉 relocate 滚过
                                 // 的那几十行。
-                                if let Some(s) =
-                                    try_append_scrolled(
-                                        &a,
-                                        &b,
-                                        frame_w,
-                                        &mut stitched,
-                                        &mut stitched_h,
-                                        false,
-                                    )
-                                {
+                                if let Some(s) = try_append_pair(
+                                    &a,
+                                    &b,
+                                    frame_w,
+                                    &mut stitched,
+                                    &mut stitched_h,
+                                    false,
+                                ) {
                                     progress_h.store(stitched_h, Ordering::Relaxed);
                                     tracing::info!(
                                         "[scroll] iter={iter} revived_append s={s} stitched_h={stitched_h}"
@@ -907,15 +922,23 @@ pub fn run_manual_scroll_capture(
             // 成功才拼」更少漏拼（这是「只拼到第一页」的根因），也更少重复（周期假峰被
             // 逐字节对齐 + 重复否决拦下）。判定不了（静止 / 动画模糊 / 疑似重复）→ None，
             // 落到下面的分支继续等状态明确，宁缺毋滥。
+            //
+            // 帧签名（整行哈希 / 行签名）本轮只建一次：plan_append、粗层、向上滚判定
+            // 共用同一对 FrameSig，不再各自把整帧重扫一遍。
             let tolerant = std::time::Instant::now() >= strict_until;
-            if let Some(s) = try_append_scrolled(
-                &anchor,
-                &b,
-                frame_w,
-                &mut stitched,
-                &mut stitched_h,
-                !tolerant,
-            ) {
+            let sigs = stitch::FrameSigs::new(&anchor, &b);
+            let pair = sigs.as_ref().map(|sg| sg.pair());
+            let plan = pair.as_ref().and_then(|p| p.plan_append());
+            if let Some(s) = pair.as_ref().and_then(|p| {
+                try_append_scrolled(
+                    p,
+                    plan,
+                    frame_w,
+                    &mut stitched,
+                    &mut stitched_h,
+                    !tolerant,
+                )
+            }) {
                 progress_h.store(stitched_h, Ordering::Relaxed);
                 tracing::info!(
                     "[scroll-manual] iter={iter} append s={s} stitched_h={stitched_h} maxdiff={}",
@@ -929,7 +952,9 @@ pub fn run_manual_scroll_capture(
             }
 
             // 检测失败：区分「向上滚」「还在滚动动画中」「静止在新位置」
-            if stitch::scroll_up_delta(&b, &anchor).is_some() {
+            // 向上滚判定的帧对是 (b, anchor)，正是上面那对的**反向**：复用同一批签名，
+            // 这里一次像素都不用重扫。
+            if sigs.as_ref().is_some_and(|sg| sg.reversed().scroll_up_delta().is_some()) {
                 // 反向检测命中 → 用户向上滚了：保持 anchor 在最深基线不动，
                 // 之后滚回原位/继续向下时只追加超出当前拼接底部的真正新内容，
                 // 避免把已拼接的行重复拼进去
@@ -965,12 +990,15 @@ pub fn run_manual_scroll_capture(
                 // 稳定帧再测；仍测不出才交给下文的宽松估计兜底。
                 if energy < TEXTURED_ENERGY {
                     let mut tried = 0;
-                    let mut recovered = false;
+                    // 恢复成功的那一帧暂存在这里，循环结束后才写回 anchor。原因：本轮帧
+                    // 签名借用着 anchor 指向的帧，在借用区间内给 anchor 赋值会被借用检查器
+                    // 拒绝（旧代码没有帧签名对象，可以就地赋值）。
+                    let mut recovered_frame: Option<CapturedFrame> = None;
                     while tried < 3 {
                         std::thread::sleep(EXTRA_SETTLE);
                         if let Ok(f2) = capture.capture_area(x, y, w, h) {
                             if f2.width == anchor.width && f2.height == anchor.height {
-                                if let Some(s) = try_append_scrolled(
+                                if let Some(s) = try_append_pair(
                                     &anchor,
                                     &f2,
                                     frame_w,
@@ -982,16 +1010,13 @@ pub fn run_manual_scroll_capture(
                                     tracing::info!(
                                         "[scroll-manual] iter={iter} low_energy_recovered s={s} stitched_h={stitched_h}"
                                     );
-                                    anchor = Arc::new(f2);
-                                    prev = Some(anchor.clone());
-                                    moving_frames = 0;
-                                    // 关键：从 `while` 里 break 出来 + 置 recovered，
+                                    // 关键：从 `while` 里 break 出来 + 置 recovered_frame，
                                     // 让下方跳过 append_estimate。否则 continue 只继续内层
                                     // while，落空后仍会走 append_estimate，用**已前移**的
                                     // anchor 对比**旧的**低能耗帧 b → 误取一个 s → 拼接重叠
                                     // 区 → 序号重复（如 iter32 low_energy_recovered s=178 后
                                     // 又 append_estimate s=104，重复 23/24/25）。
-                                    recovered = true;
+                                    recovered_frame = Some(f2);
                                     break;
                                 }
                                 if avg_adjacent_diff(&f2) >= TEXTURED_ENERGY {
@@ -1001,24 +1026,29 @@ pub fn run_manual_scroll_capture(
                         }
                         tried += 1;
                     }
-                    if recovered {
+                    if let Some(f2) = recovered_frame {
+                        anchor = Arc::new(f2);
+                        prev = Some(anchor.clone());
+                        moving_frames = 0;
                         continue; // 已成功拼接，跳到下一次外循环，避免重复拼接同一段
                     }
                     tracing::info!(
                         "[scroll-manual] iter={iter} low_energy_still_blank energy={energy:.1} maxdiff={md}"
                     );
                 }
-                // 低能量兜底 + 正常纹理路径都到这里：优先宽松估计，避免丢段
-                if let Some(s) =
+                // 低能量兜底 + 正常纹理路径都到这里：优先宽松估计，避免丢段。
+                // anchor 与 b 都没变 → 直接复用本轮顶部的帧对与 plan（一个像素都不重扫）。
+                let appended = pair.as_ref().and_then(|p| {
                     try_append_scrolled(
-                        &anchor,
-                        &b,
+                        p,
+                        plan,
                         frame_w,
                         &mut stitched,
                         &mut stitched_h,
                         !tolerant,
                     )
-                {
+                });
+                if let Some(s) = appended {
                     progress_h.store(stitched_h, Ordering::Relaxed);
                     tracing::info!(
                         "[scroll-manual] iter={iter} append_estimate s={s} stitched_h={stitched_h} energy={energy:.1} maxdiff={md}"
@@ -1208,21 +1238,27 @@ fn append_new_rows(
 
 /// 尝试把 `frame`（滚动后抓到的帧）相对 `anchor` 向下滚动后新进入视口的行拼到 `stitched`。
 ///
-/// 先走严格检测 [`stitch::find_scroll_delta`]（唯一性 + 匹配率验证，最可靠）；严格
-/// 检测失败时再走宽松估计 [`stitch::estimate_scroll_delta`]（取匹配行数最多的偏移）。
-/// 宽松估计可能有一两行缝，但**不会像严格检测那样整段丢内容**——手动滚动的快速
-/// 滑动 / vxe-table 虚拟表格重建行时，严格检测常返回 None，若丢弃则长图中间缺内容。
+/// 先走严格检测（唯一性 + 匹配率验证，最可靠）；严格检测失败时再走宽松估计
+/// （取匹配行数最多的偏移）。宽松估计可能有一两行缝，但**不会像严格检测那样整段
+/// 丢内容**——手动滚动的快速滑动 / vxe-table 虚拟表格重建行时，严格检测常返回 None，
+/// 若丢弃则长图中间缺内容。
+///
+/// `pair` 是本轮帧对（内含 a、b 两帧与它们的签名），签名**只算这一次**；`plan` 是调用方
+/// 已经算过的 [`stitch::AppendPlan`]（`main`/手动循环里 `plan_append` 通常在判定前就
+/// 算过一次了，直接传进来即可，否则这里会把同一对帧重算一遍——那是纯浪费）。
 ///
 /// 返回实际使用的滚动量 s；若严格+估计都测不出（内容真的无重叠，如滚动超过一屏）
 /// → `None`，调用方决定是否丢段。
 fn try_append_scrolled(
-    anchor: &CapturedFrame,
-    frame: &CapturedFrame,
+    pair: &stitch::FramePair<'_, '_>,
+    plan: Option<stitch::AppendPlan>,
     frame_w: u32,
     stitched: &mut Vec<u8>,
     stitched_h: &mut u32,
     require_exact: bool,
 ) -> Option<usize> {
+    let anchor = pair.a();
+    let frame = pair.b();
     // **精层（整行哈希逐字节对齐）先判**，再谈像素均值启发式。
     //
     // 顺序很重要：`mean_unaligned_diff` 是**全帧采样**均值，对**周期性内容**会被稀释——
@@ -1230,7 +1266,6 @@ fn try_append_scrolled(
     // 低于 TRULY_STATIC_MIN(12) 被误判成「没动」→ 整段不拼（长图只到第一页）。
     // 而精层在有信息行上能拿到 1000‰ 命中，能正确量出真实滚动量。所以精层第一优先，
     // 像素均值那道门只用来守下面的粗层/估计路径（它确实需要，见下）。
-    let plan = stitch::plan_append(anchor, frame);
     if let Some(p) = plan.as_ref() {
         // 精层确认的对齐（多数有信息行命中）：可信，直接拼
         let exact_ok = p.via_exact && p.permille >= stitch::EXACT_PERMILLE_MIN;
@@ -1277,10 +1312,12 @@ fn try_append_scrolled(
     // frames_differ（行匹配比例）对 vxe-table 自相似行失效（真实小滚动也判 false → 丢段）。
     let unaligned = stitch::mean_unaligned_diff(anchor, frame).unwrap_or(u64::MAX);
     // 求 s：find_scroll_delta（行签名，可信）优先，否则 estimate/force 兜底。
-    let s = match stitch::find_scroll_delta(anchor, frame) {
+    // 三项都读同一份帧签名（`pair`），行签名只算一次。
+    let s = match pair.find_scroll_delta() {
         Some(s) if s >= MIN_SCROLL => s,
-        _ => stitch::estimate_scroll_delta(anchor, frame)
-            .or_else(|| stitch::force_estimate_scroll_delta(anchor, frame))?,
+        _ => pair
+            .estimate_scroll_delta(false)
+            .or_else(|| pair.estimate_scroll_delta(true))?,
     };
     // 非静止门槛：只要 unaligned ≥ TRULY_STATIC_MIN（内容至少动了那么一点点），就认为
     // 是真实滚动并放行。不按「大 s + 低 unaligned」拒——那是 vxe 周期假偏移，但那些帧的
@@ -1348,9 +1385,28 @@ fn try_append_scrolled(
         refined,
         max_frame_diff(anchor, frame)
     );
-    // 追加出口统一走 append_new_rows：固定底栏排除 + 长图尾部残留底栏裁剪
-    let band = stitch::fixed_bottom_band(anchor, frame);
+    // 追加出口统一走 append_new_rows：固定底栏排除 + 长图尾部残留底栏裁剪。
+    // 底栏同样读 `pair` 的整行哈希（与精层共用，不再重扫一遍帧）。
+    let band = pair.fixed_bottom_band();
     append_new_rows(stitched, stitched_h, anchor, frame, frame_w, s, band)
+}
+
+/// 「自带签名」的拼接尝试：自己建帧签名、算一次 plan，再交给 [`try_append_scrolled`]。
+///
+/// 只在调用方手上**没有**现成帧对时用（如刚重抓的一帧）；主循环里已经有本轮帧对，
+/// 就直接把 pair/plan 传给 [`try_append_scrolled`]，别在这里重建。
+fn try_append_pair(
+    anchor: &CapturedFrame,
+    frame: &CapturedFrame,
+    frame_w: u32,
+    stitched: &mut Vec<u8>,
+    stitched_h: &mut u32,
+    require_exact: bool,
+) -> Option<usize> {
+    let sigs = stitch::FrameSigs::new(anchor, frame)?;
+    let pair = sigs.pair();
+    let plan = pair.plan_append();
+    try_append_scrolled(&pair, plan, frame_w, stitched, stitched_h, require_exact)
 }
 
 fn frames_differ(a: &CapturedFrame, b: &CapturedFrame) -> bool {
@@ -1697,7 +1753,7 @@ mod manual_diag_tests {
         });
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, false);
+        let s = try_append_pair(&a, &b, w as u32, &mut stitched, &mut stitched_h, false);
         assert_eq!(s, Some(scroll), "strict 应测出真实滚动量 {scroll}");
         // 拼接高度 = 视口高 + 新进入的 scroll 行
         assert_eq!(stitched_h as usize, h + scroll);
@@ -1713,7 +1769,7 @@ mod manual_diag_tests {
         let b = a.clone();
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, false);
+        let s = try_append_pair(&a, &b, w as u32, &mut stitched, &mut stitched_h, false);
         assert_eq!(s, None);
         assert_eq!(stitched_h, a.height);
     }
@@ -1922,7 +1978,7 @@ mod manual_diag_tests {
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
         assert_eq!(
-            try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, false),
+            try_append_pair(&a, &b, w as u32, &mut stitched, &mut stitched_h, false),
             None,
             "静止帧不得拼接"
         );
@@ -2507,7 +2563,7 @@ mod manual_diag_tests {
         let b = page.frame(180, vh, ft, fb);
         let mut stitched = a.pixels.clone();
         let mut stitched_h = a.height;
-        let s = try_append_scrolled(&a, &b, w as u32, &mut stitched, &mut stitched_h, true);
+        let s = try_append_pair(&a, &b, w as u32, &mut stitched, &mut stitched_h, true);
         assert_eq!(s, Some(180), "周期内容的真实滚动量必须拼上（否则只到第一页）");
         assert_eq!(stitched_h as usize, vh - fb + 180);
         for r in ft..stitched_h as usize {
