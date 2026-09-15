@@ -176,6 +176,11 @@ impl RotatableTextDemo {
             max_w,
             FontWeight::Normal,
             0.0,
+            // 无背景框：与 overlay 里"纯文字"的调用一致（TRANSPARENT + 零尺寸 + 零内缩），
+            // 探针只关心文字 ink 的包围盒，不该被背景色干扰。
+            RGBA::TRANSPARENT,
+            (0.0, 0.0),
+            0.0,
         );
 
         let content_bounds = Self::find_content_bounds(&probe_frame.pixels, probe_w, probe_h)?;
@@ -213,6 +218,9 @@ impl RotatableTextDemo {
             max_w,
             FontWeight::Normal,
             rot,
+            RGBA::TRANSPARENT,
+            (0.0, 0.0),
+            0.0,
         );
 
         // 裁剪到实际内容区域（旋转后可能稍大于旋转前包围盒）

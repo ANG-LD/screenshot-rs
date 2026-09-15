@@ -12,6 +12,28 @@
 # 优先级：环境变量 > config.toml > 内置默认值
 # 所有字段均可选，缺失即回落默认；路径支持以 ~ 开头表示用户主目录。
 
+[hotkey]
+
+# 截图触发热键。默认 alt+s。
+# 写法：修饰键 + ... + 主键，用 + 分隔，大小写与空格不敏感。
+#   修饰键：ctrl(control) / alt(option) / shift / super(cmd, win, meta)
+#   主键：  a-z、0-9、f1-f24，以及 space enter esc tab backspace delete insert
+#          home end pageup pagedown up down left right printscreen 和 - = , . / ; ' ` [ ] \
+# 例：screenshot = "ctrl+shift+a"、screenshot = "super+printscreen"
+# 也可用环境变量 SCREENSHOT_RS_HOTKEY 覆盖（优先级更高）。
+# 注意：至少要带一个修饰键（裸键做全局热键会抢掉全系统那个按键）；
+#       配错不会让应用起不来——会记一条 warn 并回退 alt+s。
+# screenshot = "alt+s"
+
+[translate]
+
+# 英译中模型的下载基址。留空 = 官方 HuggingFace 优先、hf-mirror.com 兜底
+# （国内直连 huggingface.co 基本不通，实测 8s 超时）。
+# 内网自建镜像或离线分发时填自己的地址，例如：
+# base_url = "https://内网地址/opus-mt-en-zh/resolve/main"
+# 也可用环境变量 SCREENSHOT_RS_TRANSLATE_BASE_URL 覆盖。
+# base_url = ""
+
 [ocr]
 
 # 模型档位：small（默认）或 medium。

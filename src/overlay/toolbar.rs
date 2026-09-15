@@ -36,6 +36,8 @@ pub enum ToolButton {
     Text,
     /// OCR 文字识别工具
     Ocr,
+    /// 英译中翻译工具（框选后 OCR → 翻译，结果落左图右文窗口）
+    Translate,
     /// 马赛克/打码工具
     Mosaic,
     /// 取色器工具
@@ -71,6 +73,7 @@ impl ToolButton {
         ToolButton::Freehand,
         ToolButton::Text,
         ToolButton::Ocr,
+        ToolButton::Translate,
         ToolButton::Mosaic,
         ToolButton::ColorPicker,
         ToolButton::Undo,
@@ -95,6 +98,7 @@ impl ToolButton {
             ToolButton::Freehand => "画图",
             ToolButton::Text => "文字",
             ToolButton::Ocr => "OCR",
+            ToolButton::Translate => "译",
             ToolButton::Mosaic => "马赛克",
             ToolButton::ColorPicker => "颜色",
             ToolButton::Undo => "撤销",
@@ -122,6 +126,7 @@ impl ToolButton {
             ToolButton::Freehand => "画笔",
             ToolButton::Text => "文字",
             ToolButton::Ocr => "文字识别",
+            ToolButton::Translate => "翻译",
             ToolButton::Mosaic => "马赛克",
             ToolButton::ColorPicker => "取色",
             ToolButton::Undo => "撤销",
@@ -183,7 +188,12 @@ impl ToolButton {
             ToolButton::Mosaic,
         ],
         // 2) 识别与滚动截屏（纯图标）
-        &[ToolButton::Ocr, ToolButton::Scroll, ToolButton::ScrollManual],
+        &[
+            ToolButton::Ocr,
+            ToolButton::Translate,
+            ToolButton::Scroll,
+            ToolButton::ScrollManual,
+        ],
         // 3) 编辑（纯图标）
         &[ToolButton::Undo, ToolButton::Redo],
         // 4) 收尾动作（纯图标：固定 / 取消 / 完成）
@@ -260,6 +270,25 @@ mod tests {
         assert_eq!(s.current_bg, RGBA::TRANSPARENT);
     }
 
+    /// 翻译按钮：纯图标 + 有 tooltip，且必须同时出现在 ORDER 与 GROUPS 里
+    /// （漏掉任一处工具栏就不渲染，或渲染顺序与 ORDER 不一致）。
+    #[test]
+    fn translate_button_is_icon_only_and_registered() {
+        let b = ToolButton::Translate;
+        assert!(!b.shows_label(), "翻译按钮应为纯图标（与 OCR 一致）");
+        assert!(!b.tooltip_text().is_empty(), "翻译按钮必须有 tooltip");
+        assert!(b.tooltip_text().contains("翻译"), "tooltip 应说明是翻译：{}", b.tooltip_text());
+        assert!(ToolButton::ORDER.contains(&b), "翻译按钮必须在 ORDER 里");
+        assert!(
+            ToolButton::GROUPS.iter().any(|g| g.contains(&b)),
+            "翻译按钮必须在 GROUPS 里"
+        );
+        // 位置：紧跟 OCR（识别类工具放一起）
+        let order: Vec<ToolButton> = ToolButton::ORDER.to_vec();
+        let ocr = order.iter().position(|x| *x == ToolButton::Ocr).unwrap();
+        assert_eq!(order[ocr + 1], ToolButton::Translate);
+    }
+
     #[test]
     fn line_widths_no_longer_include_half_pixel() {
         assert!(!LINE_WIDTHS.contains(&0.5));
@@ -312,6 +341,7 @@ mod tests {
         }
         for btn in [
             ToolButton::Ocr,
+            ToolButton::Translate,
             ToolButton::Scroll,
             ToolButton::ScrollManual,
             ToolButton::Undo,

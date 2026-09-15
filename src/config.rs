@@ -15,7 +15,30 @@ const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../config.toml");
 #[serde(default)]
 pub struct Config {
     pub ocr: OcrConfig,
+    pub hotkey: HotkeyConfig,
+    pub translate: TranslateConfig,
 }
+
+/// 英译中配置。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct TranslateConfig {
+    /// 模型下载基址（默认 HF 优先、hf-mirror 兜底）。用于内网自建镜像或离线分发。
+    pub base_url: Option<String>,
+}
+
+/// 全局热键配置。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct HotkeyConfig {
+    /// 截图触发热键，形如 `alt+s` / `ctrl+shift+f1`（大小写与空格不敏感）。
+    /// 修饰键：ctrl/alt/shift/super；主键：a-z、0-9、f1-f24 及若干命名键。
+    /// 不填则用 [`DEFAULT_HOTKEY_SCREENSHOT`]。
+    pub screenshot: Option<String>,
+}
+
+/// 截图热键默认值：`alt+s`（沿用历史行为）。
+pub const DEFAULT_HOTKEY_SCREENSHOT: &str = "alt+s";
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
@@ -103,6 +126,33 @@ pub fn ocr_model_dir() -> Option<PathBuf> {
     env_path("OCR_MODEL_DIR")
         .or_else(|| config().ocr.model_dir.clone())
         .map(expand_home)
+}
+
+/// 截图触发热键：env `SCREENSHOT_RS_HOTKEY` > 配置 `hotkey.screenshot` > `alt+s`。
+/// 解析由 `hotkey::parse_hotkey` 负责；这里只负责取值，不做校验（解析失败时
+/// 热键服务会 warn 并回退默认键，应用照常启动）。
+pub fn hotkey_screenshot() -> String {
+    std::env::var("SCREENSHOT_RS_HOTKEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config().hotkey.screenshot.clone())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HOTKEY_SCREENSHOT.to_string())
+}
+
+/// 翻译模型缓存目录：复用下载缓存目录下的 `translate` 子目录。
+pub fn translate_cache_dir() -> PathBuf {
+    cache_dir().join("translate")
+}
+
+/// 翻译模型下载基址：env `SCREENSHOT_RS_TRANSLATE_BASE_URL` > 配置
+/// `translate.base_url`。未配置返回 None，由 `translate` 模块用「HF + 镜像」兜底。
+pub fn translate_base_url() -> Option<String> {
+    std::env::var("SCREENSHOT_RS_TRANSLATE_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config().translate.base_url.clone())
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// 推理后端：env `OCR_EXECUTION_PROVIDER` > 配置 `ocr.execution_provider` > "auto"。
@@ -209,6 +259,22 @@ mod tests {
 
     fn parse_config(contents: &str) -> Option<Config> {
         toml::from_str(contents).ok()
+    }
+
+    /// `[hotkey]` 段：值缺失/为空白时回落默认 alt+s（配置模板里默认是注释掉的）。
+    #[test]
+    fn hotkey_section_defaults_and_reads_value() {
+        let none = parse_config("").unwrap();
+        assert_eq!(none.hotkey.screenshot, None);
+        let blank = parse_config("[hotkey]\nscreenshot = \"  \"\n").unwrap();
+        assert!(blank
+            .hotkey
+            .screenshot
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true));
+        let set = parse_config("[hotkey]\nscreenshot = \"ctrl+shift+a\"\n").unwrap();
+        assert_eq!(set.hotkey.screenshot.as_deref(), Some("ctrl+shift+a"));
     }
 
     #[test]

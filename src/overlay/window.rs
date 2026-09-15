@@ -195,6 +195,16 @@ pub struct OverlayView {
     /// 鼠标当前是否悬停在某个可选中形状的描边线条上（用于 hover 小手光标）
     hover_shape: bool,
 
+    /// 鼠标光标位置（逻辑像素，窗口坐标系）。用来画全屏十字参考线与坐标徽章。
+    /// `None` = 本次会话还没收到过鼠标移动（刚唤起覆盖层时）。
+    cursor_pos: Option<BoundsPoint>,
+    /// 上一次**已经显示过**的物理像素坐标（取整）。只有它变化才 `notify`：
+    /// 否则鼠标每移动一个亚像素都要重绘整个覆盖层（画布 + 工具栏 + 形状），白烧 CPU。
+    cursor_phys: Option<(i32, i32)>,
+    /// 「选区外禁止点击」状态：选区落定后指向选区外（工具栏除外）时为 true。
+    /// 画布端据此换禁止光标 + 画 🚫 角标，和 `on_mouse_down` 里真正拦掉点击的行为对齐。
+    forbidden_hover: bool,
+
     /// HiDPI 缩放因子（物理像素 / 逻辑像素）。
     ///
     /// screen_bounds 和所有鼠标交互使用逻辑像素（与 GPUI 坐标系一致），
@@ -337,6 +347,9 @@ impl OverlayView {
             selected_cmd_actual_idx: None,
             cmd_drag: None,
             hover_shape: false,
+            cursor_pos: None,
+            cursor_phys: None,
+            forbidden_hover: false,
             scale_factor,
             dim_opacity: 1.0,
         };
@@ -394,6 +407,9 @@ impl OverlayView {
         self.selected_cmd_actual_idx = None;
         self.cmd_drag = None;
         self.hover_shape = false;
+        self.cursor_pos = None;
+        self.cursor_phys = None;
+        self.forbidden_hover = false;
         self.scale_factor = scale_factor;
         tracing::info!("[overlay] start_session scale_factor={scale_factor} frame={}x{}", self.frame_width, self.frame_height);
         self.dim_opacity = 1.0;
@@ -585,7 +601,8 @@ impl OverlayView {
             }
             // Text 走 open_text_input、Ocr 走框选识别（on_mouse_down 已拦截），
             // 其余非绘图工具忽略。
-            ToolButton::Text | ToolButton::Ocr | ToolButton::ColorPicker | ToolButton::Undo
+            ToolButton::Text | ToolButton::Ocr | ToolButton::Translate | ToolButton::ColorPicker
+            | ToolButton::Undo
             | ToolButton::Redo | ToolButton::Bold | ToolButton::Scroll | ToolButton::ScrollManual
             | ToolButton::Finish | ToolButton::Cancel | ToolButton::Pin => return,
         }));
@@ -1163,6 +1180,7 @@ fn icon_for(btn: ToolButton) -> Icon {
         ToolButton::Freehand => Icon::empty().path(app_icon::PENCIL),
         ToolButton::Text => Icon::empty().path(app_icon::TYPE),
         ToolButton::Ocr => Icon::empty().path(app_icon::SCAN_TEXT),
+        ToolButton::Translate => Icon::empty().path(app_icon::TRANSLATE),
         ToolButton::Mosaic => Icon::empty().path(app_icon::GRID_2X2),
         ToolButton::ColorPicker => Icon::empty().path(app_icon::PIPETTE),
         ToolButton::Pin => Icon::empty().path(app_icon::PIN),
@@ -1208,6 +1226,34 @@ fn toolbar_width_estimate() -> f32 {
         }
     }
     w + 4.0
+}
+
+/// 「UI 区域」：工具栏本体，外加（二级弹层展开时）弹层所占的那片区域。
+///
+/// 用途只有一个——判断指针是不是落在 UI 上。工具栏会被 `compute_toolbar_bounds`
+/// 摆到选区**之外**（选区太小或贴屏幕边时），所以"是否在选区内"不足以描述 UI。
+fn ui_zone(sel: Option<ub::Bounds>, screen_bounds: ub::Bounds, popup_open: bool) -> ub::Bounds {
+    /// 二级弹层的最大高度估计：比最高那个（文字样式）再留点余量。
+    const POPOVER_MAX_H: f32 = 340.0;
+    /// 外扩一点，容忍工具栏阴影/边框与坐标取整。
+    const PAD: f32 = 6.0;
+
+    let Some(sel) = sel else {
+        return ub::Bounds::new(BoundsPoint::ZERO, BoundsPoint::ZERO);
+    };
+    let (x, y, w, h) = compute_toolbar_bounds(sel, screen_bounds);
+    let mut min = BoundsPoint::new(x - PAD, y - PAD);
+    let mut max = BoundsPoint::new(x + w + PAD, y + h + PAD);
+    if popup_open {
+        // 弹层总是朝"远离选区"的方向展开（见工具栏渲染处的 popover_open_up 判定），
+        // 所以只往那一侧扩，不会把选区这一侧的画布误划进 UI 区域。
+        if y + h / 2.0 < sel.origin.y + sel.size.y / 2.0 {
+            min.y -= POPOVER_MAX_H;
+        } else {
+            max.y += POPOVER_MAX_H;
+        }
+    }
+    ub::Bounds::new(min, max)
 }
 
 fn compute_toolbar_bounds(
@@ -1629,11 +1675,38 @@ fn render_simple_button(
                         if this.toolbar.active_tool == Some(ToolButton::Ocr) {
                             this.toolbar.active_tool = None;
                             this.ocr_rect = None;
+                            cx.notify();
                         } else {
                             this.toolbar.active_tool = Some(ToolButton::Ocr);
                             this.ocr_rect = None;
+                            // 已经有截图框 → 直接识别框内全部内容，不用再框一次
+                            if let Some(sel) = this.selection.current().filter(|s| ocr_rect_usable(*s))
+                            {
+                                this.start_ocr_or_translate(sel, false, window, cx);
+                                return;
+                            }
+                            cx.notify();
                         }
-                        cx.notify();
+                    }
+                    // 翻译工具：复用 OCR 的框选状态（ocr_rect / ocr_drag_start）与画布上的
+                    // 选框渲染，只有"松开之后干什么"不同——省掉一整套重复的拖拽状态。
+                    ToolButton::Translate => {
+                        this.finalize_text_input_if_active(cx);
+                        if this.toolbar.active_tool == Some(ToolButton::Translate) {
+                            this.toolbar.active_tool = None;
+                            this.ocr_rect = None;
+                            cx.notify();
+                        } else {
+                            this.toolbar.active_tool = Some(ToolButton::Translate);
+                            this.ocr_rect = None;
+                            // 同 OCR：直接翻译当前截图框内的全部内容，不用二次框选
+                            if let Some(sel) = this.selection.current().filter(|s| ocr_rect_usable(*s))
+                            {
+                                this.start_ocr_or_translate(sel, true, window, cx);
+                                return;
+                            }
+                            cx.notify();
+                        }
                     }
                     ToolButton::Pin => {
                         this.finalize_text_input_if_active(cx);
@@ -2639,6 +2712,78 @@ fn begin_text_drag(
     cx.stop_propagation();
 }
 
+/// 光标旁的浮动小徽章：坐标显示或「禁止点击」提示。
+///
+/// 位置默认贴光标右下 18px；贴近屏幕右/下边缘时翻到另一侧，避免徽章跑出屏幕。
+/// 传 `icon` 时在文字左侧加个小图标（禁止提示用 ⊘）。
+fn hud_badge(
+    cursor: BoundsPoint,
+    label: String,
+    window: &Window,
+    icon: Option<&str>,
+) -> impl IntoElement {
+    let win = window.bounds().size;
+    // 宽度按最长内容（"1234, 5678    1920 × 1080"）估个上限，仅用于判断是否翻边
+    let (bw, bh) = (210.0_f32, 26.0_f32);
+    let x = if cursor.x + 18.0 + bw > f32::from(win.width) {
+        cursor.x - 18.0 - bw
+    } else {
+        cursor.x + 18.0
+    };
+    let y = if cursor.y + 18.0 + bh > f32::from(win.height) {
+        cursor.y - 18.0 - bh
+    } else {
+        cursor.y + 18.0
+    };
+    let mut badge = div()
+        .absolute()
+        .left(px(x.max(0.0)))
+        .top(px(y.max(0.0)))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .px(px(8.0))
+        .py(px(3.0))
+        .rounded(px(5.0))
+        .bg(gpui::rgba(theme::tokens::PANEL_BG))
+        .border_1()
+        .border_color(gpui::rgba(theme::tokens::PANEL_BORDER))
+        .text_size(px(12.0))
+        .text_color(gpui::rgba(theme::tokens::TEXT));
+    if let Some(path) = icon {
+        badge = badge.child(
+            gpui::svg()
+                .path(path)
+                .size(px(15.0))
+                .text_color(gpui::rgba(0xE5484DFF)),
+        );
+    }
+    badge.child(label)
+}
+
+/// 记录鼠标光标位置并换算成对外的物理像素坐标（坐标徽章显示用）。
+///
+/// 存进视图的是**按物理像素取整后反算回逻辑像素**的位置，这样画出来的十字线
+/// 正好落在徽章上那个坐标对应的像素上（不会差半个物理像素）。
+/// 只在取整后的物理坐标变化时才 `notify`：高 DPI 下鼠标移动的亚像素抖动不该
+/// 触发整个覆盖层重绘。
+fn update_cursor_readout(
+    this: &mut OverlayView,
+    p: BoundsPoint,
+    window: &Window,
+    cx: &mut Context<OverlayView>,
+) {
+    let (sx, sy) = frame_scale(window, this.frame_width, this.frame_height);
+    let phys = ((p.x * sx).round() as i32, (p.y * sy).round() as i32);
+    let changed = this.cursor_phys != Some(phys);
+    this.cursor_pos = Some(BoundsPoint::new(phys.0 as f32 / sx, phys.1 as f32 / sy));
+    this.cursor_phys = Some(phys);
+    if changed {
+        cx.notify();
+    }
+}
+
 /// 构造文字输入框的角 resize handle（6×6 方块）
 ///
 /// 鼠标按下时把 `text_input_drag` 置为对应 mode + 记录起点 rect。
@@ -2691,6 +2836,19 @@ fn build_render_image_from_pixels(width: u32, height: u32, mut pixels: Vec<u8>) 
 /// 把 GPUI 像素坐标转成 SelectionState 用的 f32 点（utils::bounds::Point）
 fn to_bounds_point(p: Point<Pixels>) -> BoundsPoint {
     BoundsPoint::new(f32::from(p.x), f32::from(p.y))
+}
+
+/// 逻辑像素 → 帧物理像素的缩放系数 (sx, sy)。
+///
+/// 与提交时「裁剪 / rasterize」用的是同一套映射（帧宽 ÷ 覆盖层窗口宽），所以
+/// 鼠标逻辑坐标乘上它就是成图里的像素坐标——坐标徽章显示的数字因此可直接用来
+/// 对像素做测量。覆盖层窗口即整块屏幕，两者在高 DPI 下并不相等（2x 屏为 2.0）。
+fn frame_scale(window: &Window, frame_width: u32, frame_height: u32) -> (f32, f32) {
+    let size = window.bounds().size;
+    (
+        frame_width as f32 / f32::from(size.width).max(1.0),
+        frame_height as f32 / f32::from(size.height).max(1.0),
+    )
 }
 
 /// 把 DrawCommand 中的所有坐标从 canvas 坐标转为帧物理像素坐标。
@@ -3299,6 +3457,146 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
 /// `window.bounds()` 获取。它与 frame 物理尺寸可能有差异（如任务栏挤压），
 /// `paint_image` 会基于两者之比缩放图像，像素提取需用相同比率。
 /// 在后台线程对选区区域做 OCR：接收选区 RGBA 像素（已裁剪，避免克隆整帧）。
+
+/// 「够不够大才值得识别」：小于这个尺寸的框多半是误点/误拖。
+fn ocr_rect_usable(rect: ub::Bounds) -> bool {
+    rect.size.x > 5.0 && rect.size.y > 5.0
+}
+
+impl OverlayView {
+    /// 对给定的**逻辑坐标矩形**跑 OCR / 翻译：裁剪该区域像素 → 立刻开左图右文结果窗
+    /// （右侧先显示「识别中…/翻译中…」）→ 后台线程识别/翻译并回填 + 写剪贴板 →
+    /// 立即 commit 关闭遮罩。
+    ///
+    /// 两个入口共用同一份逻辑：
+    ///   1. 点工具栏「OCR / 翻译」按钮：直接用**当前整个截图框**——用户要求不用再二次框选；
+    ///   2. 在截图框内拖出更小的区域：保留"只想识别某一块"的精细能力。
+    fn start_ocr_or_translate(
+        &mut self,
+        rect: ub::Bounds,
+        translate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fw = self.frame_width;
+        let fh = self.frame_height;
+        let wb = window.bounds();
+        let sx = self.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+        let sy = self.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+        // 裁剪选区像素构造 PinPayload（供结果窗左侧显示原图）
+        let sel_px = ub::Bounds {
+            origin: ub::Point::new(rect.origin.x * sx, rect.origin.y * sy),
+            size: ub::Point::new(rect.size.x * sx, rect.size.y * sy),
+        };
+        let Ok(clipped) = CapturedFrame::clip_pixels(
+            fw,
+            fh,
+            &self.frame_pixels,
+            sel_px.origin.x as u32,
+            sel_px.origin.y as u32,
+            sel_px.size.x as u32,
+            sel_px.size.y as u32,
+        ) else {
+            tracing::error!("OCR/翻译: 裁剪区域像素失败，放弃");
+            return;
+        };
+        let pin_x = self.client_origin.x + rect.origin.x;
+        let pin_y = self.client_origin.y + rect.origin.y;
+        // 选区区域像素（RGBA，几百 KB）给后台线程——只克隆选区而非整帧（整帧 8MB
+        // 一次性拷贝），显著减少内存与拷贝耗时。
+        let region_pixels = clipped.pixels.clone();
+        let region_w = clipped.width;
+        let region_h = clipped.height;
+        let payload = PinPayload {
+            frame: clipped,
+            origin_x: pin_x,
+            origin_y: pin_y,
+            sx,
+            sy,
+        };
+        // 立即打开左图右文窗口（右侧显示"识别中…/翻译中…"）
+        let _ = ensure_started().send(OverlayCommand::OpenResultPin { payload, translate });
+        std::thread::spawn(move || {
+            if translate {
+                run_translate_and_update(region_pixels, region_w, region_h);
+                return;
+            }
+            let text = run_ocr_sync(region_pixels, region_w, region_h);
+            if !text.is_empty() {
+                if let Err(e) = crate::clipboard::global().write_text(&text) {
+                    tracing::error!("OCR: 结果写入剪贴板失败: {e}");
+                } else {
+                    tracing::info!("OCR: 结果已复制到剪贴板 ({} bytes)", text.len());
+                }
+            } else {
+                tracing::info!("OCR: 未识别到文字");
+            }
+            let _ = ensure_started().send(OverlayCommand::UpdateResultPin {
+                translate: false,
+                text,
+            });
+        });
+        // 立即提交关闭遮罩（不再单独开 pin；图像由结果窗左侧展示）
+        self.commit(
+            OverlayResult {
+                selection: Some(rect),
+                commands: vec![],
+                no_clipboard: true,
+                pin: None,
+                scroll_region_px: None,
+                scroll_manual: false,
+                frame: None,
+            },
+            window,
+        );
+        let _ = cx;
+    }
+}
+
+/// 翻译工具的后台任务：确保模型就位 → OCR → 翻译 → 回填窗口 + 复制译文。
+///
+/// 独立成一个函数是因为 OCR 与翻译**共用同一条框选/裁剪路径**，只在"松开之后"
+/// 分岔。首次使用会先下载约 110MB 模型（进度由 `translate::progress()` 暴露），
+/// 这期间结果窗一直显示「翻译中…」。
+fn run_translate_and_update(region_pixels: Vec<u8>, region_w: u32, region_h: u32) {
+    let dir = crate::config::translate_cache_dir();
+    if !crate::translate::models_ready(&dir) {
+        tracing::info!("翻译: 模型未就绪，先下载到 {}", dir.display());
+        if let Err(e) = crate::translate::ensure_models(&dir) {
+            tracing::error!("翻译: 模型下载失败: {e}");
+            let _ = ensure_started().send(OverlayCommand::UpdateResultPin {
+                translate: true,
+                text: format!("翻译模型下载失败：{e}"),
+            });
+            return;
+        }
+    }
+    let text = run_ocr_sync(region_pixels, region_w, region_h);
+    if text.trim().is_empty() {
+        tracing::info!("翻译: 未识别到文字");
+        let _ = ensure_started().send(OverlayCommand::UpdateResultPin {
+            translate: true,
+            text: "未识别到文字".to_string(),
+        });
+        return;
+    }
+    let translated = match crate::translate::translate(&text) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("翻译失败: {e}");
+            format!("翻译失败：{e}")
+        }
+    };
+    // 复制的是**译文**（微信的翻译也是给你中文）
+    if let Err(e) = crate::clipboard::global().write_text(&translated) {
+        tracing::error!("翻译: 译文写入剪贴板失败: {e}");
+    }
+    let _ = ensure_started().send(OverlayCommand::UpdateResultPin {
+        translate: true,
+        text: translated,
+    });
+}
+
 fn run_ocr_sync(
     region_pixels: Vec<u8>,
     region_width: u32,
@@ -3442,6 +3740,7 @@ impl Render for OverlayView {
         let ocr_dragging = self.ocr_drag_start.is_some();
         let dim_opacity = self.dim_opacity;
         let hover_shape = self.hover_shape;
+        let forbidden_hover = self.forbidden_hover;
         // 文字框 auto_grow 测量提前到 render 开头：canvas 边框与 Input 必须基于
         // 同一份 text_input_rect。若在 Input 渲染时才更新 size，canvas closure 捕获
         // 的是测量前的旧值，导致边框与输入框错位（光标跑到框外、文字被边框盖住）。
@@ -3524,11 +3823,14 @@ impl Render for OverlayView {
         };
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect, editing_bg),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, text_editing, text_input_rect, editing_bg), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg), window, cx| {
                 // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
                 // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
-                if hover_shape {
+                if forbidden_hover {
+                    // 禁止光标：让"点不动"有明确反馈（不是没反应）
+                    window.set_window_cursor_style(gpui::CursorStyle::OperationNotAllowed);
+                } else if hover_shape {
                     window.set_window_cursor_style(gpui::CursorStyle::PointingHand);
                 }
 
@@ -3834,6 +4136,57 @@ impl Render for OverlayView {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(paint_canvas.size_full());
+
+        // 光标美化：短十字参考线 + 坐标徽章 + 「禁止点击」角标（参考微信 / Snipaste）。
+        // 放在画布之后、工具栏之前：工具栏弹出时天然盖住它们，互不打架；这些都是
+        // 无 id / 无 handler 的纯展示 div，不参与命中测试，不会挡住底下的操作。
+        if let Some(c) = self.cursor_pos {
+            let (sx, sy) = frame_scale(window, self.frame_width, self.frame_height);
+            let (phys_x, phys_y) = self.cursor_phys.unwrap_or((0, 0));
+            // ① 十字 + 坐标只在**还没画出选区**时显示（拖框过程中保留，好让用户看尺寸）。
+            //    选区一旦落定，光标要去调手柄 / 移动 / 提示禁止点击，再挂个十字和坐标
+            //    只会挡住选区边界，所以这时候不显示坐标。
+            //    （OCR / 翻译工具在已有选区里再拖一个小框时也要看坐标，所以一并保留。）
+            let show_hud = self.selection.current().is_none()
+                || self.selection.is_dragging()
+                || self.ocr_drag_start.is_some();
+            if show_hud {
+                // 短十字：四段短臂围着光标，中间留 GAP 露出鼠标本身。之前是横贯/纵贯
+                // 整个屏幕的十字，把屏幕切成四块，反而看不清选区边界（用户反馈）。
+                const ARM: f32 = 16.0;
+                const GAP: f32 = 5.0;
+                let shade = gpui::rgba(0x00000066);
+                let line = gpui::rgba(0xFFFFFFCC);
+                let arms: [(f32, f32, f32, f32); 4] = [
+                    (c.x - GAP - ARM, c.y, ARM, 1.0),
+                    (c.x + GAP, c.y, ARM, 1.0),
+                    (c.x, c.y - GAP - ARM, 1.0, ARM),
+                    (c.x, c.y + GAP, 1.0, ARM),
+                ];
+                root = root.children(arms.iter().flat_map(|(ax, ay, aw, ah)| {
+                    [
+                        // 深色线偏 1px 当描边、亮色线压在上面：浅底深底都看得清
+                        div().absolute().left(px(*ax + 1.0)).top(px(*ay + 1.0)).w(px(*aw)).h(px(*ah)).bg(shade),
+                        div().absolute().left(px(*ax)).top(px(*ay)).w(px(*aw)).h(px(*ah)).bg(line),
+                    ]
+                }));
+
+                // 坐标徽章：物理像素坐标（与成图像素一一对应）；拖框时补上「宽 × 高」
+                let mut label = format!("{phys_x}, {phys_y}");
+                if self.selection.is_dragging() {
+                    if let Some(sel) = self.selection.current() {
+                        let w = (sel.size.x * sx).round() as i32;
+                        let h = (sel.size.y * sy).round() as i32;
+                        label = format!("{label}    {w} × {h}");
+                    }
+                }
+                root = root.child(hud_badge(c, label, window, None));
+            } else if self.forbidden_hover {
+                // ② 选区已落定 + 指针在选区外：明确的「禁止点击」角标。画布那边同时把
+                //    光标换成 not-allowed，这里做双保险（部分 Linux 后端不一定映射该光标）。
+                root = root.child(hud_badge(c, "禁止点击".to_string(), window, Some(crate::assets::icons::BAN)));
+            }
+        }
 
         // Editing 模式下挂浮动工具栏；选区是 None 时仍可挂，但 render_toolbar
         // 用的是 selection.current()，工具栏会贴在 None 处 → 等 Editing 时一定存在
@@ -4234,8 +4587,10 @@ impl Render for OverlayView {
                                 return;
                             }
                             // 2.5) OCR 工具 + 选区内点击 → 开始框选识别区域
-                            if this.toolbar.active_tool == Some(ToolButton::Ocr)
-                                && sel.contains(p)
+                            if matches!(
+                                this.toolbar.active_tool,
+                                Some(ToolButton::Ocr) | Some(ToolButton::Translate)
+                            ) && sel.contains(p)
                             {
                                 this.finalize_text_input_if_active(cx);
                                 this.ocr_rect = Some(ub::Bounds::new(p, BoundsPoint::ZERO));
@@ -4266,7 +4621,7 @@ impl Render for OverlayView {
                     this.selection.mouse_down(p);
                 }),
             )
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 let mut p = to_bounds_point(ev.position);
                 // 将鼠标位置裁剪到屏幕范围内，防止所有拖拽操作超出截图区域。
                 // GPUI 在快速拖拽时可能报告窗口外的坐标。
@@ -4278,6 +4633,26 @@ impl Render for OverlayView {
                     this.screen_bounds.origin.y,
                     this.screen_bounds.origin.y + this.screen_bounds.size.y,
                 );
+                // 记录光标（此时只裁到屏幕内）：十字参考线要跟手走遍全屏，
+                // 所以不能等下面裁到选区之后才记录。
+                update_cursor_readout(this, p, window, cx);
+                // 选区画出来之后，选区外（工具栏/二级弹层除外）属于「禁止点击」区：
+                // 这里只算状态，光标与角标在画布/渲染端体现；真正拦掉点击的是
+                // on_mouse_down 里 "Editing 模式下已有截图框时禁止点击框外区域" 那段。
+                // 工具栏与二级弹层所在的整片区域不算"选区外"：工具栏经常被摆到选区
+                // 之外（选区很小或贴着屏幕边时），只按"是否在选区内"判断会把悬停工具栏
+                // 误判成选区外，于是鼠标一进操作栏就冒 🚫（用户反馈"操作栏也需要正常显示"）。
+                let ui = ui_zone(
+                    this.selection.current(),
+                    this.screen_bounds,
+                    this.toolbar.popup.is_some(),
+                );
+                let forbid = this.mode == OverlayMode::Editing
+                    && this.selection.current().map(|s| !s.contains(p) && !ui.contains(p)).unwrap_or(false);
+                if forbid != this.forbidden_hover {
+                    this.forbidden_hover = forbid;
+                    cx.notify();
+                }
                 // 绘制中（in_progress）/ 拖拽命令 / OCR 框选时进一步裁剪到选区边界，
                 // 防止矩形/箭头/自由画笔超出截图框进入 dim 区域。
                 let sel = this.selection.current();
@@ -4346,89 +4721,18 @@ impl Render for OverlayView {
                         this.cmd_drag = None;
                         return;
                     }
-                    // OCR 框选结束 → 提取像素、后台异步识别，并立即提交关闭遮罩
+                    // OCR/翻译 框选结束 → 交给共用入口（提取像素、开结果窗、后台识别）
                     if this.ocr_drag_start.is_some() {
-                        tracing::info!(
-                            "OCR mouse_up: drag_start=({:.1},{:.1}) ocr_rect={:?}",
-                            this.ocr_drag_start.unwrap().x,
-                            this.ocr_drag_start.unwrap().y,
-                            this.ocr_rect.map(|r| (r.origin.x, r.origin.y, r.size.x, r.size.y)),
-                        );
                         this.ocr_drag_start = None;
-                        if let Some(rect) = this.ocr_rect {
-                            if rect.size.x > 5.0 && rect.size.y > 5.0 {
-                                let fw = this.frame_width;
-                                let fh = this.frame_height;
-                                let wb = window.bounds();
-                                let sx = this.frame_width as f32 / f32::from(wb.size.width).max(1.0);
-                                let sy = this.frame_height as f32 / f32::from(wb.size.height).max(1.0);
-                                // 裁剪选区像素构造 PinPayload（供 OcrPin 窗口左侧显示）
-                                let sel_px = ub::Bounds {
-                                    origin: ub::Point::new(rect.origin.x * sx, rect.origin.y * sy),
-                                    size: ub::Point::new(rect.size.x * sx, rect.size.y * sy),
-                                };
-                                if let Ok(clipped) = CapturedFrame::clip_pixels(
-                                    fw,
-                                    fh,
-                                    &this.frame_pixels,
-                                    sel_px.origin.x as u32,
-                                    sel_px.origin.y as u32,
-                                    sel_px.size.x as u32,
-                                    sel_px.size.y as u32,
-                                ) {
-                                    let pin_x = this.client_origin.x + rect.origin.x;
-                                    let pin_y = this.client_origin.y + rect.origin.y;
-                                    // 选区区域像素（RGBA，几百 KB）给后台 OCR 线程——只克隆选区
-                                    // 而非整帧（整帧 8MB 一次性拷贝），显著减少内存与拷贝耗时。
-                                    let region_pixels = clipped.pixels.clone();
-                                    let region_w = clipped.width;
-                                    let region_h = clipped.height;
-                                    let payload = PinPayload {
-                                        frame: clipped,
-                                        origin_x: pin_x,
-                                        origin_y: pin_y,
-                                        sx,
-                                        sy,
-                                    };
-                                    // 立即打开左图右文 OcrPin 窗口（右侧显示"识别中…"）
-                                    let _ = ensure_started().send(OverlayCommand::OpenOcrPin(payload));
-                                    std::thread::spawn(move || {
-                                        let text =
-                                            run_ocr_sync(region_pixels, region_w, region_h);
-                                        if !text.is_empty() {
-                                            if let Err(e) = crate::clipboard::global().write_text(&text) {
-                                                tracing::error!("OCR: 结果写入剪贴板失败: {e}");
-                                            } else {
-                                                tracing::info!(
-                                                    "OCR: 结果已复制到剪贴板 ({} bytes)",
-                                                    text.len()
-                                                );
-                                            }
-                                        } else {
-                                            tracing::info!("OCR: 未识别到文字");
-                                        }
-                                        let _ = ensure_started().send(OverlayCommand::UpdateOcrPin(text));
-                                    });
-                                }
-                                // 立即提交关闭遮罩（不再单独开 pin；图像由 OcrPin 窗口左侧展示）
-                                this.commit(
-                                    OverlayResult {
-                                        selection: Some(rect),
-                                        commands: vec![],
-                                        no_clipboard: true,
-                                        pin: None,
-                                        scroll_region_px: None,
-                                        scroll_manual: false,
-                                        frame: None,
-                                    },
-                                    window,
-                                );
-                            } else {
-                                tracing::info!("OCR rect too small, cleared");
+                        let translate = this.toolbar.active_tool == Some(ToolButton::Translate);
+                        match this.ocr_rect {
+                            Some(rect) if ocr_rect_usable(rect) => {
+                                this.start_ocr_or_translate(rect, translate, window, cx);
+                            }
+                            _ => {
+                                tracing::info!("OCR/翻译: 框选区域过小或为空，忽略");
                                 this.ocr_rect = None;
                             }
-                        } else {
-                            tracing::info!("OCR ocr_rect is None");
                         }
                         return;
                     }
@@ -5047,9 +5351,16 @@ enum OverlayCommand {
     /// 打开 OCR 模型管理窗口（查看模型状态 / 重新下载 / 进度）
     OpenOcrModels,
     /// 打开/重用 OCR 识别窗口（左图右文，类似微信文字识别）：左侧选区图 + 右侧结果区
-    OpenOcrPin(PinPayload),
+    OpenResultPin {
+        payload: PinPayload,
+        /// true=翻译结果窗（标题「翻译」、等待文案「翻译中…」）
+        translate: bool,
+    },
     /// 更新当前 OCR 窗口的右侧文字（后台识别完成后调用）
-    UpdateOcrPin(String),
+    UpdateResultPin {
+        translate: bool,
+        text: String,
+    },
     /// 打开滚动截屏进度小窗（cancel/progress 由主线程与 GPUI 线程共享原子）
     ShowProgress {
         cancel: Arc<AtomicBool>,
@@ -5254,6 +5565,8 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
 
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
                 let mut ocr_pin: Option<WindowHandle<gpui_component::Root>> = None;
+                // 翻译结果窗（与 OCR 结果窗互不干扰，各自只保留一个）
+                let mut trans_pin: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut update_prompt: Option<WindowHandle<gpui_component::Root>> = None;
                 // UI 视觉调试：SCREENSHOT_RS_UI_PROBE=pin|progress|ocr|update 时，
@@ -5346,18 +5659,20 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                 }
                             }
                         }
-                        Ok(OverlayCommand::OpenOcrPin(payload)) => {
-                            // 多次 OCR 只保留一个窗口：关掉旧的，开新的（左图右文）
-                            if let Some(old) = ocr_pin.take() {
+                        Ok(OverlayCommand::OpenResultPin { payload, translate }) => {
+                            // 同一类窗口只保留一个：关掉旧的，开新的（左图右文）
+                            let slot = if translate { &mut trans_pin } else { &mut ocr_pin };
+                            if let Some(old) = slot.take() {
                                 let _ = old.update(async_cx, |_, window, _| window.remove_window());
                             }
-                            match async_cx.update(|cx| open_ocr_pin_in_app(payload, cx)) {
-                                Ok(handle) => ocr_pin = Some(handle),
-                                Err(e) => tracing::error!("[overlay] open ocr pin window failed: {e}"),
+                            match async_cx.update(|cx| open_result_pin_in_app(payload, translate, cx)) {
+                                Ok(handle) => *slot = Some(handle),
+                                Err(e) => tracing::error!("[overlay] 打开结果窗失败: {e}"),
                             }
                         }
-                        Ok(OverlayCommand::UpdateOcrPin(text)) => {
-                            if let Some(handle) = &ocr_pin {
+                        Ok(OverlayCommand::UpdateResultPin { translate, text }) => {
+                            let handle = if translate { &trans_pin } else { &ocr_pin };
+                            if let Some(handle) = handle {
                                 let _ = handle.update(async_cx, |root, _, cx| {
                                     // Root 包裹后 downcast 访问 OcrPinView
                                     if let Ok(view) = root.view().clone().downcast::<OcrPinView>() {
@@ -5368,7 +5683,22 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                             } else {
                                                 // 先由 `&text` 生成 markdown 字符串，再**移动** text 给
                                                 // view.text（原为 clone，避免整份 OCR 文本深拷贝）。
-                                                let md = format!("```text\n{}\n```", text);
+                                                // 渲染方式按内容自适应：
+                                                //   - OCR 结果：一律等宽代码块（表格/缩进靠等宽对齐）；
+                                                //   - 译文：纯段落走 markdown 散文（中文读着舒服），
+                                                //     但只要带版式（行首缩进 / 连续空行）就必须包代码块
+                                                //     ——markdown 会把行首空白和多余空行吃掉，那样
+                                                //     "混排保留原格式"在界面上根本看不出来。
+                                                let keep_layout = translate
+                                                    && (text.contains("\n\n")
+                                                        || text
+                                                            .lines()
+                                                            .any(|l| l.starts_with(' ') || l.starts_with('\t')));
+                                                let md = if translate && !keep_layout {
+                                                    text.clone()
+                                                } else {
+                                                    format!("```text\n{}\n```", text)
+                                                };
                                                 view.text = Some(text);
                                                 // 重建 TextViewState（markdown 解析），支持选中/复制/全选
                                                 view.text_state = Some(cx.new(|cx| {
@@ -7027,6 +7357,12 @@ fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component
 /// 多次 OCR 复用同一个窗口（OpenOcrPin 关旧开新）；后台识别完成后
 /// UpdateOcrPin 把文字填入右侧。
 struct OcrPinView {
+    /// true=翻译结果窗（标题「翻译」、等待文案「翻译中…」），false=OCR 结果窗
+    translate: bool,
+    /// 是否要在等待文案里提"首次会先下载模型"。
+    /// 只在**确实要下载**（翻译窗口且模型未就绪）时为 true：模型早就下好了还挂着
+    /// 这句提示纯属误导（用户反馈）。
+    needs_download: bool,
     focus_handle: FocusHandle,
     image: Arc<RenderImage>,
     /// 图片逻辑显示宽高（用于保持宽高比，窗口缩放不变形）
@@ -7044,11 +7380,16 @@ impl OcrPinView {
         text: Option<String>,
         disp_w: f32,
         disp_h: f32,
+        translate: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let (w, h, pixels) = (frame.width, frame.height, frame.pixels);
         let img = build_render_image_from_pixels(w, h, pixels);
+        let needs_download =
+            translate && !crate::translate::models_ready(&crate::translate::model_dir());
         Self {
+            translate,
+            needs_download,
             focus_handle: cx.focus_handle(),
             image: img,
             img_w: disp_w,
@@ -7077,7 +7418,13 @@ impl Render for OcrPinView {
                     div()
                         .text_color(theme::c::rgb(t::TEXT_MUTED))
                         .text_sm()
-                        .child(gpui::SharedString::from("OCR 识别中…")),
+                        .child(gpui::SharedString::from(if !self.translate {
+                            "OCR 识别中…"
+                        } else if self.needs_download {
+                            "翻译中…（首次需要先下载约 110MB 模型，请稍候）"
+                        } else {
+                            "翻译中…"
+                        })),
                 ),
             Some(text) => {
                 // 覆盖代码块配色：黑底白字（默认 muted 灰底），文字顶到标题栏下。
@@ -7195,7 +7542,11 @@ impl Render for OcrPinView {
 }
 
 /// 打开 OCR 识别窗口（左图右文）。窗口大小 = 图片显示宽 + 360，高度按比例。
-fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
+fn open_result_pin_in_app(
+    payload: PinPayload,
+    translate: bool,
+    cx: &mut App,
+) -> AppResult<WindowHandle<gpui_component::Root>> {
     let PinPayload { frame, sx, sy, .. } = payload;
     let img_w = frame.width as f32 / sx;
     let img_h = frame.height as f32 / sy;
@@ -7233,7 +7584,7 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
             })),
             window_background: WindowBackgroundAppearance::Opaque,
             titlebar: Some(TitlebarOptions {
-                title: Some("OCR 识别".into()),
+                title: Some(if translate { "翻译" } else { "OCR 识别" }.into()),
                 appears_transparent: false,
                 ..Default::default()
             }),
@@ -7245,7 +7596,7 @@ fn open_ocr_pin_in_app(payload: PinPayload, cx: &mut App) -> AppResult<WindowHan
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, cx));
+            let view = cx.new(|cx| OcrPinView::new(frame, None, disp_w, disp_h, translate, cx));
             let h = view.read(cx).focus_handle.clone();
             h.focus(window, cx);
             // 包 gpui-component Root：TextView 的鼠标选择控制器依赖 Root 的
@@ -7377,6 +7728,83 @@ fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「UI 区域」必须把工具栏本体盖住——工具栏被摆到选区外时（选区小/贴屏幕边），
+    /// 这是"悬停操作栏不该算选区外"的唯一依据。顺便锁住弹层展开方向：只往远离
+    /// 选区的一侧扩，否则会把选区旁的画布也划成 UI 区域，🚫 就再也不出现了。
+    #[test]
+    fn ui_zone_covers_toolbar_and_expands_away_from_selection() {
+        let screen = ub::Bounds::new(BoundsPoint::new(0.0, 0.0), BoundsPoint::new(1920.0, 1080.0));
+        // 选区在上半屏，工具栏会落在它下方
+        let sel = ub::Bounds::new(BoundsPoint::new(600.0, 200.0), BoundsPoint::new(1200.0, 400.0));
+        let (tx, ty, tw, th) = compute_toolbar_bounds(sel, screen);
+        let toolbar_center = BoundsPoint::new(tx + tw / 2.0, ty + th / 2.0);
+
+        let closed = ui_zone(Some(sel), screen, false);
+        assert!(
+            closed.contains(toolbar_center),
+            "工具栏中心必须在 UI 区域内，否则悬停它就会冒禁止角标"
+        );
+
+        // 弹层未展开时，工具栏下方 200px 属于画布 → 不在 UI 区域内
+        let below = BoundsPoint::new(tx + tw / 2.0, ty + th + 200.0);
+        assert!(!closed.contains(below), "弹层没开时工具栏下方应是画布");
+
+        // 弹层展开时，弹层朝下（远离选区）→ 同一位置被划进 UI 区域
+        let open = ui_zone(Some(sel), screen, true);
+        assert!(open.contains(below), "弹层展开时它占的区域也要算 UI");
+
+        // 但选区那一侧（工具栏上方）不能被扩进来
+        let above = BoundsPoint::new(tx + tw / 2.0, ty - 200.0);
+        assert!(!open.contains(above), "扩边只能朝远离选区的一侧，不能吃掉画布");
+
+        // 选区贴屏幕底边 → compute_toolbar_bounds 放不下"下方"，只能摆到选区上方，
+        // 此时扩边方向必须随之翻转（这才是"工具栏在选区上方"的真实成因）。
+        let sel_top = ub::Bounds::new(
+            BoundsPoint::new(600.0, 900.0),
+            BoundsPoint::new(1200.0, 1050.0),
+        );
+        let (tx2, ty2, tw2, th2) = compute_toolbar_bounds(sel_top, screen);
+        assert!(
+            ty2 + th2 <= sel_top.origin.y,
+            "前提校验：此时工具栏应被摆到选区上方（ty2={ty2} sel_y={}）",
+            sel_top.origin.y
+        );
+        let open_top = ui_zone(Some(sel_top), screen, true);
+        assert!(
+            open_top.contains(BoundsPoint::new(tx2 + tw2 / 2.0, ty2 - 200.0)),
+            "工具栏在选区上方时，弹层向上展开"
+        );
+        assert!(
+            !open_top.contains(BoundsPoint::new(tx2 + tw2 / 2.0, ty2 + th2 + 200.0)),
+            "向下不该扩到画布里"
+        );
+    }
+
+    /// 识别区域的下限：太小的框多半是误点/误拖，直接跑 OCR 只会白等一次推理。
+    /// 这个阈值同时把"工具栏按钮直接用整个截图框"和"框内细化"两条路径统一了。
+    #[test]
+    fn tiny_ocr_rect_is_rejected() {
+        let ok = ub::Bounds::new(BoundsPoint::new(10.0, 10.0), BoundsPoint::new(110.0, 60.0));
+        assert!(ocr_rect_usable(ok));
+        // 恰好等于阈值不算（要求严格大于）
+        let edge = ub::Bounds::new(BoundsPoint::new(10.0, 10.0), BoundsPoint::new(15.0, 15.0));
+        assert!(!ocr_rect_usable(edge), "5×5 不该触发识别");
+        let dot = ub::Bounds::new(BoundsPoint::new(10.0, 10.0), BoundsPoint::new(10.0, 10.0));
+        assert!(!ocr_rect_usable(dot), "零面积（误点）不该触发识别");
+        let thin = ub::Bounds::new(BoundsPoint::new(10.0, 10.0), BoundsPoint::new(400.0, 13.0));
+        assert!(!ocr_rect_usable(thin), "细长条不该触发识别");
+    }
+
+    /// 没有选区时 UI 区域是空矩形：此时不该有任何"禁止点击"判定生效。
+    #[test]
+    fn ui_zone_is_empty_without_selection() {
+        let screen = ub::Bounds::new(BoundsPoint::new(0.0, 0.0), BoundsPoint::new(800.0, 600.0));
+        let z = ui_zone(None, screen, true);
+        assert_eq!(z.size.x, 0.0);
+        assert_eq!(z.size.y, 0.0);
+        assert!(!z.contains(BoundsPoint::new(400.0, 300.0)));
+    }
 
     /// 手柄样式必须落在正确的位置上：上下边才是横胶囊、左右边才是竖胶囊、四角
     /// 必须是圆点。`handle_positions()` 的顺序一旦变化，这里先炸——而不是等用户

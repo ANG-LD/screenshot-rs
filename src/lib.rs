@@ -12,6 +12,7 @@ pub mod hotkey;
 pub mod ocr;
 pub mod overlay;
 pub mod scroll;
+pub mod translate;
 pub mod tray;
 pub mod update;
 pub mod utils;

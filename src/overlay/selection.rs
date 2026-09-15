@@ -150,6 +150,12 @@ impl SelectionState {
     /// 获取当前选区（已归一化）
     ///
     /// 返回 Option 是因为可能尚未创建任何选区。
+    /// 当前是否正在拖拽选区（Creating / Moving / Resizing 都算）。
+    /// 光标坐标徽章据此决定要不要附带显示「宽 × 高」。
+    pub fn is_dragging(&self) -> bool {
+        !matches!(self.drag, DragState::Idle)
+    }
+
     pub fn current(&self) -> Option<Bounds> {
         self.bounds
     }

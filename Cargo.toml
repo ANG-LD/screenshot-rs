@@ -43,6 +43,9 @@ dirs = "6"
 # PaddleOCR（PP-OCRv6）本地推理：替换 tesseract CLI，中文准确率更高。
 # 依赖 oar-ocr 包装（内部为 ONNX Runtime；下方 target 条件依赖使默认构建带平台加速 EP）。
 oar-ocr = "0.9"
+# 翻译分词：解析 HuggingFace 的 tokenizer.json（Unigram + SentencePiece charsmap）。
+# 该 crate 本来就在依赖树里（oar-ocr-core → tokenizers），引进来不增加编译量。
+tokenizers = "0.23"
 # ort 运行时设备探测（与 oar-ocr 内部同一版本，避免两个 ORT 全局实例冲突；
 # 只用于检测 CUDA 设备，session 仍由 oar-ocr 创建）
 ort = "=2.0.0-rc.13"

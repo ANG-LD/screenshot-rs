@@ -41,6 +41,10 @@ pub mod icons {
     pub const TYPE: &str = "app-icons/type.svg";
     /// OCR 文字识别
     pub const SCAN_TEXT: &str = "app-icons/scan-text.svg";
+    /// 英译中（工具栏「翻译」按钮）
+    pub const TRANSLATE: &str = "app-icons/languages.svg";
+    /// 禁止（选区外点击无效时的角标）
+    pub const BAN: &str = "app-icons/ban.svg";
     /// 马赛克
     pub const GRID_2X2: &str = "app-icons/grid-2x2.svg";
     /// 取色器
@@ -98,6 +102,8 @@ icon_table! {
     icons::PENCIL => "pencil.svg",
     icons::TYPE => "type.svg",
     icons::SCAN_TEXT => "scan-text.svg",
+    icons::TRANSLATE => "languages.svg",
+    icons::BAN => "ban.svg",
     icons::GRID_2X2 => "grid-2x2.svg",
     icons::PIPETTE => "pipette.svg",
     icons::PIN => "pin.svg",
