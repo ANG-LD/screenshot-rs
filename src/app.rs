@@ -81,6 +81,15 @@ impl AppState {
             #[cfg(target_os = "linux")]
             pump_gtk_events_linux();
 
+            // 系统设置窗口改过热键 → 在这里换绑。窗口拿不到 HotkeyService
+            // （它归本结构体所有，且不在 GPUI 上下文里），只能走请求通道。
+            if let Some(spec) = crate::hotkey::take_rebind_request() {
+                match self.hotkey.rebind(&spec) {
+                    Ok(()) => tracing::info!("热键已换绑为 {spec}"),
+                    Err(e) => tracing::error!("热键换绑失败：{e}"),
+                }
+            }
+
             if let Some(event) = self.hotkey.try_recv() {
                 match event {
                     HotkeyEvent::TriggerScreenshot => {
@@ -106,9 +115,13 @@ impl AppState {
                         tracing::info!("托盘触发：退出");
                         return Ok(());
                     }
-                    TrayMenuEvent::OpenOcrModels => {
-                        tracing::info!("托盘触发：打开 OCR 模型管理窗口");
+                    TrayMenuEvent::OpenModels => {
+                        tracing::info!("托盘触发：打开模型管理窗口");
                         self.overlay.open_ocr_models();
+                    }
+                    TrayMenuEvent::OpenSettings => {
+                        tracing::info!("托盘触发：打开系统设置窗口");
+                        self.overlay.open_settings();
                     }
                 }
             }

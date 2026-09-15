@@ -11,7 +11,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub mod engine;
@@ -70,6 +70,148 @@ pub struct TranslateProgress {
 fn progress_cell() -> &'static Mutex<TranslateProgress> {
     static P: OnceLock<Mutex<TranslateProgress>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(TranslateProgress::default()))
+}
+
+// ---------------------------------------------------------------------------
+// 模型管理窗口用的状态快照 + 非阻塞下载
+// 形状刻意与 `ocr::paddle::{model_snapshot, start_download}` 保持一致，
+// 这样模型管理窗口里两栏（OCR / 翻译）能用同一套渲染逻辑。
+// ---------------------------------------------------------------------------
+
+/// 单个模型文件在磁盘上的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStatus {
+    /// 存在且体积与预期一致
+    Ready,
+    /// 不存在
+    Missing,
+    /// 存在但体积不符（上次下载被截断，或上游换了量化版本）
+    WrongSize,
+}
+
+/// 单个文件的快照。
+#[derive(Debug, Clone)]
+pub struct FileSnapshot {
+    /// 仓库内相对路径，同时用作界面显示名
+    pub name: &'static str,
+    /// 期望字节数
+    pub expected: u64,
+    /// 本地实际字节数（不存在为 None）
+    pub local_size: Option<u64>,
+    pub status: FileStatus,
+    /// 本地绝对路径
+    pub local_path: std::path::PathBuf,
+}
+
+/// 翻译模型的整体快照（模型管理窗口每次重绘拉一份）。
+#[derive(Debug, Clone)]
+pub struct ModelSnapshot {
+    pub cache_dir: std::path::PathBuf,
+    pub files: Vec<FileSnapshot>,
+    /// 全部文件就位
+    pub ready: bool,
+    /// 是否有下载在跑
+    pub downloading: bool,
+    /// 正在下载的文件（相对路径）
+    pub current_file: Option<String>,
+    /// (已下载字节, 总量)
+    pub progress: (u64, Option<u64>),
+    /// 上一次下载失败的原因
+    pub last_error: Option<String>,
+    /// 当前使用的下载源（界面显示"从哪下"）
+    pub base_url: String,
+    /// 总占用（就位文件的字节和）与总需求
+    pub bytes_on_disk: u64,
+    pub bytes_total: u64,
+}
+
+/// 是否有下载线程在跑。
+static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
+fn last_error_cell() -> &'static Mutex<Option<String>> {
+    static E: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(None))
+}
+
+/// 是否有翻译模型下载在进行中。
+pub fn is_downloading() -> bool {
+    DOWNLOADING.load(Ordering::SeqCst)
+}
+
+/// 收集模型快照（UI 线程用，非阻塞）。
+pub fn model_snapshot() -> ModelSnapshot {
+    let dir = model_dir();
+    let mut files = Vec::with_capacity(MODEL_FILES.len());
+    let (mut on_disk, mut total) = (0u64, 0u64);
+    for (rel, expected) in MODEL_FILES {
+        let path = dir.join(rel);
+        let local_size = std::fs::metadata(&path).ok().map(|md| md.len());
+        let status = match local_size {
+            Some(n) if n == expected => FileStatus::Ready,
+            Some(_) => FileStatus::WrongSize,
+            None => FileStatus::Missing,
+        };
+        if status == FileStatus::Ready {
+            on_disk += expected;
+        }
+        total += expected;
+        files.push(FileSnapshot {
+            name: rel,
+            expected,
+            local_size,
+            status,
+            local_path: path,
+        });
+    }
+    let ready = files.iter().all(|f| f.status == FileStatus::Ready);
+    let p = progress();
+    let last_error = last_error_cell().lock().ok().and_then(|g| g.clone());
+    ModelSnapshot {
+        cache_dir: dir,
+        files,
+        ready,
+        downloading: is_downloading(),
+        current_file: (!p.file.is_empty()).then(|| p.file.clone()),
+        progress: (p.downloaded, p.total),
+        last_error,
+        base_url: base_urls().into_iter().next().unwrap_or_default(),
+        bytes_on_disk: on_disk,
+        bytes_total: total,
+    }
+}
+
+/// 启动后台下载（非阻塞），供模型管理窗口的「下载」按钮调用。
+///
+/// 返回 `false` 表示已经有一个下载在跑（不重复起线程——两个线程写同一批
+/// `.part` 文件会互相覆盖）。
+pub fn start_download() -> bool {
+    if DOWNLOADING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    if let Ok(mut g) = last_error_cell().lock() {
+        *g = None;
+    }
+    // 进度清零：否则界面会先显示上一次下载的残留数字，看着像"已经在下了"
+    if let Ok(mut g) = progress_cell().lock() {
+        *g = TranslateProgress::default();
+    }
+    std::thread::spawn(move || {
+        let dir = model_dir();
+        tracing::info!("翻译: 开始下载模型 → {}", dir.display());
+        let result = ensure_models(&dir);
+        if let Err(e) = &result {
+            tracing::error!("翻译: 模型下载失败: {e}");
+            if let Ok(mut g) = last_error_cell().lock() {
+                *g = Some(e.clone());
+            }
+        }
+        if let Ok(mut g) = progress_cell().lock() {
+            g.done = result.is_ok();
+        }
+        DOWNLOADING.store(false, Ordering::SeqCst);
+        tracing::info!("翻译: 下载线程结束（成功={}）", result.is_ok());
+    });
+    true
 }
 
 /// 读取当前下载进度（UI 线程用，非阻塞）。
@@ -264,6 +406,33 @@ pub fn model_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 快照必须自洽：模型管理窗口直接拿这些数字画界面（文件行数、总占用、
+    /// "就绪/未就绪"），一旦口径不一致，界面会显示自相矛盾的状态。
+    #[test]
+    fn model_snapshot_is_self_consistent() {
+        let snap = model_snapshot();
+        assert_eq!(snap.files.len(), MODEL_FILES.len());
+        assert_eq!(
+            snap.bytes_total,
+            MODEL_FILES.iter().map(|(_, n)| *n).sum::<u64>(),
+            "总需求应等于各文件期望值之和"
+        );
+        assert_eq!(
+            snap.ready,
+            snap.files.iter().all(|f| f.status == FileStatus::Ready),
+            "ready 必须等价于全部文件就绪"
+        );
+        for f in &snap.files {
+            match f.local_size {
+                Some(n) if n == f.expected => assert_eq!(f.status, FileStatus::Ready),
+                Some(_) => assert_eq!(f.status, FileStatus::WrongSize),
+                None => assert_eq!(f.status, FileStatus::Missing),
+            }
+            assert!(f.local_path.ends_with(f.name), "{:?}", f.local_path);
+            assert!(f.expected > 0);
+        }
+    }
 
     #[test]
     fn base_url_list_prefers_hf_and_includes_mirror() {

@@ -14,6 +14,7 @@
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::{AppError, AppResult};
 
@@ -155,17 +156,19 @@ static FUNC_KEYS: [Code; 24] = [
 /// 2. 启动后台监听线程，把底层事件转换为 `HotkeyEvent` 后通过 mpsc 发出；
 /// 3. 提供 `try_recv()` / `recv()` 让上层主动轮询或阻塞等待事件。
 pub struct HotkeyService {
-    /// 全局热键管理器（保留字段，未来可用于注销/重新注册）
-    #[allow(dead_code)]
+    /// 全局热键管理器。换绑（设置窗口改热键）时要拿它注销旧键、注册新键。
     manager: GlobalHotKeyManager,
     /// 监听线程 → 业务侧的事件通道发送端（保留字段，便于将来扩展）
     #[allow(dead_code)]
     event_tx: Sender<HotkeyEvent>,
     /// 业务侧接收热键事件的通道接收端
     event_rx: Receiver<HotkeyEvent>,
-    /// 当前注册的截图热键 ID（保留字段，便于将来注销/重新注册）
-    #[allow(dead_code)]
-    screenshot_id: u32,
+    /// 当前注册的截图热键本体。注销时要按值传回给管理器，所以必须留着它，
+    /// 只存 id 是注销不掉的。
+    ///
+    /// 用 `Cell` 是为了让 `rebind` 能拿 `&self`：主循环里 `App::run` 拿的是 `&self`，
+    /// 而 global-hotkey 的 register/unregister 本身也只要 `&self`——只有这个字段需要写。
+    screenshot_hotkey: std::cell::Cell<HotKey>,
 }
 
 impl HotkeyService {
@@ -234,7 +237,7 @@ impl HotkeyService {
             manager,
             event_tx,
             event_rx,
-            screenshot_id,
+            screenshot_hotkey: std::cell::Cell::new(hotkey),
         })
     }
 
@@ -242,6 +245,36 @@ impl HotkeyService {
     ///
     /// 若通道里有事件则返回 `Some(HotkeyEvent)`；否则返回 `None`。
     /// 适合在主循环里轮询使用。
+    /// 换绑截图热键：注销旧的、注册新的。
+    ///
+    /// 注册失败时**把旧键装回去**：否则用户手滑写错一个字符串就彻底失去截图热键
+    /// （只能重启应用去读配置里那个已经写坏的值）。
+    pub fn rebind(&self, spec: &str) -> Result<(), String> {
+        let new = parse_hotkey(spec)?;
+        let old = self.screenshot_hotkey.get();
+        if new == old {
+            return Ok(());
+        }
+        self.manager
+            .unregister(old)
+            .map_err(|e| format!("注销旧热键失败：{e}"))?;
+        match self.manager.register(new) {
+            Ok(()) => {
+                self.screenshot_hotkey.set(new);
+                tracing::info!("已换绑全局热键：{spec}（hotkey id = {}）", new.id());
+                Ok(())
+            }
+            Err(e) => {
+                let restored = self.manager.register(old).is_ok();
+                Err(if restored {
+                    format!("注册新热键 {spec} 失败（已恢复原热键）：{e}")
+                } else {
+                    format!("注册新热键 {spec} 失败，且原热键也恢复失败：{e}")
+                })
+            }
+        }
+    }
+
     pub fn try_recv(&self) -> Option<HotkeyEvent> {
         self.event_rx.try_recv().ok()
     }
@@ -289,4 +322,28 @@ mod tests {
         assert!(parse_hotkey("").unwrap_err().contains("空"));
         assert!(parse_hotkey("f25").is_err()); // 超出 f1-f24
     }
+}
+
+/// 「换绑热键」请求通道。
+///
+/// 设置窗口只拿得到 `&mut App`，拿不到 `HotkeyService`（它归主应用所有、又不在 GPUI
+/// 上下文里），所以用一条通道把请求交给主循环轮询处理——和托盘事件同一套路子。
+fn rebind_channel() -> &'static Mutex<(Sender<String>, Receiver<String>)> {
+    static C: OnceLock<Mutex<(Sender<String>, Receiver<String>)>> = OnceLock::new();
+    C.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Mutex::new((tx, rx))
+    })
+}
+
+/// 请求换绑截图热键（持久化由调用方负责，这里只管让运行中的服务换绑）。
+pub fn request_rebind(spec: String) {
+    if let Ok(g) = rebind_channel().lock() {
+        let _ = g.0.send(spec);
+    }
+}
+
+/// 主循环轮询：有没有待处理的换绑请求。
+pub fn take_rebind_request() -> Option<String> {
+    rebind_channel().lock().ok()?.1.try_recv().ok()
 }

@@ -223,6 +223,60 @@ pub fn persist_model_tier(tier: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 把 `hotkey.screenshot` 持久化写入配置文件（文本级修改，保留注释与排版），
+/// 供「系统设置」窗口改热键时调用。
+///
+/// 写完**不会自动生效**：还要让运行中的热键服务重新注册（见
+/// `hotkey::request_rebind`），否则用户改了要等重启才生效。
+pub fn persist_hotkey_screenshot(spec: &str) -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Err("找不到配置文件路径".into());
+    };
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取配置文件失败: {e}"))?;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    // 删掉已有的 screenshot 行（模板里那行注释保留，作为写法说明）
+    lines.retain(|l| !l.trim_start().starts_with("screenshot"));
+
+    // 插入点：[hotkey] 段内最后一条非空行的下一行——注释也算内容，
+    // 新行会落在注释之后，读起来仍是"说明在前、取值在后"。
+    let mut in_hotkey = false;
+    let mut last_line: Option<usize> = None;
+    let mut header: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with('[') && t.ends_with(']') {
+            in_hotkey = t == "[hotkey]";
+            if in_hotkey && header.is_none() {
+                header = Some(i);
+            }
+        } else if in_hotkey && !t.is_empty() {
+            last_line = Some(i);
+        }
+    }
+
+    match (last_line, header) {
+        (Some(i), _) => lines.insert(i + 1, format!("screenshot = \"{spec}\"")),
+        (None, Some(i)) => lines.insert(i + 1, format!("screenshot = \"{spec}\"")),
+        // 老配置文件没有 [hotkey] 段：必须连段头一起补，否则这行会落到上一个段里，
+        // 读取时被当成别的段的键，用户改了等于没改。
+        (None, None) => {
+            lines.push(String::new());
+            lines.push("[hotkey]".to_string());
+            lines.push(format!("screenshot = \"{spec}\""));
+        }
+    }
+
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| format!("写入配置文件失败: {e}"))?;
+    tracing::info!("已持久化截图热键 {spec} → {}", path.display());
+    Ok(())
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -262,6 +316,58 @@ mod tests {
     }
 
     /// `[hotkey]` 段：值缺失/为空白时回落默认 alt+s（配置模板里默认是注释掉的）。
+    /// 热键持久化：写进已有段、重复写是替换不是追加、老配置缺段时补段头。
+    ///
+    /// 第三点最容易出错：直接往文件末尾追加 `screenshot = ...` 会落进**上一个段**，
+    /// 读取时被当成那个段的键——用户改了等于没改。
+    #[test]
+    fn persist_hotkey_writes_into_section_without_duplicating() {
+        let dir = std::env::temp_dir().join(format!("srs-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1) 段已存在（含模板注释行）
+        let p1 = dir.join("with_section.toml");
+        std::fs::write(
+            &p1,
+            "[hotkey]\n# screenshot = \"alt+s\"\n\n[ocr]\nmodel_tier = \"small\"\n",
+        )
+        .unwrap();
+        std::env::set_var("SCREENSHOT_RS_CONFIG", &p1);
+        persist_hotkey_screenshot("ctrl+shift+a").unwrap();
+        let t1 = std::fs::read_to_string(&p1).unwrap();
+        assert!(t1.contains("screenshot = \"ctrl+shift+a\""), "{t1}");
+        assert!(
+            t1.contains("[ocr]") && t1.contains("model_tier"),
+            "不能破坏其他段: {t1}"
+        );
+
+        // 2) 再写一次：替换而不是追加
+        persist_hotkey_screenshot("alt+q").unwrap();
+        let t2 = std::fs::read_to_string(&p1).unwrap();
+        // 只数真正的键行：模板里那行注释 `# screenshot = "alt+s"` 也含同样的子串
+        let keys = t2
+            .lines()
+            .filter(|l| l.trim_start().starts_with("screenshot ="))
+            .count();
+        assert_eq!(keys, 1, "键被重复写入: {t2}");
+        assert!(t2.contains("alt+q"), "{t2}");
+        assert!(!t2.contains("ctrl+shift+a"), "{t2}");
+
+        // 3) 老配置没有 [hotkey] 段 → 必须连段头一起补
+        let p2 = dir.join("no_section.toml");
+        std::fs::write(&p2, "[ocr]\nmodel_tier = \"small\"\n").unwrap();
+        std::env::set_var("SCREENSHOT_RS_CONFIG", &p2);
+        persist_hotkey_screenshot("super+f1").unwrap();
+        let t3 = std::fs::read_to_string(&p2).unwrap();
+        assert!(
+            t3.contains("[hotkey]") && t3.contains("super+f1"),
+            "缺段时要补段头: {t3}"
+        );
+
+        std::env::remove_var("SCREENSHOT_RS_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn hotkey_section_defaults_and_reads_value() {
         let none = parse_config("").unwrap();

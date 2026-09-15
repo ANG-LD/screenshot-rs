@@ -1228,6 +1228,118 @@ fn toolbar_width_estimate() -> f32 {
     w + 4.0
 }
 
+
+// ---------------------------------------------------------------------------
+// 辅助窗口的共用视觉组件
+//
+// 模型窗口与系统设置窗口都长在辅助窗口里，样式必须一致——所以卡片、区块头、
+// 状态胶囊这三样抽成共用函数，而不是各写一份相近但不相同的 div 树。
+// 颜色一律走 ui_theme 的 token，禁止在这里写死色值。
+// ---------------------------------------------------------------------------
+
+/// 区块卡片：深色底 + 细描边 + 统一内边距与圆角。
+fn window_card() -> gpui::Div {
+    div()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .rounded_md()
+        .border_1()
+        .border_color(theme::c::rgb(theme::tokens::PANEL_BORDER))
+        .bg(theme::c::rgb(theme::tokens::POPOVER_BG))
+}
+
+/// 窗口标题区：主标题 + 说明，下方紧跟一条分隔线。
+fn window_header(title: &str, subtitle: &str) -> impl IntoElement {
+    use theme::tokens as t;
+    div()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .text_base()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::c::rgb(t::TEXT))
+                .child(gpui::SharedString::from(title.to_string())),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::c::rgb(t::SECTION_LABEL))
+                .child(gpui::SharedString::from(subtitle.to_string())),
+        )
+        .child(div().h(px(1.0)).w_full().bg(theme::c::rgb(t::DIVIDER)))
+}
+
+/// 区块头：左边标题 + 说明，右边放按钮（没有按钮时传空 div）。
+fn section_header(title: &str, subtitle: &str, right: impl IntoElement) -> impl IntoElement {
+    use theme::tokens as t;
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::c::rgb(t::TEXT))
+                        .child(gpui::SharedString::from(title.to_string())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::c::rgb(t::SECTION_LABEL))
+                        .child(gpui::SharedString::from(subtitle.to_string())),
+                ),
+        )
+        .child(right)
+}
+
+/// 状态胶囊：同色系柔和底 + 彩色文字。整屏都是纯色文字会显得很"生"，
+/// 胶囊把"状态"从正文里拎出来。
+fn status_chip(text: String, color: u32, soft_bg: u32) -> impl IntoElement {
+    div()
+        .px(px(7.0))
+        .py(px(2.0))
+        .rounded_sm()
+        .bg(gpui::rgba(soft_bg))
+        .text_xs()
+        .text_color(gpui::rgba(color))
+        .child(gpui::SharedString::from(text))
+}
+
+/// 只取文件名，去掉目录前缀。
+///
+/// 翻译模型的清单里写的是 `onnx/encoder_model_int8.onnx` 这种相对路径（下载时要拼 URL），
+/// 但界面要跟 OCR 模型那几行一致——**只显示文件名**，别把路径当内容显示出来。
+fn file_basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// 把热键写法拆成键帽序列（"ctrl+shift+a" → ["Ctrl", "Shift", "A"]）。
+///
+/// 只做展示美化用：大小写与别名都按用户能认出来的写法给。
+fn hotkey_caps(spec: &str) -> Vec<String> {
+    spec.split('+')
+        .map(|p| {
+            let p = p.trim();
+            match p.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => "Ctrl".to_string(),
+                "alt" | "option" => "Alt".to_string(),
+                "shift" => "Shift".to_string(),
+                "super" | "cmd" | "win" | "meta" => "Super".to_string(),
+                other => other.to_uppercase(),
+            }
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 /// 「UI 区域」：工具栏本体，外加（二级弹层展开时）弹层所占的那片区域。
 ///
 /// 用途只有一个——判断指针是不是落在 UI 上。工具栏会被 `compute_toolbar_bounds`
@@ -5348,8 +5460,10 @@ enum OverlayCommand {
     },
     /// 在同一个 GPUI 应用里打开 Pin 窗口
     OpenPin(PinPayload),
-    /// 打开 OCR 模型管理窗口（查看模型状态 / 重新下载 / 进度）
+    /// 打开模型管理窗口（OCR 档位 + 翻译模型：状态 / 下载 / 进度）
     OpenOcrModels,
+    /// 打开系统设置窗口（热键查看与替换 / 版本 / 检查更新）
+    OpenSettings,
     /// 打开/重用 OCR 识别窗口（左图右文，类似微信文字识别）：左侧选区图 + 右侧结果区
     OpenResultPin {
         payload: PinPayload,
@@ -5434,9 +5548,14 @@ impl OverlayService {
         let _ = self.cmd.send(OverlayCommand::OpenPin(payload));
     }
 
-    /// 打开 OCR 模型管理窗口（fire-and-forget）。
+    /// 打开模型管理窗口（fire-and-forget）。
     pub fn open_ocr_models(&self) {
         let _ = self.cmd.send(OverlayCommand::OpenOcrModels);
+    }
+
+    /// 打开系统设置窗口（fire-and-forget）。
+    pub fn open_settings(&self) {
+        let _ = self.cmd.send(OverlayCommand::OpenSettings);
     }
 
     /// 启动时检查到新版本：弹「发现新版本」提示窗，让用户确认是否下载更新。
@@ -5568,6 +5687,8 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 // 翻译结果窗（与 OCR 结果窗互不干扰，各自只保留一个）
                 let mut trans_pin: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
+                // 系统设置窗口（同一时刻只保留一个）
+                let mut settings_window: Option<WindowHandle<gpui_component::Root>> = None;
                 let mut update_prompt: Option<WindowHandle<gpui_component::Root>> = None;
                 // UI 视觉调试：SCREENSHOT_RS_UI_PROBE=pin|progress|ocr|update 时，
                 // 应用一起来就把对应的独立窗口摆出来，方便用截图脚本核对样式
@@ -5638,6 +5759,24 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                 match async_cx.update(open_ocr_models_in_app) {
                                     Ok(h) => ocr_models = Some(h),
                                     Err(e) => tracing::error!("[overlay] 打开 OCR 模型窗口失败: {e}"),
+                                }
+                            }
+                        }
+                        Ok(OverlayCommand::OpenSettings) => {
+                            // 系统设置窗口同样只留一个：已存在就聚焦，不重复开
+                            let alive = if let Some(h) = &settings_window {
+                                h.update(async_cx, |_, window, _| {
+                                    window.activate_window();
+                                    true
+                                })
+                                .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            if !alive {
+                                match async_cx.update(open_settings_in_app) {
+                                    Ok(h) => settings_window = Some(h),
+                                    Err(e) => tracing::error!("[overlay] 打开系统设置窗口失败: {e}"),
                                 }
                             }
                         }
@@ -7054,13 +7193,14 @@ impl Render for OcrModelsView {
             div()
                 .flex_col()
                 .gap(px(6.0))
-                .p(px(10.0))
+                .p(px(12.0))
                 .rounded_md()
                 .border_1()
+                .bg(theme::c::rgb(t::POPOVER_BG))
                 .border_color(if selected {
                     theme::c::rgb(t::ACCENT)
                 } else {
-                    theme::c::rgb(t::DIVIDER)
+                    theme::c::rgb(t::PANEL_BORDER)
                 })
                 // 档位头：名称 + 说明在前，激活 / 重新下载按钮都在行尾
                 .child(
@@ -7179,6 +7319,249 @@ impl Render for OcrModelsView {
                 .child(div().flex_col().gap(px(4.0)).children(file_rows))
         });
 
+        // ---- 翻译模型区块（英译中，opus-mt-en-zh 量化版，约 110MB）----
+        // 与上面 OCR 档位区块同一套视觉：卡片 + 标题行（右侧按钮）+ 文件行 + 进度/结果。
+        let t_snap = crate::translate::model_snapshot();
+        let t_downloading = t_snap.downloading;
+        let t_ready = t_snap.ready;
+        let t_current_file = t_snap.current_file.clone();
+        let (t_done, t_total) = t_snap.progress;
+        let t_pct = t_total
+            .filter(|t| *t > 0)
+            .map(|t| (t_done as f64 / t as f64 * 100.0).min(100.0));
+        let t_mb = |b: u64| format!("{:.1} MB", b as f64 / 1048576.0);
+        let t_rows = t_snap.files.iter().map(|f| {
+            // (状态文字, 颜色)：文字统一用 String，避免各分支类型不一致
+            let (mark, color): (String, _) =
+                if t_downloading && t_current_file.as_deref() == Some(f.name) {
+                    ("下载中…".to_string(), theme::c::rgb(t::ACCENT))
+                } else {
+                    match f.status {
+                        crate::translate::FileStatus::Ready => {
+                            ("✓ 已存在".to_string(), theme::c::rgb(t::SUCCESS))
+                        }
+                        crate::translate::FileStatus::Missing => {
+                            ("未下载".to_string(), theme::c::rgb(t::TEXT_MUTED))
+                        }
+                        // 只报"体积不符"用户没法判断是下坏了还是版本变了，附上实际大小
+                        crate::translate::FileStatus::WrongSize => (
+                            match f.local_size {
+                                Some(n) => format!("体积不符（本地 {}）", t_mb(n)),
+                                None => "体积不符".to_string(),
+                            },
+                            theme::c::rgb(t::DANGER),
+                        ),
+                    }
+                };
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .text_xs()
+                        .text_color(theme::c::rgb(t::TEXT))
+                        .child(gpui::SharedString::from(file_basename(f.name).to_string())),
+                )
+                // 体积列与 OCR 行保持一致：只给期望体积。
+                // 本地体积只在"体积不符"这个异常状态里补出来，正常情况不占地方。
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::c::rgb(t::TEXT_MUTED))
+                        .child(gpui::SharedString::from(t_mb(f.expected))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(color)
+                        .child(gpui::SharedString::from(mark.clone())),
+                )
+        });
+        // 远程下载链接：与 OCR 档位卡片里的 url 同一性质。
+        // 只给"还没就绪"的文件列完整链接——全都下好了就没有可操作的东西，
+        // 那时只留上面的仓库地址一行，别把界面塞满五个长 URL。
+        let t_links: Vec<gpui::AnyElement> = t_snap
+            .files
+            .iter()
+            .filter(|f| f.status != crate::translate::FileStatus::Ready)
+            .map(|f| {
+                div()
+                    .text_xs()
+                    .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.7))
+                    .child(gpui::SharedString::from(format!(
+                        "远程链接：{}/{}",
+                        t_snap.base_url, f.name
+                    )))
+                    .into_any_element()
+            })
+            .collect();
+
+        let translate_block = window_card()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme::c::rgb(t::TEXT))
+                                    .child("翻译模型（英译中）"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::c::rgb(t::SECTION_LABEL))
+                                    .child(gpui::SharedString::from(format!(
+                                        "离线推理，不联网；已就位 {}/{} 个文件{}",
+                                        t_snap
+                                            .files
+                                            .iter()
+                                            .filter(|f| {
+                                                f.status == crate::translate::FileStatus::Ready
+                                            })
+                                            .count(),
+                                        t_snap.files.len(),
+                                        if t_ready { "（就绪）" } else { "" },
+                                    ))),
+                            ),
+                    )
+                    .child(
+                        Button::new("dl-translate")
+                            .label(if t_downloading {
+                                "下载中…"
+                            } else if t_ready {
+                                "重新下载"
+                            } else {
+                                "下载"
+                            })
+                            .with_variant(if t_downloading {
+                                ButtonVariant::Default
+                            } else {
+                                ButtonVariant::Info
+                            })
+                            .with_size(gpui_component::Size::XSmall)
+                            .disabled(t_downloading)
+                            .on_click({
+                                let weak = self.weak.clone();
+                                move |_, _, app| {
+                                    let Some(entity) = weak.upgrade() else { return };
+                                    entity.update(app, |this, cx| {
+                                        // start_download 返回 false = 已有下载在跑，
+                                        // 不重复起线程（两个线程会互相覆盖 .part 文件）
+                                        if crate::translate::start_download() {
+                                            this.activation_error = None;
+                                            tracing::info!("翻译: 开始在后台下载模型");
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    ),
+            )
+            .child(div().h(px(1.0)).w_full().bg(theme::c::rgb(t::DIVIDER)))
+            .children(t_rows)
+            // 本地保存路径：与 OCR 档位卡片里的 path_text 同一性质——
+            // 文件名只给名字，路径单独一行，用户才知道东西存哪了。
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.7))
+                    .child(gpui::SharedString::from(if t_ready {
+                        format!("本地路径：{}", t_snap.cache_dir.display())
+                    } else {
+                        // 没下全时把"会存到哪"也说清楚，方便用户自己去看/清理
+                        format!(
+                            "本地路径：{}（尚未下载完整）",
+                            t_snap.cache_dir.display()
+                        )
+                    })),
+            )
+            // 远程仓库地址（下载源）：所有文件都在它下面，换镜像也就换这一行
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.7))
+                    .child(gpui::SharedString::from(format!(
+                        "远程地址：{}",
+                        t_snap.base_url
+                    ))),
+            )
+            .children(t_links)
+            .child(if t_downloading {
+                let pct_text = match (t_done, t_total) {
+                    (d, Some(t)) if t > 0 => format!(
+                        "{:.0}%  {:.1}/{:.1} MB",
+                        t_pct.unwrap_or(0.0),
+                        d as f64 / 1048576.0,
+                        t as f64 / 1048576.0
+                    ),
+                    (d, _) => format!("{:.1} MB", d as f64 / 1048576.0),
+                };
+                div()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_color(theme::c::rgb(t::ACCENT))
+                            .text_sm()
+                            .child(gpui::SharedString::from(format!("正在下载：{pct_text}"))),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(theme::c::rgb(t::PROGRESS_TRACK))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(px(0.0))
+                                    .h_full()
+                                    .rounded_full()
+                                    .w(relative(
+                                        (t_pct.unwrap_or(0.0) as f32 / 100.0).clamp(0.0, 1.0),
+                                    ))
+                                    .bg(theme::c::rgb(t::ACCENT)),
+                            ),
+                    )
+            } else {
+                div().child(match (&t_snap.last_error, t_ready) {
+                    (Some(e), _) => status_chip(
+                        format!("下载失败：{e}"),
+                        t::DANGER,
+                        t::DANGER_SOFT,
+                    )
+                    .into_any_element(),
+                    (None, true) => status_chip(
+                        "✓ 已就绪，可直接用「翻译」工具".to_string(),
+                        t::SUCCESS,
+                        0x2BB6732E,
+                    )
+                    .into_any_element(),
+                    (None, false) => div()
+                        .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.85))
+                        .text_xs()
+                        .child(gpui::SharedString::from(format!(
+                            "点右侧「下载」获取（约 {:.0} MB），也可在首次使用翻译时自动下载",
+                            t_snap.bytes_total as f64 / 1048576.0
+                        )))
+                        .into_any_element(),
+                })
+            });
+
         div()
             .id("ocr-models")
             .size_full()
@@ -7195,16 +7578,28 @@ impl Render for OcrModelsView {
                     .flex_col()
                     .gap(px(10.0))
                     .p(px(12.0))
-                    // 缓存目录说明
+                    // 标题区
+                    .child(window_header(
+                        "模型管理",
+                        "OCR 识别与英译中翻译所需的本地模型；全部离线运行，下载一次即可",
+                    ))
+                    // 缓存目录（脚注性质：平时不用看，出问题时才有用）
                     .child(
                         div()
-                            .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.8))
+                            .text_color(theme::c::rgb(t::TEXT_MUTED).opacity(0.7))
                             .text_xs()
                             .child(gpui::SharedString::from(format!(
                                 "缓存目录：{cache_dir}"
                             ))),
                     )
+                    .child(section_header(
+                        "OCR 识别模型",
+                        "档位越高越准、体积也越大；标「内置」的随应用一起分发，无需下载",
+                        div(),
+                    ))
                     .children(tier_blocks)
+                    // 翻译模型：与 OCR 档位并列的第二块
+                    .child(translate_block)
                     // 下载进度 / 最近结果
                     // 激活失败提示（模型文件不齐全时显示）
                     .child(if let Some((t, msg)) = &self.activation_error {
@@ -7294,6 +7689,345 @@ impl Render for OcrModelsView {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 系统设置窗口：热键（查看 / 替换）、版本、检查更新
+// ---------------------------------------------------------------------------
+
+/// 系统设置视图。
+///
+/// 热键替换是真生效的：写入 config.toml（保留注释排版）后通过
+/// `hotkey::request_rebind` 请主循环换绑运行中的热键服务，不用重启。
+pub struct SettingsView {
+    focus_handle: FocusHandle,
+    /// 自身弱引用：按钮回调（只拿 &mut App）用它更新视图并触发重绘
+    weak: WeakEntity<Self>,
+    /// 热键输入框（InputState 自带 IME 支持）
+    hotkey_input: Entity<gpui_component::input::InputState>,
+    /// 上次保存热键的结果：Ok=提示语，Err=失败原因
+    hotkey_status: Option<Result<String, String>>,
+}
+
+impl SettingsView {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let current = crate::config::hotkey_screenshot();
+        let hotkey_input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(crate::config::DEFAULT_HOTKEY_SCREENSHOT)
+                .default_value(current)
+        });
+        Self {
+            focus_handle: cx.focus_handle(),
+            weak: cx.entity().downgrade(),
+            hotkey_input,
+            hotkey_status: None,
+        }
+    }
+
+    /// 保存热键输入框里的值：校验 → 写配置 → 请主循环换绑。
+    fn save_hotkey(&mut self, cx: &mut Context<Self>) {
+        let spec = self.hotkey_input.read(cx).value().to_string();
+        let spec = spec.trim().to_string();
+        if spec.is_empty() {
+            self.hotkey_status = Some(Err("热键不能为空".into()));
+            cx.notify();
+            return;
+        }
+        // 先校验再落盘：写坏了重启后仍会被回退到默认键，但用户会以为"改了没用"
+        if let Err(e) = crate::hotkey::parse_hotkey(&spec) {
+            self.hotkey_status = Some(Err(format!("格式不对：{e}")));
+            cx.notify();
+            return;
+        }
+        match crate::config::persist_hotkey_screenshot(&spec) {
+            Ok(()) => {
+                crate::hotkey::request_rebind(spec.clone());
+                self.hotkey_status = Some(Ok(format!("已保存，热键已换绑为 {spec}")));
+            }
+            Err(e) => self.hotkey_status = Some(Err(e)),
+        }
+        cx.notify();
+    }
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        use theme::tokens as t;
+        let current_version = crate::update::CURRENT_VERSION;
+        let check = crate::update::check_state();
+
+        let status_row = |res: &Option<Result<String, String>>| match res {
+            None => div().into_any_element(),
+            Some(Ok(msg)) => div()
+                .text_xs()
+                .text_color(theme::c::rgb(t::SUCCESS))
+                .child(gpui::SharedString::from(msg.clone()))
+                .into_any_element(),
+            Some(Err(e)) => div()
+                .text_xs()
+                .text_color(theme::c::rgb(t::DANGER))
+                .child(gpui::SharedString::from(format!("失败：{e}")))
+                .into_any_element(),
+        };
+
+        div()
+            .id("settings")
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .p(px(14.0))
+            .bg(theme::c::rgb(t::PANEL_BG))
+            .text_color(theme::c::rgb(t::TEXT))
+            .track_focus(&self.focus_handle)
+            // ---------- 标题区 ----------
+            .child(window_header(
+                "设置",
+                "截图热键与版本更新；改完立即生效，不用重启",
+            ))
+            // ---------- 热键 ----------
+            .child(
+                window_card()
+                    .child(section_header(
+                        "截图热键",
+                        "写法：修饰键 + 键，如 alt+s、ctrl+shift+a（支持 ctrl / alt / shift / super）",
+                        div(),
+                    ))
+                    // 当前生效的键，用键帽形状展示——比一行纯文本好认得多
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .children(hotkey_caps(&crate::config::hotkey_screenshot()).into_iter().enumerate().flat_map(
+                                |(i, cap)| {
+                                    let mut v: Vec<gpui::AnyElement> = Vec::new();
+                                    if i > 0 {
+                                        v.push(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::c::rgb(t::TEXT_MUTED))
+                                                .child("+")
+                                                .into_any_element(),
+                                        );
+                                    }
+                                    v.push(
+                                        div()
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(theme::c::rgb(t::PANEL_BORDER))
+                                            .bg(theme::c::rgb(t::BTN_BG))
+                                            .text_xs()
+                                            .text_color(theme::c::rgb(t::TEXT))
+                                            .child(gpui::SharedString::from(cap))
+                                            .into_any_element(),
+                                    );
+                                    v
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::c::rgb(t::TEXT_MUTED))
+                                    .child("← 当前生效"),
+                            ),
+                    )
+                    .child(
+                        gpui_component::input::Input::new(&self.hotkey_input).w_full(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("save-hotkey")
+                                    .label("保存并生效")
+                                    .with_variant(ButtonVariant::Info)
+                                    .with_size(gpui_component::Size::Small)
+                                    .on_click({
+                                        let weak = self.weak.clone();
+                                        move |_, _, app| {
+                                            let Some(entity) = weak.upgrade() else { return };
+                                            entity.update(app, |this, cx| this.save_hotkey(cx));
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("reset-hotkey")
+                                    .label("恢复默认")
+                                    .with_size(gpui_component::Size::Small)
+                                    .on_click({
+                                        let weak = self.weak.clone();
+                                        move |_, window, app| {
+                                            let Some(entity) = weak.upgrade() else { return };
+                                            entity.update(app, |this, cx| {
+                                                let def = crate::config::DEFAULT_HOTKEY_SCREENSHOT.to_string();
+                                                this.hotkey_input.update(cx, |input, cx| {
+                                                    input.set_value(def, window, cx);
+                                                });
+                                                this.save_hotkey(cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(status_row(&self.hotkey_status)),
+                    ),
+            )
+            // ---------- 版本与更新 ----------
+            .child(
+                window_card()
+                    .child(section_header(
+                        &format!("当前版本 v{current_version}"),
+                        "更新走 GitHub Release；发现新版本会弹确认窗，不会静默安装",
+                        div(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("check-update")
+                                    .label(if crate::update::is_checking() {
+                                        "检查中…"
+                                    } else {
+                                        "检查更新"
+                                    })
+                                    .with_variant(ButtonVariant::Info)
+                                    .with_size(gpui_component::Size::Small)
+                                    .disabled(crate::update::is_checking())
+                                    .on_click({
+                                        let weak = self.weak.clone();
+                                        move |_, _, app| {
+                                            let Some(entity) = weak.upgrade() else { return };
+                                            entity.update(app, |_this, cx| {
+                                                // start_check 返回 false = 已有检查在跑，不重复发请求
+                                                crate::update::start_check();
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(match &check {
+                                crate::update::CheckState::Idle => div()
+                                    .text_xs()
+                                    .text_color(theme::c::rgb(t::TEXT_MUTED))
+                                    .child("尚未检查")
+                                    .into_any_element(),
+                                crate::update::CheckState::Checking => div()
+                                    .text_xs()
+                                    .text_color(theme::c::rgb(t::ACCENT))
+                                    .child("正在检查…")
+                                    .into_any_element(),
+                                crate::update::CheckState::Done(Ok(None)) => status_chip(
+                                    format!("已是最新版本（v{current_version}）"),
+                                    t::SUCCESS,
+                                    0x2BB6732E,
+                                )
+                                .into_any_element(),
+                                crate::update::CheckState::Done(Ok(Some(v))) => div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::c::rgb(t::ACCENT))
+                                            .child(gpui::SharedString::from(format!(
+                                                "发现新版本 v{v}"
+                                            ))),
+                                    )
+                                    // 复用既有的「更新提示」窗口：那里负责下载与重启，
+                                    // 设置窗口不自己再实现一套更新流程。
+                                    .child({
+                                        let v = v.clone();
+                                        Button::new("go-update")
+                                            .label("更新")
+                                            .with_variant(ButtonVariant::Info)
+                                            .with_size(gpui_component::Size::XSmall)
+                                            .on_click(move |_, _, _| {
+                                                let _ = ensure_started().send(
+                                                    OverlayCommand::PromptUpdate {
+                                                        new_version: v.clone(),
+                                                    },
+                                                );
+                                            })
+                                    })
+                                    .into_any_element(),
+                                crate::update::CheckState::Done(Err(e)) => status_chip(
+                                    format!("检查失败：{e}"),
+                                    t::DANGER,
+                                    t::DANGER_SOFT,
+                                )
+                                .into_any_element(),
+                            }),
+                    ),
+            )
+    }
+}
+
+/// 在常驻应用里打开系统设置窗口（屏幕居中，fire-and-forget）。
+fn open_settings_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
+    let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
+        Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: Size::new(px(1280.0), px(800.0)),
+        }
+    });
+    let win_w = 560.0_f32;
+    let win_h = 420.0_f32;
+    let origin = point(
+        px(f32::from(display_bounds.origin.x) + (f32::from(display_bounds.size.width) - win_w) / 2.0),
+        px(f32::from(display_bounds.origin.y) + (f32::from(display_bounds.size.height) - win_h) / 2.0),
+    );
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin,
+                size: Size::new(px(win_w), px(win_h)),
+            })),
+            window_background: WindowBackgroundAppearance::Opaque,
+            titlebar: Some(TitlebarOptions {
+                title: Some("系统设置".into()),
+                appears_transparent: false,
+                ..Default::default()
+            }),
+            kind: WindowKind::Normal,
+            is_movable: true,
+            is_resizable: false,
+            is_minimizable: false,
+            focus: true,
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| SettingsView::new(window, cx));
+            // 检查更新是后台线程跑的，状态在全局；这里定时重绘把结果刷出来。
+            // 空转成本很低（每秒三次重绘一个静态界面），换来不用引入额外通道。
+            let weak = view.downgrade();
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(300))
+                        .await;
+                    let Some(entity) = weak.upgrade() else {
+                        break;
+                    };
+                    entity.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+            let handle = view.read(cx).focus_handle.clone();
+            handle.focus(window, cx);
+            // 包 Root：与其他辅助窗口一致（输入/选择控制器依赖 Root）
+            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+        },
+    )
+    .map_err(|e| AppError::Gpui(format!("打开系统设置窗口失败: {e}")))
+}
+
 /// 在常驻应用里打开 OCR 模型管理窗口（屏幕居中，fire-and-forget）。
 fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
@@ -7317,7 +8051,7 @@ fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component
             window_background: WindowBackgroundAppearance::Opaque,
             // 系统标题栏 + 系统关闭按钮（用户要求）
             titlebar: Some(TitlebarOptions {
-                title: Some("OCR 模型".into()),
+                title: Some("模型管理".into()),
                 appears_transparent: false,
                 ..Default::default()
             }),
@@ -7727,6 +8461,33 @@ fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i3
 
 #[cfg(test)]
 mod tests {
+
+    /// 只显示文件名：翻译模型清单里的 "onnx/xxx.onnx" 在界面上要跟 OCR 那几行一样
+    /// 只给文件名，别把目录前缀当内容显示出来。
+    #[test]
+    fn file_basename_strips_directory_prefix() {
+        assert_eq!(
+            super::file_basename("onnx/encoder_model_int8.onnx"),
+            "encoder_model_int8.onnx"
+        );
+        assert_eq!(super::file_basename("tokenizer.json"), "tokenizer.json");
+        assert_eq!(super::file_basename("a/b/c.onnx"), "c.onnx");
+        assert_eq!(super::file_basename(""), "");
+    }
+
+    /// 键帽展示：别名归一（control→Ctrl、cmd→Super）、按键序保留、去掉空段。
+    #[test]
+    fn hotkey_caps_normalizes_aliases() {
+        assert_eq!(super::hotkey_caps("alt+s"), vec!["Alt", "S"]);
+        assert_eq!(
+            super::hotkey_caps("control+SHIFT+a"),
+            vec!["Ctrl", "Shift", "A"]
+        );
+        assert_eq!(super::hotkey_caps("cmd+space"), vec!["Super", "SPACE"]);
+        // 空段（"alt++s"）不能变成空键帽
+        assert_eq!(super::hotkey_caps("alt++s"), vec!["Alt", "S"]);
+        assert!(super::hotkey_caps("").is_empty());
+    }
     use super::*;
 
     /// 「UI 区域」必须把工具栏本体盖住——工具栏被摆到选区外时（选区小/贴屏幕边），

@@ -52,6 +52,59 @@ fn is_newer(latest_tag: &str, current: &str) -> bool {
 /// - 有更新：返回 `Ok(Some(新版本号))`。
 /// - 无更新 / 已是最新：`Ok(None)`。
 /// - 网络 / 解析失败：`Err(原因)`（调用方应忽略，不阻塞启动）。
+/// 手动检查更新的状态（系统设置窗口轮询展示）。
+///
+/// 形状与 `translate::{model_snapshot, start_download}` 一致：检查在后台线程跑，
+/// 状态放全局，UI 只读不阻塞——检查要发 HTTP，放在 GPUI 前台会把界面冻住。
+#[derive(Debug, Clone, Default)]
+pub enum CheckState {
+    /// 还没检查过
+    #[default]
+    Idle,
+    /// 正在检查
+    Checking,
+    /// 检查完成：Ok(None)=已是最新，Ok(Some(v))=发现新版本，Err=失败原因
+    Done(Result<Option<String>, String>),
+}
+
+static CHECKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn check_cell() -> &'static std::sync::Mutex<CheckState> {
+    static C: std::sync::OnceLock<std::sync::Mutex<CheckState>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(CheckState::Idle))
+}
+
+/// 是否有检查在进行中。
+pub fn is_checking() -> bool {
+    CHECKING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 读取当前检查状态（UI 线程用，非阻塞）。
+pub fn check_state() -> CheckState {
+    check_cell().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// 启动一次后台检查更新。返回 `false` 表示已经有一次检查在跑。
+pub fn start_check() -> bool {
+    if CHECKING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    if let Ok(mut g) = check_cell().lock() {
+        *g = CheckState::Checking;
+    }
+    std::thread::spawn(|| {
+        let result = check_for_update();
+        if let Err(e) = &result {
+            tracing::warn!("手动检查更新失败：{e}");
+        }
+        if let Ok(mut g) = check_cell().lock() {
+            *g = CheckState::Done(result);
+        }
+        CHECKING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    true
+}
+
 pub fn check_for_update() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
     let user_agent = format!("{REPO_NAME}/{}", CURRENT_VERSION);
