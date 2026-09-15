@@ -151,7 +151,11 @@ taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
 
 [profile.release]
-opt-level = "z"          # 优化目标为大小 (size optimization)
+# 优化目标为速度：本项目热路径全是逐像素/逐行循环（mosaic 打码、freehand 离屏
+# 光栅化、形状混合、RGBA↔BGRA 转换、滚动拼接的行哈希），opt-level="z" 会关掉
+# 它们的向量化与内联。实测（同一台机器、release）4K 帧 RGBA→BGRA 转换：
+# "z" 52.8ms → 3 10.5ms，这一条就值回代价，而二进制只大几 MB。
+opt-level = 3
 lto = "fat"              # 完整的链接时优化 (full LTO)
 codegen-units = 1        # 最小化编译单元以获得最佳优化
 strip = true             # 自动移除符号和调试信息
