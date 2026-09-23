@@ -19,7 +19,6 @@ use crate::error::{AppError, AppResult};
 use crate::overlay::drawing::{DrawCommand, FontWeight, Point as DrawPoint, RGBA};
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Weight};
 use crate::overlay::font::{with_font_system, with_swash_cache, TEXT_FONT_FAMILY};
-use image::imageops::FilterType;
 
 /// 把 Text 命令栅格化到 frame（v0.2 真实现）
 ///
@@ -333,12 +332,12 @@ pub fn apply_commands_step(
     // 保证矩形/箭头/文字等标注叠加在马赛克之上。
     for cmd in commands {
         if let DrawCommand::Mosaic { regions, block_size, color } = cmd {
-            for rect in regions {
-                let a = translate(rect.0, region_origin_x, region_origin_y);
-                let b = translate(rect.1, region_origin_x, region_origin_y);
-                let (x1, y1, x2, y2) = normalize_rect(a, b);
-                apply_mosaic(frame, x1, y1, x2, y2, *block_size, *color)?;
-            }
+            // **整条命令一次写回**，不逐个 stamp 调用。
+            //
+            // 逐个写回时，重叠的 stamp 会把同一像素的颜色叠加多次（同一处越涂越深），
+            // 而拖动预览是一次算完 —— 两边就对不上。整条命令一次算完，预览与提交才
+            // 是同一张图（见 render_mosaic_stroke_pixels 的说明）。
+            apply_mosaic(frame, region_origin_x, region_origin_y, regions, *block_size, *color)?;
         }
     }
     // 第二步：所有标注命令 — 绘制在马赛克之上
@@ -1093,74 +1092,402 @@ fn blend_pixel(dst: &mut [u8], src: RGBA) {
     dst[3] = src.a.max(dst[3]);
 }
 
-/// 对 frame 中 (x1, y1) - (x2, y2) 区域做马赛克
+/// **块平均像素化**：算出 `[x0,x1)×[y0,y1)` 每块的平均色，写进 `out`（该区域大小）。
 ///
-/// 1. 把原区域 resize 到 (w/block_size, h/block_size)（nearest-neighbor）
-/// 2. 再 resize 回原尺寸
-/// 3. 叠加颜色（低 alpha 模拟马赛克预览的调色效果）
-/// 4. 写回 frame 对应区域
+/// 每个 `bs×bs` 块填**整块的平均色**，而不是取块内某一个点。这不是细节而是成败
+/// 关键：原来马赛克每块只采样左上角一个像素，等于把像素搬了个位置 —— 内容一点没
+/// 少，所以用户要"反复涂抹才能遮挡"（涂第二遍时采到的还是原文的像素）。取平均才
+/// 是真的把一块里的内容**抹成一个颜色**，一笔就能盖住。
+///
+/// 网格原点强制为 `bs` 的整数倍（绝对网格）：同一像素落在哪个块，只由图片坐标
+/// 决定，与"这次请求了多大区域、由哪个 stamp 发起"无关。少了这一条，重叠的方块
+/// 会各自用不同相位取样，边界交叉涂抹。
+///
+/// 块范围裁到图片内；完全在图片外的块取最近的真实像素（不越界、不留空洞）。
+///
+/// 返回 `(块均色像素, 每块是否"有内容")`，两者都按 `gw×gh` 的块序排列。
+/// "有内容"的判定见 [`mosaic_block_has_content`]：**空白背景不打码**，只有文字、
+/// 线条这类有内容的块才打码（用户要求："无效区域没有任何内容只有颜色的不做模糊"）。
+pub fn mosaic_block_average_ex(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    bs: i32,
+) -> (Vec<u8>, Vec<bool>) {
+    let bs = bs.max(1);
+    let rw = (x1 - x0).max(0) as usize;
+    let rh = (y1 - y0).max(0) as usize;
+    let mut out = vec![0u8; rw * rh * 4];
+    if rw == 0 || rh == 0 || sw == 0 || sh == 0 {
+        return (out, Vec::new());
+    }
+    let (swi, shi) = (sw as i32, sh as i32);
+    let gx0 = x0.div_euclid(bs) * bs;
+    let gy0 = y0.div_euclid(bs) * bs;
+    let gx1 = (x1 + bs - 1).div_euclid(bs) * bs;
+    let gy1 = (y1 + bs - 1).div_euclid(bs) * bs;
+    let gw = ((gx1 - gx0) as usize / bs as usize).max(1);
+    let gh = ((gy1 - gy0) as usize / bs as usize).max(1);
+
+    let mut small = vec![0u8; gw * gh * 4];
+    let mut flat = vec![false; gw * gh];
+    for j in 0..gh {
+        for i in 0..gw {
+            let abx0 = gx0 + (i * bs as usize) as i32;
+            let aby0 = gy0 + (j * bs as usize) as i32;
+            let bx0 = abx0.clamp(0, swi);
+            let by0 = aby0.clamp(0, shi);
+            let bx1 = (abx0 + bs).clamp(0, swi);
+            let by1 = (aby0 + bs).clamp(0, shi);
+            let d = (j * gw + i) * 4;
+            if bx1 <= bx0 || by1 <= by0 {
+                // 完全在图片外：取最近的真实像素（边缘复制）
+                let cx = abx0.clamp(0, swi - 1) as usize;
+                let cy = aby0.clamp(0, shi - 1) as usize;
+                let s_off = (cy * sw as usize + cx) * 4;
+                small[d..d + 4].copy_from_slice(&src[s_off..s_off + 4]);
+                flat[j * gw + i] = false;
+                continue;
+            }
+            let n = ((bx1 - bx0) * (by1 - by0)) as u32;
+            let mut acc = [0u32; 4];
+            for y in by0..by1 {
+                let base = y as usize * sw as usize * 4;
+                for x in bx0..bx1 {
+                    let s_off = base + x as usize * 4;
+                    for c in 0..4 {
+                        acc[c] += u32::from(src[s_off + c]);
+                    }
+                }
+            }
+            for c in 0..4 {
+                small[d + c] = ((acc[c] + n / 2) / n) as u8;
+            }
+            // 第二遍：块内像素与块均值的最大色差 → 判断这块是不是"纯色"
+            // （纯色 = 没有文字笔画、线条边这类结构，只有一片颜色）
+            let mut max_dev = 0u8;
+            for y in by0..by1 {
+                let base = y as usize * sw as usize * 4;
+                for x in bx0..bx1 {
+                    let s_off = base + x as usize * 4;
+                    for c in 0..3 {
+                        let dev = src[s_off + c].abs_diff(small[d + c]);
+                        if dev > max_dev {
+                            max_dev = dev;
+                        }
+                    }
+                }
+            }
+            flat[j * gw + i] = max_dev <= MOSAIC_FLAT_TOL;
+        }
+    }
+    // 整块铺开：每块是纯色方块，块内不插值
+    for y in 0..rh {
+        let j = (((y0 + y as i32) - gy0).div_euclid(bs)).clamp(0, gh as i32 - 1) as usize;
+        for x in 0..rw {
+            let i = (((x0 + x as i32) - gx0).div_euclid(bs)).clamp(0, gw as i32 - 1) as usize;
+            let s_off = (j * gw + i) * 4;
+            let d_off = (y * rw + x) * 4;
+            out[d_off..d_off + 4].copy_from_slice(&small[s_off..s_off + 4]);
+        }
+    }
+    // 每块"有没有内容"：块内有色差（文字笔画/线条边）→ 有内容；纯色的块只有和
+    // 整笔背景色一致时才算背景（否则是粗线条/大色块内部，属于内容）。
+    let bg = mosaic_dominant_color(src, sw, sh, x0, y0, x1, y1);
+    let mut content = vec![false; gw * gh];
+    for j in 0..gh {
+        for i in 0..gw {
+            let d = (j * gw + i) * 4;
+            let dev = (0..3)
+                .map(|c| small[d + c].abs_diff(bg[c]))
+                .max()
+                .unwrap_or(0);
+            content[j * gw + i] = !flat[j * gw + i] || dev > MOSAIC_BG_TOL;
+        }
+    }
+    (out, content)
+}
+
+/// 被涂抹区域的**背景色**：整片像素里出现最多的颜色（量化到 32 级后取众数）。
+///
+/// 用途是区分"空白背景"和"有内容的纯色块"：截图里背景通常占据多数像素，所以众数
+/// 就是背景（白底页面→白、深色 UI→深色）。粗线条内部虽然也是纯色，但与背景色差得
+/// 远，会被判成内容 —— 线条照样打码。
+fn mosaic_dominant_color(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+) -> [u8; 3] {
+    let (swi, shi) = (sw as i32, sh as i32);
+    let bx0 = x0.clamp(0, swi);
+    let by0 = y0.clamp(0, shi);
+    let bx1 = x1.clamp(0, swi);
+    let by1 = y1.clamp(0, shi);
+    if bx1 <= bx0 || by1 <= by0 {
+        return [0, 0, 0];
+    }
+    // 5 bit/通道 → 32768 个桶
+    let mut hist = vec![0u32; 32768];
+    for y in by0..by1 {
+        let base = y as usize * sw as usize * 4;
+        for x in bx0..bx1 {
+            let o = base + x as usize * 4;
+            let idx = ((src[o] as usize >> 3) << 10)
+                | ((src[o + 1] as usize >> 3) << 5)
+                | (src[o + 2] as usize >> 3);
+            hist[idx] += 1;
+        }
+    }
+    let best = hist
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, n)| **n)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    // 桶中心（+4 是半个桶宽）
+    [
+        (((best >> 10) & 31) as u8) << 3 | 4,
+        (((best >> 5) & 31) as u8) << 3 | 4,
+        ((best & 31) as u8) << 3 | 4,
+    ]
+}
+
+/// 纯色块与背景色的最大差 ≤ 此值 → 当作背景（不打码）。
+///
+/// 留了余量：渐变/压缩噪点不会让背景被判成内容；而文字、线条与背景的差值通常在
+/// 60 以上，不会被误判成背景。
+const MOSAIC_BG_TOL: u8 = 24;
+
+/// 块内像素与块均值的最大差 ≤ 此值 → 这块是"纯色块"（没有笔画/边缘等结构）。
+///
+/// 取 8：截图像素本身很干净，抗锯齿笔画与背景的差远超此值；而同一片纯色背景里
+/// 的细微波动不会超过它。
+const MOSAIC_FLAT_TOL: u8 = 8;
+
+/// 预览用的**对齐裁剪**：抠出笔迹包围盒外扩一圈、且原点对齐到块网格的那块像素。
+///
+/// 为什么要对齐：块网格钉在 `bs` 的整数倍上（绝对坐标决定块相位）。裁剪原地错了，
+/// 块相位就跟着错，预览与提交会对不上 —— 而且从代码里看不出来。这里有测试
+/// （`mosaic_crop_does_not_change_block_grid`）钉住"在裁剪上算 == 在整帧上算"。
+///
+/// 为什么要裁剪：避免每帧为预览克隆整帧像素（1080p 8MB）。
+///
+/// 返回 `(裁剪像素, 裁剪宽, 裁剪高, 裁剪原点, 局部 regions)`；局部 regions 已平移到裁剪坐标系。
+pub fn mosaic_aligned_crop(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    regions: &[(DrawPoint, DrawPoint)],
+    bs: u32,
+) -> Option<(Vec<u8>, u32, u32, i32, i32, Vec<(DrawPoint, DrawPoint)>)> {
+    if regions.is_empty() || sw == 0 || sh == 0 {
+        return None;
+    }
+    let bsi = bs.max(1) as i32;
+    let (mut bx0, mut by0, mut bx1, mut by1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for (a, b) in regions {
+        bx0 = bx0.min(a.x.min(b.x).floor() as i32);
+        by0 = by0.min(a.y.min(b.y).floor() as i32);
+        bx1 = bx1.max((a.x.max(b.x)).ceil() as i32);
+        by1 = by1.max((a.y.max(b.y)).ceil() as i32);
+    }
+    let (swi, shi) = (sw as i32, sh as i32);
+    let cx0 = ((bx0 - bsi).div_euclid(bsi) * bsi).clamp(0, swi);
+    let cy0 = ((by0 - bsi).div_euclid(bsi) * bsi).clamp(0, shi);
+    let cx1 = ((((bx1 + bsi) + bsi - 1).div_euclid(bsi) * bsi)).clamp(0, swi);
+    let cy1 = ((((by1 + bsi) + bsi - 1).div_euclid(bsi) * bsi)).clamp(0, shi);
+    let (cw, ch) = (cx1 - cx0, cy1 - cy0);
+    if cw <= 0 || ch <= 0 {
+        return None;
+    }
+    let fwu = sw as usize;
+    let mut crop = vec![0u8; (cw * ch * 4) as usize];
+    for y in 0..ch as usize {
+        let so = ((cy0 as usize + y) * fwu + cx0 as usize) * 4;
+        let dst = y * cw as usize * 4;
+        crop[dst..dst + cw as usize * 4]
+            .copy_from_slice(&src[so..so + cw as usize * 4]);
+    }
+    let local: Vec<(DrawPoint, DrawPoint)> = regions
+        .iter()
+        .map(|(a, b)| {
+            (
+                DrawPoint::new(a.x - cx0 as f32, a.y - cy0 as f32),
+                DrawPoint::new(b.x - cx0 as f32, b.y - cy0 as f32),
+            )
+        })
+        .collect();
+    Some((crop, cw as u32, ch as u32, cx0, cy0, local))
+}
+
+/// 马赛克色的半透明叠加量（色板颜色当滤镜用，见 [`render_mosaic_stroke_pixels`]）
+pub const MOSAIC_TINT_ALPHA: u8 = 0x60;
+
+/// **一笔马赛克的核心**：对 `regions` 覆盖到的像素做块平均像素化 + 颜色叠加，
+/// 返回联合包围盒内的像素（RGBA，未覆盖处 alpha=0）。
+///
+/// 这是**预览与提交共用的同一份实现**，不是"两边各写一遍、靠约定保持一致"。
+/// 用户看到的拖动效果就是松手后成图的那一次运算，所以不可能出现
+/// "拖动中一个样、成型后又一个样"。
+///
+/// - 入参 `regions` 的单位是**物理像素**（调用方负责换算：提交路径用逻辑→物理的
+///   缩放比换算，预览路径用 "画布坐标 × frame_dim / window_dim" 换算）。
+/// - 块平均的值只由**绝对坐标**决定（网格钉在 `bs` 的整数倍），所以"先写半个块、
+///   再被后一个 stamp 覆盖"与"一次算整块"结果相同；重叠 stamp 不会交叉涂抹。
+/// - 未被覆盖的像素 alpha=0：预览层叠在帧图之上时，只有笔迹范围被替换。
+pub fn render_mosaic_stroke_pixels(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    regions: &[(DrawPoint, DrawPoint)],
+    bs: u32,
+    color: RGBA,
+) -> Option<(Vec<u8>, i32, i32, u32, u32)> {
+    if regions.is_empty() || sw == 0 || sh == 0 {
+        return None;
+    }
+    let (swi, shi) = (sw as i32, sh as i32);
+    // 联合包围盒：向外取整到整数像素，并裁到画面内
+    let mut ux0 = i32::MAX;
+    let mut uy0 = i32::MAX;
+    let mut ux1 = i32::MIN;
+    let mut uy1 = i32::MIN;
+    for (a, b) in regions {
+        ux0 = ux0.min(a.x.min(b.x).floor() as i32);
+        uy0 = uy0.min(a.y.min(b.y).floor() as i32);
+        ux1 = ux1.max((a.x.max(b.x)).ceil() as i32);
+        uy1 = uy1.max((a.y.max(b.y)).ceil() as i32);
+    }
+    let ux0 = ux0.clamp(0, swi);
+    let uy0 = uy0.clamp(0, shi);
+    let ux1 = ux1.clamp(0, swi);
+    let uy1 = uy1.clamp(0, shi);
+    let (cw, ch) = ((ux1 - ux0).max(0) as u32, (uy1 - uy0).max(0) as u32);
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    // ① 覆盖掩码：哪些像素属于这一笔
+    let mut inside = vec![false; (cw * ch) as usize];
+    for (a, b) in regions {
+        let x0 = (a.x.min(b.x).floor() as i32).max(ux0);
+        let y0 = (a.y.min(b.y).floor() as i32).max(uy0);
+        let x1 = (a.x.max(b.x).ceil() as i32).min(ux1);
+        let y1 = (a.y.max(b.y).ceil() as i32).min(uy1);
+        for y in y0.max(0)..y1.max(0) {
+            if y < uy0 || y >= uy1 {
+                continue;
+            }
+            let row = (y - uy0) as usize * cw as usize;
+            for x in x0.max(0)..x1.max(0) {
+                if x < ux0 || x >= ux1 {
+                    continue;
+                }
+                inside[row + (x - ux0) as usize] = true;
+            }
+        }
+    }
+    // ② 整块平均（与提交路径同一函数、同一网格）+ 每块"有没有内容"
+    let bsi = bs.max(1) as i32;
+    let (avg, content) =
+        mosaic_block_average_ex(src, sw, sh, ux0, uy0, ux1, uy1, bsi);
+    if avg.len() != (cw * ch * 4) as usize {
+        return None;
+    }
+    // 块网格原点（与 `mosaic_block_average_ex` 内部一致），用来把像素映射到块
+    let gx0 = ux0.div_euclid(bsi) * bsi;
+    let gy0 = uy0.div_euclid(bsi) * bsi;
+    let gw = (((ux1 + bsi - 1).div_euclid(bsi) * bsi - gx0).max(0) / bsi) as usize;
+    // 空背景块不打码：这些像素保持透明（预览）/不被改写（提交）
+    // ③ 只把被覆盖的像素交出去，其余保持透明（预览层叠在帧图上，未覆盖处不该有东西）
+    let mut out = vec![0u8; avg.len()];
+    let tint = if color.a == 0 {
+        RGBA::TRANSPARENT
+    } else {
+        RGBA::new(color.r, color.g, color.b, MOSAIC_TINT_ALPHA)
+    };
+    for i in 0..(cw * ch) as usize {
+        if !inside[i] {
+            continue;
+        }
+        // 跳过"没有内容"的块（空白背景）：用户要求只对文字、线条这类有效区域打码
+        if !content.is_empty() && gw > 0 {
+            let (x, y) = (i % cw as usize, i / cw as usize);
+            let bi = ((ux0 + x as i32).div_euclid(bsi) * bsi - gx0) / bsi;
+            let bj = ((uy0 + y as i32).div_euclid(bsi) * bsi - gy0) / bsi;
+            if bi < 0 || bj < 0 {
+                continue;
+            }
+            let (bi, bj) = (bi as usize, bj as usize);
+            match content.get(bj * gw + bi) {
+                Some(true) => {}
+                _ => continue,
+            }
+        }
+        let o = i * 4;
+        out[o..o + 4].copy_from_slice(&avg[o..o + 4]);
+        if tint.a > 0 {
+            blend_pixel(&mut out[o..o + 4], tint);
+        }
+    }
+    Some((out, ux0, uy0, cw, ch))
+}
+
+/// 把一条马赛克命令**整趟**写进 frame：块平均像素化 + 颜色叠加。
+///
+/// `regions` 是逻辑像素坐标（命令空间），这里按 `region_origin` 平移成帧局部坐标。
+/// 实现直接复用 [`render_mosaic_stroke_pixels`] —— 与拖动预览**同一份代码**，
+/// 所以"拖动中"和"最终成型"逐像素一致，不是靠两边各自小心维护。
 fn apply_mosaic(
     frame: &mut CapturedFrame,
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
+    region_origin_x: f32,
+    region_origin_y: f32,
+    regions: &[(DrawPoint, DrawPoint)],
     block_size: u32,
     color: RGBA,
 ) -> AppResult<()> {
-    let bs = block_size.max(1) as i32;
-    let rx = x1 as i32;
-    let ry = y1 as i32;
-    let rw = (x2 - x1) as i32;
-    let rh = (y2 - y1) as i32;
-    if rw <= 0 || rh <= 0 {
+    let shifted: Vec<(DrawPoint, DrawPoint)> = regions
+        .iter()
+        .map(|(a, b)| {
+            let (ax, ay) = translate(*a, region_origin_x, region_origin_y);
+            let (bx, by) = translate(*b, region_origin_x, region_origin_y);
+            (DrawPoint::new(ax, ay), DrawPoint::new(bx, by))
+        })
+        .collect();
+    let Some((pix, px, py, pw, ph)) = render_mosaic_stroke_pixels(
+        &frame.pixels,
+        frame.width,
+        frame.height,
+        &shifted,
+        block_size,
+        color,
+    ) else {
         return Ok(());
-    }
-    let w_px = frame.width as i32;
-    let h_px = frame.height as i32;
-    let small_w = (rw / bs).max(1);
-    let small_h = (rh / bs).max(1);
-
-    // 全局对齐的块网格：所有 stamp 共用同一套 bs 网格（原点对齐到 bs 的整数倍）。
-    // 这样重叠的 stamp 不会各自用不同相位取样造成交叉涂抹——块边界清晰、马赛克块可辨。
-    let gx0 = rx.div_euclid(bs) * bs;
-    let gy0 = ry.div_euclid(bs) * bs;
-
-    // 1) 提取原区域像素到 small buffer
-    let mut small = vec![0u8; (small_w * small_h * 4) as usize];
-    for sy in 0..small_h {
-        for sx in 0..small_w {
-            let src_x = (gx0 + sx * bs).clamp(0, w_px - 1);
-            let src_y = (gy0 + sy * bs).clamp(0, h_px - 1);
-            let src_idx = ((src_y * w_px + src_x) as usize) * 4;
-            let dst_idx = ((sy * small_w + sx) as usize) * 4;
-            small[dst_idx..dst_idx + 4].copy_from_slice(&frame.pixels[src_idx..src_idx + 4]);
-        }
-    }
-
-    // 2) nearest 放大回原尺寸实现马赛克
-    let img_small = image::RgbaImage::from_raw(small_w as u32, small_h as u32, small)
-        .ok_or_else(|| AppError::Window("mosaic 创建 ImageBuffer 失败".into()))?;
-    let img_big = image::imageops::resize(&img_small, rw as u32, rh as u32, FilterType::Nearest);
-
-    // 3) 写回 frame（像素化 + 颜色叠加）。叠加色用较高 alpha，让马赛克颜色更实、
-    //    不显浅；块边界由全局对齐网格保证清晰可辨。
-    let tint = RGBA::new(color.r, color.g, color.b, 0x60);
-    for dy in 0..rh {
-        let py = ry + dy;
-        if py < 0 || py >= h_px {
+    };
+    let (w_px, h_px) = (frame.width as i32, frame.height as i32);
+    for y in 0..ph as i32 {
+        let ty = py + y;
+        if ty < 0 || ty >= h_px {
             continue;
         }
-        for dx in 0..rw {
-            let px = rx + dx;
-            if px < 0 || px >= w_px {
+        for x in 0..pw as i32 {
+            let tx = px + x;
+            if tx < 0 || tx >= w_px {
                 continue;
             }
-            let src_idx = ((dy * rw + dx) as usize) * 4;
-            let dst_idx = ((py * w_px + px) as usize) * 4;
-            frame.pixels[dst_idx..dst_idx + 4]
-                .copy_from_slice(&img_big.as_raw()[src_idx..src_idx + 4]);
-            blend_pixel(&mut frame.pixels[dst_idx..dst_idx + 4], tint);
+            let s_off = ((y * pw as i32 + x) * 4) as usize;
+            if pix[s_off + 3] == 0 {
+                continue; // 这一笔没覆盖到，保持原像素
+            }
+            let d_off = (ty as usize * w_px as usize + tx as usize) * 4;
+            frame.pixels[d_off..d_off + 4].copy_from_slice(&pix[s_off..s_off + 4]);
         }
     }
     Ok(())
@@ -1248,37 +1575,230 @@ mod tests {
         assert!(f.pixels[idx] > 200, "r = {}", f.pixels[idx]);
     }
 
+    /// **只对"有内容"的块打码**：同一笔同时扫过"文字区"和"纯空白区"，
+    /// 文字区必须被糊掉，空白区必须**一个像素都不变**。
+    ///
+    /// 用户要求："只对文字、线条等有效区域能模糊，无效区域没有任何内容只有颜色的
+    /// 不做模糊"。空白块被平均后仍是同一个颜色，打码没有任何遮挡收益，却会让笔迹
+    /// 拖出一整条醒目的色带。
     #[test]
-    fn mosaic_blurs_region() {
-        let mut f = empty_frame(20, 20);
-        // 在 (10, 10) 标一个红点，其余黑
-        let i = (10 * 20 + 10) * 4;
-        f.pixels[i] = 0xFF;
-        f.pixels[i + 3] = 0xFF;
+    fn mosaic_skips_empty_background_blocks() {
+        let (w, h) = (48u32, 24u32);
+        let mut f = empty_frame(w, h);
+        // 左半：白底 + 每 4px 一条深色"笔画"；右半：纯白空白
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let ink = x < w / 2 && x % 4 == 0;
+                let v = if ink { 20 } else { 240 };
+                f.pixels[i] = v;
+                f.pixels[i + 1] = v;
+                f.pixels[i + 2] = v;
+                f.pixels[i + 3] = 0xFF;
+            }
+        }
+        let before = f.pixels.clone();
 
+        // 一笔横扫整幅（两侧都被笔迹覆盖）
+        apply_commands(
+            &mut f,
+            0.0,
+            0.0,
+            &[DrawCommand::Mosaic {
+                regions: vec![(
+                    DrawPoint::new(0.0, 0.0),
+                    DrawPoint::new(w as f32, h as f32),
+                )],
+                block_size: 8,
+                color: RGBA::TRANSPARENT, // 不叠色，只看有没有马赛克化
+            }],
+        )
+        .unwrap();
+
+        let at = |x: u32, y: u32| -> u8 { f.pixels[((y * w + x) * 4) as usize] };
+        // 右半（纯空白）：必须保持原样
+        let mut changed_bg = 0usize;
+        for y in 0..h {
+            for x in (w / 2 + 8)..w {
+                let i = ((y * w + x) * 4) as usize;
+                if f.pixels[i..i + 4] != before[i..i + 4] {
+                    changed_bg += 1;
+                }
+            }
+        }
+        assert_eq!(changed_bg, 0, "空白背景被改动了 {changed_bg} 个像素 —— 不该对空白打码");
+
+        // 左半（文字）：必须已经没有原文墨色（20）
+        let mut ink_left = 0usize;
+        for y in 0..h {
+            for x in 0..(w / 2 - 8) {
+                if at(x, y) == 20 {
+                    ink_left += 1;
+                }
+            }
+        }
+        assert_eq!(ink_left, 0, "文字区还有 {ink_left} 个墨色像素 —— 该打码的没打");
+    }
+
+    #[test]
+    fn block_average_mosaic_hides_content_in_one_pass() {
+        // 这个测试原来断言"红点的原值被搬到整块"——那是**点采样**（每块只取左上角
+        // 一个像素）的行为，也正是"要反复涂抹才能遮挡"的原因：内容只是被搬了个
+        // 位置，一个像素都没少。改成整块取平均后该断言必然失败，所以按新契约重写。
+        let (w, h) = (40u32, 40u32);
+        let mut f = empty_frame(w, h);
+        // 造"文字"：每 4px 一条深色竖线（比块细，块平均必须把它糊掉）
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let dark = x % 4 == 0;
+                let v = if dark { 20 } else { 240 };
+                f.pixels[i] = v;
+                f.pixels[i + 1] = v;
+                f.pixels[i + 2] = v;
+                f.pixels[i + 3] = 0xFF;
+            }
+        }
+        let before = f.pixels.clone();
+
+        let bs = 10u32;
         let cmd = DrawCommand::Mosaic {
-            regions: vec![(DrawPoint::new(0.0, 0.0), DrawPoint::new(20.0, 20.0))],
-            block_size: 10,
-            color: RGBA::new(0x80, 0x80, 0x80, 0x80),
+            regions: vec![(
+                DrawPoint::new(0.0, 0.0),
+                DrawPoint::new(w as f32, h as f32),
+            )],
+            block_size: bs,
+            color: RGBA::TRANSPARENT, // 不染色，单看马赛克本身
         };
         apply_commands(&mut f, 0.0, 0.0, &[cmd]).unwrap();
 
-        // mosaic with block_size=10 → small buffer 2x2
-        // small[1,1] samples src (10, 10) → red；其余采样 (0,0)/(10,0)/(0,10) 都是 0
-        // nearest upscale 到 20x20 → (10..20, 10..20) 区域全红
-        // apply_mosaic 叠加灰色 tint（alpha=0x60），红区变暗红，黑区变暗灰
-        let idx = (15 * 20 + 15) * 4;
-        assert!(
-            f.pixels[idx] > 180,
-            "mosaic should propagate red to (15,15), got r={}",
-            f.pixels[idx]
+        // ① 块内必须同色（整块平均的机械证据）
+        for by in (0..h as i32).step_by(bs as usize) {
+            for bx in (0..w as i32).step_by(bs as usize) {
+                let at = |x: i32, y: i32| {
+                    let i = ((y as u32 * w + x as u32) * 4) as usize;
+                    [f.pixels[i], f.pixels[i + 1], f.pixels[i + 2]]
+                };
+                let a = at(bx, by);
+                let b = at(bx + bs as i32 - 1, by + bs as i32 - 1);
+                assert_eq!(a, b, "块 ({bx},{by}) 内应为一个纯色，got {a:?} vs {b:?}");
+            }
+        }
+
+        // ② **一笔就必须把原内容抹掉**：4px 竖线在块内被平均成中间灰，
+        //    原来的深/浅对比不能再出现在块图里。
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            f.pixels[i]
+        };
+        let mut extremes = 0;
+        for by in 0..h {
+            for bx in 0..w {
+                if at(bx, by) < 60 || at(bx, by) > 200 {
+                    extremes += 1;
+                }
+            }
+        }
+        assert_eq!(
+            extremes, 0,
+            "马赛克后仍有 {extremes} 个像素保持原来的深浅极端值 —— 内容没被抹掉"
         );
-        // (0..10, 0..10) 区域原来全黑，叠加灰色 tint 后略灰
-        let idx = (5 * 20 + 5) * 4;
-        assert!(
-            f.pixels[idx] < 60,
-            "r at (5,5) should be dark (gray tint over black), got {}",
-            f.pixels[idx]
+        // 而且确实改过像素（不是"看着有笔迹、其实没落到像素上"）
+        let changed = (0..f.pixels.len()).step_by(4).filter(|&i| f.pixels[i] != before[i]).count();
+        assert!(changed > (w * h) as usize / 2, "绝大多数像素应当被改过，实际 {changed}");
+
+        // ③ 块均值必须**就是整块的平均**（拿块内的原像素直接算出来对照，
+        //    而不是我手写一个算术——上面那版手算就写错了，被这条断言抓住）。
+        let (bx, by) = (0usize, 0usize);
+        let mut sum = 0u32;
+        let mut n = 0u32;
+        for y in by..by + bs as usize {
+            for x in bx..bx + bs as usize {
+                sum += u32::from(before[(y * w as usize + x) * 4]);
+                n += 1;
+            }
+        }
+        let expect = ((sum + n / 2) / n) as i32;
+        let got = at(5, 5) as i32;
+        assert_eq!(got, expect, "块均值应当等于整块平均");
+        // ④ `RGBA::TRANSPARENT` 必须表示**不染色**：只做马赛克，不能顺手压暗画面。
+        //    （回归：把"一律按 0x60 半透明叠加"写成无条件规则时，透明黑也会叠一层，
+        //    整幅图被压暗 —— 用户只想马赛克时没法关掉染色。）
+        assert_eq!(got, expect, "传 TRANSPARENT 时不应发生任何染色");
+    }
+
+    #[test]
+    fn mosaic_crop_does_not_change_block_grid() {
+        // 预览为了不克隆整帧，只把笔迹包围盒**外扩一圈并按块对齐**的一小块喂给核心。
+        // 这一步一旦错位（裁剪原点不按块对齐 / 平移算错），块网格相位就变了 ——
+        // 预览与提交会悄悄对不上，而且看代码看不出来。这条测试把它钉死：
+        // 在整帧上算，与在"对齐裁剪"上算，结果必须逐像素相同。
+        use super::render_mosaic_stroke_pixels;
+        use crate::overlay::drawing::Point as P;
+
+        let (fw, fh) = (200u32, 120u32);
+        let mut frame = empty_frame(fw, fh);
+        // 有结构的图：棋盘 + 几个色块，块均值才有区分度
+        for y in 0..fh {
+            for x in 0..fw {
+                let i = ((y * fw + x) * 4) as usize;
+                let v = if (x / 3 + y / 5) % 2 == 0 { 40 } else { 210 };
+                frame.pixels[i] = v;
+                frame.pixels[i + 1] = (v as u16 * 2 / 3) as u8;
+                frame.pixels[i + 2] = 255 - v;
+                frame.pixels[i + 3] = 255;
+            }
+        }
+        let bs = 12u32;
+        let regions = vec![
+            (P::new(37.0, 41.0), P::new(85.0, 89.0)),
+            (P::new(70.0, 41.0), P::new(118.0, 89.0)),
+            (P::new(103.0, 41.0), P::new(151.0, 89.0)),
+            (P::new(136.0, 41.0), P::new(184.0, 89.0)),
+        ];
+        let color = RGBA::new(0xE6, 0x22, 0x22, 0xFF);
+
+        // ① 整帧直接算
+        let (full, fx, fy, fwid, fhei) =
+            render_mosaic_stroke_pixels(&frame.pixels, fw, fh, &regions, bs, color)
+                .expect("整帧渲染应当成功");
+
+        // ② 按预览的**生产路径**裁剪（mosaic_aligned_crop，不是测试里另抄一遍）
+        let (crop, cw, ch, cx0, cy0, local) =
+            super::mosaic_aligned_crop(&frame.pixels, fw, fh, &regions, bs)
+                .expect("对齐裁剪应当成功");
+        let (cropped, px, py, pw, ph) = render_mosaic_stroke_pixels(
+            &crop,
+            cw,
+            ch,
+            &local,
+            bs,
+            color,
+        )
+        .expect("裁剪渲染应当成功");
+
+        assert_eq!(
+            (fx, fy, fwid, fhei),
+            (cx0 + px, cy0 + py, pw, ph),
+            "裁剪渲染的包围盒换算回整帧坐标后应当一致"
+        );
+        // ③ 逐像素比对：换算到整帧坐标系后必须完全相同
+        let mut diff = 0usize;
+        let mut checked = 0usize;
+        for y in 0..ph as i32 {
+            for x in 0..pw as i32 {
+                let fo = ((y * fwid as i32 + x) * 4) as usize;
+                let co = ((y * pw as i32 + x) * 4) as usize;
+                checked += 1;
+                if full[fo..fo + 4] != cropped[co..co + 4] {
+                    diff += 1;
+                }
+            }
+        }
+        assert!(checked > 1000, "比对像素太少：{checked}");
+        assert_eq!(
+            diff, 0,
+            "裁剪后有 {diff}/{checked} 个像素与整帧渲染不同 —— 裁剪破坏了块网格相位"
         );
     }
 

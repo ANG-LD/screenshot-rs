@@ -76,6 +76,45 @@ struct ShapeLayerCache {
 }
 
 
+/// 马赛克**已提交笔迹**的显示层缓存（松手之后到最终提交之前，画布上要一直看得见）。
+///
+/// 为什么需要它：绘制分两条路 —— 拖动中走 `in_progress`（有实时预览层），松手后这一笔
+/// 被移进"已提交命令"列表，而**已提交命令在编辑态原本不显示**（只在最终提交时烤进像素）。
+/// 于是松手瞬间预览层失效、笔迹凭空消失，用户会以为"没生效"（"拖动能预览、结束就消失"）。
+///
+/// **一笔一层**（不是把所有笔迹合成一层）：每笔的颜色/块大小可以不同，合成一层就只能用
+/// 其中一个颜色，第二笔换色会把前面所有笔迹一起染色 —— 这正是"第一笔也跟着变色"的成因。
+/// 逐笔渲染也与提交路径一致（`apply_commands` 是**每条命令单独应用**）。
+struct CommittedMosaicCache {
+    /// 快照时的 `DrawingState.revision`（提交/撤销/重做都会 +1）
+    revision: u64,
+    /// 快照时的画布逻辑尺寸 → 帧物理像素的缩放比
+    scale: (f32, f32),
+    /// 每笔一层，按命令顺序
+    layers: Vec<(Arc<RenderImage>, ub::Bounds)>,
+}
+
+/// 马赛克**实时预览**层缓存：当前这一笔的真像素光栅化结果。
+///
+/// 用户明确要"拖动中就看到真实效果"。预览不能画示意图（那正是"拖动中与成型后
+/// 不一致"的来源），所以这里放的是**真像素**：由
+/// [`crate::overlay::commands::render_mosaic_stroke_pixels`] 算出，与松手提交走的是
+/// 同一份代码，逐像素一致（有测试钉住）。
+///
+/// 只在"笔迹长出新 stamp"或缩放入参变化时重算；同一帧内多次渲染直接复用。
+struct MosaicPreviewCache {
+    /// 快照时的 stamp 个数：笔迹只增不改，个数变了才需要重算
+    region_count: usize,
+    /// 快照时的最后一个 stamp（同个数但换笔时兜底）
+    last_region: Option<((f32, f32), (f32, f32))>,
+    /// 画布逻辑坐标 → 帧物理像素的缩放比（窗口尺寸变了要重算）
+    scale: (f32, f32),
+    /// 光栅化结果（BGRA，未覆盖处透明）
+    image: Arc<RenderImage>,
+    /// paint_image 的目标 Bounds（逻辑像素）
+    bounds: ub::Bounds,
+}
+
 /// Freehand 增量渲染状态（累积所有已画 Freehand）：
 /// 拖动时每帧只画新增段(O(新增))；buffer 覆盖所有 Freehand 的联合 bbox，
 /// bbox 超界时重建(拷贝旧像素+画新段)。bbox 计算与 rasterize_shapes 完全
@@ -132,6 +171,10 @@ pub struct OverlayView {
 
     /// 已提交形状的离屏光栅化缓存（见 `ShapeLayerCache`）
     shape_layer_cache: Option<ShapeLayerCache>,
+    /// 当前这一笔马赛克的实时预览层（见 `MosaicPreviewCache`）
+    mosaic_preview: Option<MosaicPreviewCache>,
+    /// 已提交马赛克笔迹的显示层（见 `CommittedMosaicCache`）
+    mosaic_layer: Option<CommittedMosaicCache>,
     /// Freehand 统一增量层（累积所有已画 Freehand；committed 不渲染 Freehand）
     freehand_incr: Option<IncrFreehand>,
 
@@ -339,6 +382,8 @@ impl OverlayView {
             drawing: DrawingState::new(),
             in_progress: None,
             shape_layer_cache: None,
+            mosaic_preview: None,
+            mosaic_layer: None,
             freehand_incr: None,
             text_input: None,
             text_input_anchor: BoundsPoint::ZERO,
@@ -401,6 +446,9 @@ impl OverlayView {
         self.mode = OverlayMode::Selecting;
         self.toolbar = ToolbarState::default();
         self.drawing = DrawingState::new();
+        // 新会话必须丢掉上一轮的像素层缓存（帧内容与命令都换了），否则可能残留旧图
+        self.mosaic_preview = None;
+        self.mosaic_layer = None;
         self.in_progress = None;
         // 清缓存前交出旧图：形状层缓存是"全部形状联合 bbox"的整幅光栅，
         // 大的能到整屏，直接置 None 就把这块 atlas 瓦片永久留下了
@@ -1973,14 +2021,21 @@ fn render_simple_button(
 
 /// 马赛克画笔几何 → (画笔边长, 像素化块边长)
 ///
-/// - 画笔边长：单次涂抹覆盖的宽度。取默认线宽 3 → 12px，配合沿路径补 stamp
-///   保证连续覆盖。
-/// - 像素化块边长：越小像素越细密（"像素多"），马赛克更均匀、覆盖更实。
-///   默认线宽 3 → 4px，进一步加密。
+/// **跟随工具栏「粗细」档位**（[`crate::overlay::toolbar::LINE_WIDTHS`]，1..8，默认 3）：
+/// 用户觉得遮盖面积大就调细、要一次盖住整段就调粗 —— 这是"遮盖多大一片"的直接旋钮，
+/// 不用改代码。默认档（3）→ 画笔 24px、块 12px。
+///
+/// 两级尺寸保持 **2:1**（笔刷宽度 = 2 个块），所以调细只是把整片缩小，马赛克的
+/// "颗粒感"不变 —— 之前固定 48/24 且带 36px 下限，档位调到底也缩不下去，
+/// 用户反馈"马赛克区域太大"却无从调整。
+///
+/// 两个尺寸的关系是"一笔就能遮挡"的关键：块必须**大到跨过笔画与背景**（否则块平均
+/// 就等于原文那一小块的颜色，等于没遮），笔刷要**宽到一笔扫过一片内容**。所以块有
+/// 8px 下限（再小块均值就贴近原文局部色），块上限 28px（再粗就糊成一片、看不出是马赛克）。
 fn mosaic_geom(lw: f32) -> (f32, u32) {
-    let brush = (lw * 4.0).max(12.0);
-    let block = (lw * 1.5).max(3.0);
-    (brush, block.max(1.0) as u32)
+    let brush = (lw * 8.0).max(12.0).round();
+    let block = (brush * 0.5).round().max(8.0);
+    (brush, (block as u32).clamp(8, 28))
 }
 
 // ── 二级弹层（popover）视觉 ────────────────────────────────────────────────
@@ -3197,11 +3252,215 @@ fn is_shape_command(c: &DrawCommand) -> bool {
     )
 }
 
-/// 光栅化一组形状命令到 BGRA 图像 + 联合包围盒（逻辑像素，含 AA 外扩）。
+/// 一笔记马的渲染参数：笔迹区域 + 块大小 + 颜色。
+type MosaicStroke = (
+    Vec<(crate::overlay::drawing::Point, crate::overlay::drawing::Point)>,
+    u32,
+    crate::overlay::drawing::RGBA,
+);
+
+/// 从命令序列里取出所有马赛克笔迹，**每笔一条、各自保留颜色与块大小**。
 ///
-/// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感，所以这里
-/// 复用 commit 路径的 `commands::apply_commands` 逐像素解析式 AA，得到与最终成图
-/// 一致的平滑线条。返回 `None` 若无形状。
+/// 单独抽成函数是为了能直接测：曾经的 bug 是把所有笔迹**合并成一层**、颜色只取最后
+/// 一笔的，于是"第一笔红色、第二笔改成黑色"时，第二笔落下会让第一笔也变成黑色
+/// （用户报的"第一个模糊也变色了"）。
+fn mosaic_strokes_of<'a>(
+    cmds: impl Iterator<Item = &'a std::sync::Arc<DrawCommand>>,
+) -> Vec<MosaicStroke> {
+    cmds.filter_map(|cmd| match &**cmd {
+        DrawCommand::Mosaic { regions, block_size, color } => {
+            Some((regions.clone(), (*block_size).max(1), *color))
+        }
+        _ => None,
+    })
+    .collect()
+}
+
+/// 把一笔马赛克渲染成一层真像素（画布逻辑坐标入参，内部换算到帧物理像素）。
+///
+/// 与预览、提交共用 [`crate::overlay::commands::render_mosaic_stroke_pixels`]，
+/// 所以三者是同一张图。
+fn mosaic_layer_from_stroke(
+    frame: &[u8],
+    fw: u32,
+    fh: u32,
+    regions: &[(crate::overlay::drawing::Point, crate::overlay::drawing::Point)],
+    block_size: u32,
+    color: crate::overlay::drawing::RGBA,
+    sx: f32,
+    sy: f32,
+) -> Option<(Arc<RenderImage>, ub::Bounds)> {
+    use crate::overlay::drawing::Point;
+    let scaled: Vec<(Point, Point)> = regions
+        .iter()
+        .map(|(a, b)| (Point::new(a.x * sx, a.y * sy), Point::new(b.x * sx, b.y * sy)))
+        .collect();
+    let (crop, cw, ch, cx0, cy0, local) = crate::overlay::commands::mosaic_aligned_crop(
+        frame,
+        fw,
+        fh,
+        &scaled,
+        block_size,
+    )?;
+    let (pix, px, py, pw, ph) = crate::overlay::commands::render_mosaic_stroke_pixels(
+        &crop,
+        cw,
+        ch,
+        &local,
+        block_size,
+        color,
+    )?;
+    // 与预览同样：`ub::Bounds::new` 是「两对角点」，这里必须直接给 size
+    let bounds = ub::Bounds {
+        origin: ub::Point::new((cx0 + px) as f32 / sx, (cy0 + py) as f32 / sy),
+        size: ub::Point::new(pw as f32 / sx, ph as f32 / sy),
+    };
+    Some((build_render_image_from_pixels(pw, ph, pix), bounds))
+}
+
+/// 生成（或复用）**已提交马赛克笔迹**的显示层，**每笔一层**。
+///
+/// 覆盖"松手后 → 最终提交前"这一段：这一笔已经不在 `in_progress` 里，但必须仍然看得见，
+/// 否则用户会以为操作没生效。
+///
+/// 逐笔（而不是合并）渲染是必须的：每笔的颜色与块大小都可以不同，合并就只能取一个颜色，
+/// 第二笔换色会把前面所有笔迹一起染色（"第一笔也跟着变色"）。
+///
+/// 缓存键是 `DrawingState.revision`（提交/撤销/重做都会 +1），所以撤销一笔马上跟着消失。
+fn update_committed_mosaic_layers(
+    self_: &mut OverlayView,
+    window: &Window,
+) -> Vec<(Arc<RenderImage>, ub::Bounds)> {
+    // 先把各笔的 (regions, 块大小, 颜色) 取出来（克隆），后面要可变借用 self_
+    let strokes = mosaic_strokes_of(self_.drawing.visible_commands());
+    if strokes.is_empty() {
+        self_.mosaic_layer = None;
+        return Vec::new();
+    }
+    let wb = window.bounds();
+    let sx = self_.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+    let sy = self_.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+    let fresh = self_
+        .mosaic_layer
+        .as_ref()
+        .is_some_and(|c| c.revision == self_.drawing.revision && c.scale == (sx, sy));
+    if fresh {
+        return self_
+            .mosaic_layer
+            .as_ref()
+            .map(|c| c.layers.clone())
+            .unwrap_or_default();
+    }
+    let mut layers = Vec::with_capacity(strokes.len());
+    for (regions, block_size, color) in &strokes {
+        if let Some(layer) = mosaic_layer_from_stroke(
+            &self_.frame_pixels,
+            self_.frame_width,
+            self_.frame_height,
+            regions,
+            *block_size,
+            *color,
+            sx,
+            sy,
+        ) {
+            layers.push(layer);
+        }
+    }
+    self_.mosaic_layer = Some(CommittedMosaicCache {
+        revision: self_.drawing.revision,
+        scale: (sx, sy),
+        layers: layers.clone(),
+    });
+    layers
+}
+
+
+/// 生成（或复用）当前这一笔马赛克的**实时真像素预览层**。
+///
+/// 与提交路径共用 [`crate::overlay::commands::render_mosaic_stroke_pixels`]，
+/// 所以拖动中看到的就是松手后的成图（有测试逐像素钉住）。
+///
+/// 性能：只把笔迹包围盒**外扩一圈并按块对齐**的那块像素喂给核心函数 ——
+/// 对齐是必须的，块网格钉在 `bs` 整数倍上，裁剪原点错开会让块相位变化、预览与
+/// 提交对不上；好处是避免每帧克隆整帧像素（1080p 8MB）。
+fn update_mosaic_preview(
+    self_: &mut OverlayView,
+    window: &Window,
+) -> Option<(Arc<RenderImage>, ub::Bounds)> {
+    let Some(ip) = self_.in_progress.clone() else {
+        return None;
+    };
+    let DrawCommand::Mosaic { regions, block_size, color } = &*ip else {
+        self_.mosaic_preview = None;
+        return None;
+    };
+    if regions.is_empty() {
+        self_.mosaic_preview = None;
+        return None;
+    }
+    let wb = window.bounds();
+    let sx = self_.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+    let sy = self_.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+
+    // 画布逻辑坐标 → 帧物理像素
+    let scaled: Vec<(crate::overlay::drawing::Point, crate::overlay::drawing::Point)> = regions
+        .iter()
+        .map(|(a, b)| {
+            (
+                crate::overlay::drawing::Point::new(a.x * sx, a.y * sy),
+                crate::overlay::drawing::Point::new(b.x * sx, b.y * sy),
+            )
+        })
+        .collect();
+
+    // 缓存判据：笔迹只增不改 → stamp 个数 + 最后一个 stamp 就够
+    let last = scaled.last().map(|(a, b)| ((a.x, a.y), (b.x, b.y)));
+    let fresh = self_.mosaic_preview.as_ref().is_some_and(|c| {
+        c.region_count == scaled.len() && c.last_region == last && c.scale == (sx, sy)
+    });
+    if fresh {
+        let c = self_.mosaic_preview.as_ref()?;
+        return Some((c.image.clone(), c.bounds));
+    }
+
+    // 对齐裁剪：只抠出笔迹附近的一块（对齐到块网格，相位不变），避免克隆整帧
+    let (crop, cw, ch, cx0, cy0, local) = crate::overlay::commands::mosaic_aligned_crop(
+        &self_.frame_pixels,
+        self_.frame_width,
+        self_.frame_height,
+        &scaled,
+        *block_size,
+    )?;
+    let rendered = crate::overlay::commands::render_mosaic_stroke_pixels(
+        &crop,
+        cw,
+        ch,
+        &local,
+        *block_size,
+        *color,
+    );
+    let (pix, px, py, pw, ph) = rendered?;
+    // 目标 Bounds 用**逻辑像素**（画布坐标）：帧像素 / 缩放比。
+    //
+    // 注意：`ub::Bounds::new(from, to)` 是「两个对角点」构造函数，不是「原点+尺寸」！
+    // 这里必须用结构体字面量直接给 size —— 用 `new` 传 (原点, 尺寸) 会把 size 算成
+    // `尺寸 - 原点`（负数），`paint_image` 拿到负尺寸就什么都不画：预览层算得再对，
+    // 屏幕上也看不到（这个 bug 就是这么来的）。
+    let bounds = ub::Bounds {
+        origin: ub::Point::new((cx0 + px) as f32 / sx, (cy0 + py) as f32 / sy),
+        size: ub::Point::new(pw as f32 / sx, ph as f32 / sy),
+    };
+    let image = build_render_image_from_pixels(pw, ph, pix);
+    self_.mosaic_preview = Some(MosaicPreviewCache {
+        region_count: scaled.len(),
+        last_region: last,
+        scale: (sx, sy),
+        image: image.clone(),
+        bounds,
+    });
+    Some((image, bounds))
+}
+
 /// 增量画 Freehand 当前笔画到 freehand_incr（累积层）：
 /// 每帧只画新增段；buffer 矩形覆盖整笔包围盒（origin/尺寸都取整 + 对齐 32px 网格）
 /// 时直接复用，笔尖跑出 buffer 才重建。origin 取整保证绘制偏移的整数性，
@@ -3382,6 +3641,11 @@ fn update_in_progress_incr(
     }
 }
 
+/// 光栅化一组形状命令到 BGRA 图像 + 联合包围盒（逻辑像素，含 AA 外扩）。
+///
+/// GPUI `paint_quad` pixel_snap 到整数像素，重叠边缘产生串珠/锯齿感，所以这里
+/// 复用 commit 路径的 `commands::apply_commands` 逐像素解析式 AA，得到与最终成图
+/// 一致的平滑线条。返回 `None` 若无形状。
 fn rasterize_shapes(
     shapes: &[&DrawCommand],
     scale_factor: f32,
@@ -3643,48 +3907,15 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                     origin_y += line_height;
                 }
             }
-        DrawCommand::Mosaic { ref regions, color, block_size } => {
-            // 用 block_size 网格模拟马赛克像素化效果
-            let bs = (*block_size).max(1) as f32;
-            let bright = Hsla::from(rgba((u32::from(color.r) << 24)
-                | (u32::from(color.g) << 16)
-                | (u32::from(color.b) << 8)
-                | 0x60));
-            let dim = Hsla::from(rgba((u32::from(color.r) << 24)
-                | (u32::from(color.g) << 16)
-                | (u32::from(color.b) << 8)
-                | 0x28));
-            for rect in regions {
-                let a = rect.0;
-                let b = rect.1;
-                let (x1, y1) = (a.x.min(b.x), a.y.min(b.y));
-                let w = (b.x - a.x).abs();
-                let h = (b.y - a.y).abs();
-                if w < 1.0 || h < 1.0 { continue; }
-                let cells_x = (w / bs).ceil() as i32;
-                let cells_y = (h / bs).ceil() as i32;
-                for cy in 0..cells_y {
-                    for cx in 0..cells_x {
-                        let cell_fill = if (cx + cy) % 2 == 0 { bright } else { dim };
-                        let cx1 = x1 + cx as f32 * bs;
-                        let cy1 = y1 + cy as f32 * bs;
-                        let cw = bs.min(x1 + w - cx1);
-                        let ch = bs.min(y1 + h - cy1);
-                        if cw < 1.0 || ch < 1.0 { continue; }
-                        window.paint_quad(quad(
-                            Bounds {
-                                origin: point(px(cx1), px(cy1)),
-                                size: Size::new(px(cw), px(ch)),
-                            },
-                            px(0.),
-                            cell_fill,
-                            px(0.),
-                            gpui::transparent_black(),
-                            Default::default(),
-                        ));
-                    }
-                }
-            }
+        DrawCommand::Mosaic { .. } => {
+            // **空实现**：马赛克已经烤进帧像素（`apply_mosaic`），这里不需要再画任何东西。
+            //
+            // 这里原来画一层"亮/暗交替的格子"当示意，问题有两层：
+            //  1. 它不是马赛克本身，只是"这块被马赛克过"的图标；而真马赛克已经在
+            //     下面烤好了，这层示意图等于**盖在成图上**；
+            //  2. 已提交的笔迹更不该再画提示。
+            // 于是用户看到的是"拖动中=示意图、松手后=真像素"两张不同的图 —— 这就是
+            // "鼠标移动后效果和最终成型不一致"的来源。
         }
     }
 }
@@ -3993,6 +4224,22 @@ impl Render for OverlayView {
                 // 松手后 Freehand 已在 committed（单层），不再用 freehand_incr
                 _ => (None, None),
             };
+        // 已提交马赛克笔迹的显示层：松手后到最终提交前必须一直看得见，
+        // 否则"松手即消失"，用户会以为没生效。
+        let committed_mosaic_layers: Vec<(Arc<RenderImage>, ub::Bounds)> =
+            update_committed_mosaic_layers(self, window);
+
+        // 马赛克实时预览层：拖动中把**真像素**（与提交同一份实现）画在帧图之上，
+        // 所以"拖动中"看到的就是松手后的成图。非马赛克工具时为 None。
+        let mosaic_preview_layer: ShapeLayer = if matches!(
+            &self.in_progress.as_deref(),
+            Some(DrawCommand::Mosaic { .. })
+        ) {
+            update_mosaic_preview(self, window)
+        } else {
+            self.mosaic_preview = None;
+            None
+        };
 
         // 已提交的 Input 展示态：canvas 应跳过对应 Text 命令，避免文字重复
         // （已提交文字由元素层 Input 绘制）。
@@ -4086,8 +4333,8 @@ impl Render for OverlayView {
         };
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, in_progress_shape_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg), window, cx| {
                 // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
                 // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
                 if forbidden_hover {
@@ -4213,11 +4460,20 @@ impl Render for OverlayView {
                     if let Some((img, b)) = &committed_shape_layer {
                         paint_raster(window, img, *b);
                     }
+                    // 已提交的马赛克笔迹（松手后仍然可见；撤销后随之消失）。
+                    // **逐笔一层、按命令顺序画**：每笔颜色/块大小可不同，合并会用同一个颜色。
+                    for (img, b) in &committed_mosaic_layers {
+                        paint_raster(window, img, *b);
+                    }
                     // 先画已画 Freehand（freehand_incr），再画当前工具形状
                     if let Some((img, b)) = &in_progress_shape_layer.0 {
                         paint_raster(window, img, *b);
                     }
                     if let Some((img, b)) = &in_progress_shape_layer.1 {
+                        paint_raster(window, img, *b);
+                    }
+                    // 当前这一笔马赛克的真像素预览（与提交同源，逐像素一致）
+                    if let Some((img, b)) = &mosaic_preview_layer {
                         paint_raster(window, img, *b);
                     }
 
@@ -9176,4 +9432,371 @@ mod tests {
             ]
         );
     }
+    /// 合成一张带"正文段落"的测试画面：白底 + 30px 高的一段文字（比一笔的笔刷窄，
+    /// 所以"一次画笔"就该盖满）。字内的笔画都比块小，必须被块平均抹掉。
+    fn synth_text_screen(fw: u32, fh: u32) -> Vec<u8> {
+        let mut px = vec![0u8; (fw * fh) as usize * 4];
+        for y in 0..fh {
+            for x in 0..fw {
+                let i = ((y * fw + x) * 4) as usize;
+                px[i] = 250;
+                px[i + 1] = 250;
+                px[i + 2] = 252;
+                px[i + 3] = 255;
+            }
+        }
+        for row in 0..3u32 {
+            let ty = 140 + row * 10;
+            for seg in 0..14u32 {
+                let x0 = 60 + seg * 20;
+                for y in ty..ty + 7 {
+                    for x in x0..x0 + 12 {
+                        if x < fw && y < fh {
+                            let i = ((y * fw + x) * 4) as usize;
+                            px[i] = 30;
+                            px[i + 1] = 30;
+                            px[i + 2] = 40;
+                        }
+                    }
+                }
+            }
+        }
+        px
+    }
+
+    /// **预览与提交必须逐像素一致** —— 这是本次改动的核心承诺。
+    ///
+    /// 用户报的"鼠标移动后效果和最终成型不一致"来自两条各自独立的绘制路径
+    /// （预览画亮暗棋盘格、提交才做真像素）。现在两边都走
+    /// [`crate::overlay::commands::render_mosaic_stroke_pixels`]，这里把这条不变式
+    /// 钉死：同一笔的预览像素与提交后帧像素在笔迹范围内必须完全相同。
+    ///
+    /// 顺带守住第二件事：**一笔就把原文墨色抹掉**（遮挡），且块间保留色差。
+    #[test]
+    /// **换色只影响新笔，不改前面已画的笔**（用户报"第一个模糊也变色了"）。
+    ///
+    /// 缺陷成因：已提交笔迹的显示层把所有马赛克命令**合并成一层**渲染，颜色只取最后一
+    /// 笔的 —— 于是第二笔用黑色时，第一笔的红色区域也被重新渲染成黑色。
+    /// 这里钉住"每笔各自带颜色"这条不变式：按颜色渲染时输入必须逐笔独立。
+    #[test]
+    fn mosaic_strokes_keep_their_own_color() {
+        use crate::overlay::drawing::{Point as DPoint, RGBA};
+
+        let red = RGBA::new(0xFF, 0x00, 0x00, 0xFF);
+        let black = RGBA::new(0x00, 0x00, 0x00, 0xFF);
+        let stroke = |y: f32| {
+            (
+                DPoint::new(10.0, y),
+                DPoint::new(50.0, y + 20.0),
+            )
+        };
+        let cmds: Vec<std::sync::Arc<DrawCommand>> = vec![
+            std::sync::Arc::new(DrawCommand::Mosaic {
+                regions: vec![stroke(10.0)],
+                block_size: 12,
+                color: red,
+            }),
+            std::sync::Arc::new(DrawCommand::Mosaic {
+                regions: vec![stroke(100.0)],
+                block_size: 12,
+                color: black,
+            }),
+            // 非马赛克命令不应混进来
+            std::sync::Arc::new(DrawCommand::Rectangle {
+                rect: (DPoint::new(0.0, 0.0), DPoint::new(10.0, 10.0)),
+                color: red,
+                line_width: 2.0,
+            }),
+        ];
+
+        let strokes = mosaic_strokes_of(cmds.iter());
+        assert_eq!(strokes.len(), 2, "应当逐笔一条（非马赛克命令要过滤掉）");
+        assert_eq!(strokes[0].2, red, "第一笔必须保持自己的颜色");
+        assert_eq!(strokes[1].2, black, "第二笔必须保持自己的颜色");
+        // 逐笔独立渲染的前提：两笔的笔迹区域不能混在一起
+        assert_eq!(strokes[0].0.len(), 1);
+        assert_eq!(strokes[1].0.len(), 1);
+        assert_ne!(
+            strokes[0].0[0].0.y, strokes[1].0[0].0.y,
+            "两笔的区域被合并了 —— 合并就会用同一个颜色渲染"
+        );
+    }
+
+    fn mosaic_preview_matches_commit_pixel_for_pixel() {
+        use crate::overlay::commands::{apply_commands, render_mosaic_stroke_pixels};
+        use crate::overlay::drawing::Point as DPoint;
+
+        let (fw, fh) = (520u32, 300u32);
+        let orig = synth_text_screen(fw, fh);
+        let (brush, block_size) = mosaic_geom(3.0);
+        let brush = brush as i32;
+        let (cx0, cx1, cy) = (60i32, 460i32, 155i32);
+        let half = brush as f32 / 2.0;
+        let mut regions: Vec<(DPoint, DPoint)> = Vec::new();
+        let mut cx = cx0 as f32;
+        while cx <= cx1 as f32 {
+            regions.push((
+                DPoint::new(cx - half, cy as f32 - half),
+                DPoint::new(cx + half, cy as f32 + half),
+            ));
+            cx += brush as f32 * 0.5;
+        }
+        // 生产色：默认色板是不透明的红（按 0x60 半透明叠加）
+        let color = RGBA::new(0xE6, 0x22, 0x22, 0xFF);
+
+        // ① 预览（走共用路径）
+        let (preview, px, py, pw, ph) = render_mosaic_stroke_pixels(
+            &orig,
+            fw,
+            fh,
+            &regions,
+            block_size,
+            color,
+        )
+        .expect("预览应当产出像素");
+
+        // ② 提交（走真实提交路径）
+        let mut committed = crate::capture::CapturedFrame {
+            width: fw,
+            height: fh,
+            pixels: orig.clone(),
+        };
+        apply_commands(
+            &mut committed,
+            0.0,
+            0.0,
+            &[DrawCommand::Mosaic {
+                regions: regions.clone(),
+                block_size,
+                color,
+            }],
+        )
+        .unwrap();
+
+        // ③ 逐像素比对：预览**不透明**的每个像素，都必须与提交结果完全相同。
+        //    （预览的半透明像素是"笔迹没覆盖到"的地方，叠在帧图上不改变画面。）
+        let mut compared = 0usize;
+        let mut diff = 0usize;
+        let mut first_bad = None;
+        for y in 0..ph as i32 {
+            for x in 0..pw as i32 {
+                let p_off = ((y * pw as i32 + x) * 4) as usize;
+                if preview[p_off + 3] == 0 {
+                    continue;
+                }
+                let c_off = ((((py + y) as u32) * fw + (px + x) as u32) * 4) as usize;
+                compared += 1;
+                if preview[p_off..p_off + 4] != committed.pixels[c_off..c_off + 4] {
+                    diff += 1;
+                    if first_bad.is_none() {
+                        first_bad = Some((
+                            px + x,
+                            py + y,
+                            [preview[p_off], preview[p_off + 1], preview[p_off + 2]],
+                            [
+                                committed.pixels[c_off],
+                                committed.pixels[c_off + 1],
+                                committed.pixels[c_off + 2],
+                            ],
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(compared > 5000, "比对的像素太少：{compared}");
+        assert_eq!(
+            diff, 0,
+            "预览与提交有 {diff}/{compared} 个像素不同（首个差异 {:?}）—— 拖动中与成型后不是同一张图",
+            first_bad
+        );
+
+        // ④ 遮挡成立：笔迹带内不应再有原文墨色（30）
+        let core_y0 = cy - brush / 2 + 4;
+        let core_y1 = cy + brush / 2 - 4;
+        let mut ink = 0usize;
+        for y in core_y0..core_y1 {
+            for x in (cx0 + brush)..(cx1 - brush) {
+                let i = ((y as u32 * fw + x as u32) * 4) as usize;
+                if committed.pixels[i] == 30 {
+                    ink += 1;
+                }
+            }
+        }
+        assert_eq!(ink, 0, "一笔之后仍有 {ink} 个原文墨色像素 —— 没盖住");
+    }
+
+    /// **一笔马赛克就要把内容盖住**（用户的核心诉求），并且块之间有色差。
+    ///
+    /// 针对的缺陷：原来每块只取左上角一个像素（等于把内容搬个位置）、块只有 4px
+    /// （块里装不下一笔画、块平均等于原文局部色），于是"要反复涂抹才能遮挡"。
+    ///
+    /// 叠加 `SCREENSHOT_RS_MOSAIC_DUMP=<前缀>` 可导出**原图 / 成图** PNG 供肉眼核对
+    /// （盖没盖住最终只能靠眼睛定案，断言只保证必要条件）。
+    #[test]
+    fn mosaic_stroke_hides_text_in_one_pass() {
+        use crate::overlay::commands::apply_commands;
+        use crate::overlay::drawing::Point as DPoint;
+
+        let (fw, fh) = (520u32, 300u32);
+        let orig = synth_text_screen(fw, fh);
+
+        // 生产参数（默认档：线宽 3）
+        let lw = 3.0f32;
+        let (brush, block_size) = mosaic_geom(lw);
+        let brush = brush as i32;
+
+        // **一笔**：沿正文横刷一次（就是用户"一次画笔"的动作）
+        let (cx0, cx1, cy) = (60i32, 460i32, 155i32);
+        let (ry0, ry1) = (cy - brush / 2, cy - brush / 2 + brush);
+        let mut regions: Vec<(DPoint, DPoint)> = Vec::new();
+        let mut cx = cx0 as f32;
+        while cx <= cx1 as f32 {
+            regions.push((
+                DPoint::new(cx - brush as f32 / 2.0, ry0 as f32),
+                DPoint::new(cx - brush as f32 / 2.0 + brush as f32, ry1 as f32),
+            ));
+            cx += (brush as f32 * 0.5).max(1.0);
+        }
+        assert!(regions.len() < 60, "一笔不该是几百个方块");
+
+        // 默认色板是不透明的红（按 0x60 半透明叠加）；要单看马赛克本身时
+        // 用 SCREENSHOT_RS_MOSAIC_NO_TINT=1 换成 TRANSPARENT。
+        let preview_color = if std::env::var_os("SCREENSHOT_RS_MOSAIC_NO_TINT").is_some() {
+            RGBA::TRANSPARENT
+        } else {
+            RGBA::new(0xE6, 0x22, 0x22, 0xFF)
+        };
+        let mut committed = crate::capture::CapturedFrame {
+            width: fw,
+            height: fh,
+            pixels: orig.clone(),
+        };
+        apply_commands(
+            &mut committed,
+            0.0,
+            0.0,
+            &[DrawCommand::Mosaic {
+                regions: regions.clone(),
+                block_size,
+                color: preview_color,
+            }],
+        )
+        .unwrap();
+
+        let at = |x: i32, y: i32| -> u8 {
+            committed.pixels[((y as u32 * fw + x as u32) * 4) as usize]
+        };
+        // 笔迹**核心带**（避开笔刷边缘那一圈，那里是硬的边界）
+        let (core_y0, core_y1) = (cy - brush / 2 + 4, cy + brush / 2 - 4);
+        let (core_x0, core_x1) = (cx0 + brush, cx1 - brush);
+
+        // ---- ① 一笔之后，核心带内**原文的墨色必须消失** ----
+        //
+        // 这是"一笔就遮挡"最直接的度量：原文墨色是 30，一笔刷过之后不应再有像素是 30。
+        let mut total = 0usize;
+        let mut ink_left = 0usize;
+        let mut distinct = std::collections::BTreeSet::new();
+        for y in core_y0..core_y1 {
+            for x in core_x0..core_x1 {
+                let v = at(x, y);
+                total += 1;
+                distinct.insert(v);
+                if v == 30 {
+                    ink_left += 1;
+                }
+            }
+        }
+        assert!(total > 1000, "取样区太小：{total}");
+        assert_eq!(
+            ink_left, 0,
+            "笔迹带内还有 {ink_left} 个像素是原文的墨色（30）—— 一笔没盖住"
+        );
+
+        // ---- ② 带内被**量化成块**：取值种类应是"块的数量级"而非像素数 ----
+        //
+        // 块内整块同色 → 一条 48px 高、几百像素宽的带子里只应有几十种色值。
+        // 这里不断言"逐块完全均匀"：笔迹最外一圈的块会被笔迹边界切掉一条，那一圈本来
+        // 就是硬的边界（马赛克没有渐隐），块均值天然与整块不同，不是缺陷。
+        let blocks_x = ((core_x1 - core_x0) / block_size as i32).max(1);
+        let blocks_y = ((core_y1 - core_y0) / block_size as i32).max(1);
+        let block_budget = (blocks_x * blocks_y + blocks_x + blocks_y + 8) as usize;
+        assert!(
+            distinct.len() <= block_budget,
+            "带内取值种类 {} 超过块数量级 {}（块 {block_size}px，区域 {blocks_x}×{blocks_y}），没量化成块",
+            distinct.len(),
+            block_budget
+        );
+        // 块之间要有色差（"多个不同颜色的小方块"），不是一片死色
+        assert!(
+            distinct.len() >= 3,
+            "带内只有 {} 种色值，色块看不出差异",
+            distinct.len()
+        );
+
+        // ---- ①b 预览层按**真实偏移**叠加到帧图上，必须与提交成图一致 ----
+        //
+        // 预览在渲染时是这样用的：抠出一块（对齐裁剪）→ 算 → 用 `bounds` 画回去。
+        // 这里把这套算术完整走一遍，验证"叠加回去"的结果与提交成图相同 ——
+        // 位置/尺寸算错（偏移、单位、缩放）都会在这里露出来。
+        {
+            use crate::overlay::commands::{mosaic_aligned_crop, render_mosaic_stroke_pixels};
+            let (crop, cw, ch, cx0, cy0, local) =
+                mosaic_aligned_crop(&orig, fw, fh, &regions, block_size).expect("裁剪应当成功");
+            let (pix, px, py, pw, ph) =
+                render_mosaic_stroke_pixels(&crop, cw, ch, &local, block_size, preview_color)
+                    .expect("预览渲染应当成功");
+            let mut composite = orig.clone();
+            for y in 0..ph as i32 {
+                for x in 0..pw as i32 {
+                    let s_off = ((y * pw as i32 + x) * 4) as usize;
+                    if pix[s_off + 3] == 0 {
+                        continue;
+                    }
+                    let (tx, ty) = (cx0 + px + x, cy0 + py + y);
+                    if tx < 0 || ty < 0 || tx >= fw as i32 || ty >= fh as i32 {
+                        continue;
+                    }
+                    let d_off = ((ty as u32 * fw + tx as u32) * 4) as usize;
+                    let a = pix[s_off + 3] as u32;
+                    let inv = 255 - a;
+                    for c in 0..3 {
+                        composite[d_off + c] = ((pix[s_off + c] as u32 * a
+                            + composite[d_off + c] as u32 * inv)
+                            / 255) as u8;
+                    }
+                }
+            }
+            let diff = (0..composite.len())
+                .step_by(4)
+                .filter(|&i| composite[i] != committed.pixels[i])
+                .count();
+            assert_eq!(
+                diff, 0,
+                "把预览层按 bounds 叠加回帧图后有 {diff} 个像素与提交成图不同 —— 预览位置/尺寸算错了"
+            );
+            // 顺带导出合成图，供肉眼核对（预览画出来就是这张）
+            if let Ok(prefix) = std::env::var("SCREENSHOT_RS_MOSAIC_DUMP") {
+                let img = image::RgbaImage::from_raw(fw, fh, composite).expect("构造图片失败");
+                let path = format!("{prefix}_composited.png");
+                img.save(&path).expect("保存 PNG 失败");
+                eprintln!("[mosaic dump] composited → {path}");
+            }
+        }
+
+        // ---- ③ 导出对照图（可选） ----
+        if let Ok(prefix) = std::env::var("SCREENSHOT_RS_MOSAIC_DUMP") {
+            for (tag, px) in [("original", &orig), ("committed", &committed.pixels)] {
+                let img = image::RgbaImage::from_raw(fw, fh, px.clone()).expect("构造图片失败");
+                let path = format!("{prefix}_{tag}.png");
+                img.save(&path).expect("保存 PNG 失败");
+                eprintln!("[mosaic dump] {tag} → {path}");
+            }
+            eprintln!(
+                "[mosaic dump] 笔刷 {brush}px 块 {block_size}px 色值 {} 种（一笔 {} 个 stamp）",
+                distinct.len(),
+                regions.len()
+            );
+        }
+    }
+
 }
