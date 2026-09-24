@@ -257,6 +257,11 @@ pub struct OverlayView {
     /// 鼠标光标位置（逻辑像素，窗口坐标系）。用来画全屏十字参考线与坐标徽章。
     /// `None` = 本次会话还没收到过鼠标移动（刚唤起覆盖层时）。
     cursor_pos: Option<BoundsPoint>,
+    /// 指针是不是在屏幕顶上那一条里（GNOME 顶栏占的高度，见 `TOP_EDGE_STRIP`）。
+    /// 那一条里覆盖层既收不到移动事件、又画在顶栏底下：自绘的短十字参考线/坐标徽章
+    /// 会"卡"在那条下沿。所以这时把 `cursor_pos` 钉在 `TOP_EDGE_READOUT_Y`（那条下
+    /// 边）显示，光标样式也交回系统箭头，用系统光标完成顶边那一段的框选观感。
+    cursor_at_top: bool,
     /// 马赛克笔刷：隐藏系统光标，让自绘圆盘当指针（见 overlay/brush_cursor.rs）
     brush_cursor: crate::overlay::brush_cursor::BrushCursor,
     /// 上一次**已经显示过**的物理像素坐标（取整）。只有它变化才 `notify`：
@@ -415,6 +420,7 @@ impl OverlayView {
             cmd_drag: None,
             hover_shape: false,
             cursor_pos: None,
+            cursor_at_top: false,
             brush_cursor: crate::overlay::brush_cursor::BrushCursor::new(),
             cursor_phys: None,
             forbidden_hover: false,
@@ -3352,6 +3358,13 @@ fn hud_badge(
 /// 正好落在徽章上那个坐标对应的像素上（不会差半个物理像素）。
 /// 只在取整后的物理坐标变化时才 `notify`：高 DPI 下鼠标移动的亚像素抖动不该
 /// 触发整个覆盖层重绘。
+/// GNOME 顶栏的高度（`_NET_WORKAREA` 从 y=32 起）。覆盖层画在这一条里会被顶栏盖住，
+/// 指针一旦进这一条，移动事件也到不了覆盖层（见 `overlay_window_kind` 的说明）。
+const TOP_EDGE_STRIP: f32 = 32.0;
+/// 指针进到上面那一条时，自绘的短十字参考线/坐标徽章钉在这个 y 上——顶栏下沿再留
+/// 一点点，保证整个 `+` 都露在顶栏下面看得见。
+const TOP_EDGE_READOUT_Y: f32 = 34.0;
+
 fn update_cursor_readout(
     this: &mut OverlayView,
     p: BoundsPoint,
@@ -3361,7 +3374,16 @@ fn update_cursor_readout(
     let (sx, sy) = frame_scale(window, this.frame_width, this.frame_height);
     let phys = ((p.x * sx).round() as i32, (p.y * sy).round() as i32);
     let changed = this.cursor_phys != Some(phys);
-    this.cursor_pos = Some(BoundsPoint::new(phys.0 as f32 / sx, phys.1 as f32 / sy));
+    // 指针进到屏幕顶上那一条（GNOME 顶栏占的高度）时，覆盖层在那儿画不出来也收不到
+    // 事件：自绘的短十字参考线/坐标徽章钉在那条**下沿**显示，那一条的观感交给系统
+    // 光标（见 `TOP_EDGE_STRIP`）。注意只挪**绘制**位置：`cursor_phys` 仍是真实坐标，
+    // 所以坐标徽章显示的数值不会骗人。
+    let draw_y = if phys.1 as f32 / sy < TOP_EDGE_STRIP {
+        TOP_EDGE_READOUT_Y
+    } else {
+        phys.1 as f32 / sy
+    };
+    this.cursor_pos = Some(BoundsPoint::new(phys.0 as f32 / sx, draw_y));
     this.cursor_phys = Some(phys);
     // 光标形态跟着工具走，所以每次移动都同步一次（内部幂等，不翻转不发 X 请求）
     sync_brush_cursor(this);
@@ -4734,12 +4756,20 @@ impl Render for OverlayView {
             RGBA::TRANSPARENT
         };
 
+        // 指针是否贴在屏幕顶上那一条（见 `TOP_EDGE_STRIP`）：画布里要据此换成系统箭头，
+        // 所以先取成本地量再进闭包。
+        let cursor_at_top_local = self.cursor_at_top;
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg, cursor_hint),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg, cursor_hint), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg, cursor_hint, cursor_at_top_local),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg, cursor_hint, cursor_at_top), window, cx| {
                 // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
                 // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
-                if forbidden_hover {
+                if cursor_at_top {
+                    // 指针贴在屏幕顶上那一条：自绘的 `+` 已经钉到那条下沿，这里把系统
+                    // 光标交回箭头——那一条里显示的是系统光标（系统画的，能一路到顶），
+                    // 顶边那一段的框选观感由它完成（用户方案）。
+                    window.set_window_cursor_style(gpui::CursorStyle::Arrow);
+                } else if forbidden_hover {
                     // 禁止光标：让"点不动"有明确反馈（不是没反应）
                     window.set_window_cursor_style(gpui::CursorStyle::OperationNotAllowed);
                 } else if hover_shape {
@@ -5618,6 +5648,18 @@ impl Render for OverlayView {
                     this.screen_bounds.origin.y,
                     this.screen_bounds.origin.y + this.screen_bounds.size.y,
                 );
+                // 指针进到屏幕顶上那一条（GNOME 顶栏占的高度）时，覆盖层在那儿既收不到
+                // 移动事件、又画在顶栏底下——自绘的短十字参考线/坐标徽章会"卡"在那条
+                // 下沿（用户反馈"正常箭头能到顶，换成 + 就上不去"：系统光标是系统画的、
+                // 永远在最上层，我们自绘的 `+` 不是）。
+                // 方案：那一条交给**系统光标**去完成观感，我们自绘的 `+` 钉在那条**下边**
+                // 显示（只挪绘制位置，真实坐标照旧：框选按 `p` 算，所以顶边照样能框进去，
+                // 坐标徽章显示的也仍是真实坐标——见 `update_cursor_readout`）。
+                let at_top = p.y < TOP_EDGE_STRIP;
+                if at_top != this.cursor_at_top {
+                    this.cursor_at_top = at_top;
+                    cx.notify();
+                }
                 // 记录光标（此时只裁到屏幕内）：十字参考线要跟手走遍全屏，
                 // 所以不能等下面裁到选区之后才记录。
                 update_cursor_readout(this, p, window, cx);
@@ -7124,30 +7166,22 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
     }
 }
 
-/// 覆盖窗口的 `WindowKind`：Linux 必须用 `Normal`，其它平台保持 `PopUp`。
+/// 覆盖窗口的 `WindowKind`：**Linux 也用 `PopUp`**（＝ `_NET_WM_WINDOW_TYPE_NOTIFICATION`）。
 ///
-/// gpui 只在 `PopUp` 时给窗口打 `_NET_WM_WINDOW_TYPE_NOTIFICATION`（见
-/// gpui_linux/.../x11/window.rs 的 PopUp 分支），而 mutter 对这类窗口**不允许进全屏
-/// 状态**——本机实测其 `_NET_WM_ALLOWED_ACTIONS` 只有 CHANGE_DESKTOP/ABOVE/BELOW，
-/// 没有 FULLSCREEN，于是 `set_overlay_fullscreen` 发的请求被直接丢掉。
+/// 曾经为了"盖过 GNOME 顶栏、让屏幕最上边那一条也能框选"改成 `Normal` +
+/// `_NET_WM_STATE_FULLSCREEN`（commit 85bf1ef），但那条路有消不掉的代价：受管窗口在
+/// 重新 map 时会被 mutter **先按工作区安置一次**（头 1~2 帧 `1920x1048+0+32`，
+/// `_NET_WORKAREA = 0,32,1920,1048`），随后才应用全屏（约 130~200ms，含顶栏让位动画）
+/// ——于是 alt+s 后看到的是"先出现一个窗口大小的遮罩、再变成整屏一致的遮罩"。
 ///
-/// 为什么必须要全屏：GNOME 顶栏画在 gnome-shell 那个 `_NET_WM_WINDOW_TYPE_DESKTOP`
-/// 的 stage 窗口上（铺满全屏，且在普通窗口之上，见 `set_overlay_fullscreen` 的说明），
-/// 只有全屏窗口才能压过它。不进全屏的话，屏幕最上面那一条（顶栏高度）的指针事件
-/// 到不了覆盖层，用户就"框选/画矩形到不了屏幕最上边"。
+/// `PopUp`/NOTIFICATION 不受工作区夹持、也没资格全屏，所以遮罩一次到位（与老版观感
+/// 一致）。代价：GNOME 顶栏画在 gnome-shell 的 stage 窗口上、压在覆盖层之上，屏幕最上面
+/// 那一条（顶栏高度）里覆盖层画不出东西——十字线上半截/选区上边线看不见。
 ///
-/// `Normal` 不带 `_NET_WM_WINDOW_TYPE` 属性 = 普通窗口，mutter 允许 FULLSCREEN。
-/// 代价是普通窗口会进任务栏/alt-tab，所以唤醒时同时发 SKIP_TASKBAR/SKIP_PAGER。
-/// Windows/macOS 维持 `PopUp`：那边的置顶、不进任务栏语义都依赖它。
+/// 将来若要"两样都要"，唯一可行的路子是：平时不让位（面板亮着），只在指针/选区拖到
+/// 顶边时才请求全屏让面板让位，并按 X 实测几何做"窗口只盖工作区"的子区域坐标映射。
 const fn overlay_window_kind() -> WindowKind {
-    #[cfg(target_os = "linux")]
-    {
-        WindowKind::Normal
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        WindowKind::PopUp
-    }
+    WindowKind::PopUp
 }
 
 /// 覆盖窗口的目标尺寸（逻辑像素）：主显示 bounds。
@@ -7237,22 +7271,11 @@ fn reuse_overlay_window(
         root.hide_tooltip(window, cx);
         // 2) 放大到全屏：非 X11 平台 park 时缩成了 1×1，需要在这里恢复。
         //
-        //    X11 下不需要 resize，但**别把"窗口尺寸从头到尾不变"当成事实**：park
-        //    只 unmap 是真的，可 mutter 在重新 map 一个 `Normal` 窗口（见
-        //    `overlay_window_kind`）时会先按工作区安置一次——实测头 1~2 帧是
-        //    `1920x1048+0+32`（`_NET_WORKAREA = 0,32,1920,1048`），随后才应用
-        //    `_NET_WM_STATE_FULLSCREEN`（约 130~200ms，含顶栏让位动画）。这期间
-        //    的渲染会被 X 裁掉顶上 32px，用户看到的是"先出现一个窗口大小的遮罩、
-        //    再变成整屏一致的遮罩"。老版是 `PopUp`/NOTIFICATION 类型：不受工作区
-        //    夹持、也没资格全屏，所以没有这个中间态——代价是顶上那一条被 GNOME
-        //    面板压着，覆盖层画在那里的十字线上半截/选区上边线看不见。
-        //
-        //    已试过但**无效**的修法（别重复踩）：
-        //    ① 停靠态就先请求全屏：mutter 对 unmap 的窗口直接忽略，600ms 都不进
-        //       整屏（tests/x11_wm_race_probe.rs::probe_fullscreen_while_parked）；
-        //    ② map 后由客户端自己 `ConfigureWindow` 改成整屏（含 80ms 有界重发）：
-        //       探针窗口 +10ms 生效，但真实覆盖窗口会被 mutter 安置回 `1920x1048`
-        //       （2026-09-24 实测日志：`唤醒校验：连发 78ms 后窗口仍未到整屏`）。
+        //    X11 下不需要 resize：park 只 unmap，`PopUp`/NOTIFICATION 类型不受工作区
+        //    约束（不会被 mutter 安置成 `1920x1048+0+32`），map 之后窗口尺寸就是整屏。
+        //    **这个结论只对 PopUp 成立**：曾经改成 `Normal` + 请求全屏去争顶边，那样
+        //    每次唤醒都会被工作区夹一次，遮罩出现"先一个窗口大小、再整屏一致"的两段式；
+        //    详见 `overlay_window_kind` 的说明。
         #[cfg(not(target_os = "linux"))]
         window.resize(Size::new(px(actual_w), px(actual_h)));
         // Windows：把遮罩窗口客户端顶对齐到帧捕获原点（主屏物理 0,0）。
@@ -7315,6 +7338,7 @@ fn with_x11_window<R>(window: &Window, f: impl FnOnce(&x11rb::xcb_ffi::XCBConnec
     Some(f(&conn, xcb_wh.window.into()))
 }
 
+
 /// 通过 EWMH `_NET_WM_STATE` 给窗口增删一个状态（ADD=1 / REMOVE=0）。
 ///
 /// EWMH 规定改状态必须发 ClientMessage 给 root（直接改属性已废弃，WM 可能不认），
@@ -7373,7 +7397,6 @@ fn set_overlay_fullscreen(window: &Window, on: bool) {
 
 #[cfg(not(target_os = "linux"))]
 fn set_overlay_fullscreen(_window: &Window, _on: bool) {}
-
 /// 回读覆盖窗口在 root 坐标系下的实际位置/尺寸（诊断用）。
 ///
 /// WM 有可能不按我们要求的摆窗口（约束到工作区、加边框等），而这会直接表现成
@@ -7508,14 +7531,13 @@ fn unpark_overlay_window(window: &mut Window) {
             }
         }
     }
-    // 必须等窗口已 map 再请求全屏：WM 只处理已映射窗口的状态变更。
-    // 目的见 `set_overlay_fullscreen`——盖过 GNOME 顶栏，否则最上面那一条
-    // 收不到指针事件，用户"框选不到屏幕最上边"。
-    set_overlay_fullscreen(window, true);
-    // Linux 用的是 Normal 类型（见 `overlay_window_kind`），不设这两个状态
-    // 它会出现在任务栏和 alt-tab 里。
-    let _ = send_wm_state(window, b"_NET_WM_STATE_SKIP_TASKBAR", true);
-    let _ = send_wm_state(window, b"_NET_WM_STATE_SKIP_PAGER", true);
+    // 不再请求 `_NET_WM_STATE_FULLSCREEN`：那是 commit 85bf1ef 为了让覆盖层盖过
+    // GNOME 顶栏加的，而 `PopUp`/NOTIFICATION 窗口本来就没资格进全屏（mutter 的
+    // `_NET_WM_ALLOWED_ACTIONS` 不含 FULLSCREEN，请求会被丢掉），留着只会误导。
+    // 代价见 `overlay_window_kind`：顶栏仍压在覆盖层之上，最上面那一条画不出东西。
+    //
+    // SKIP_TASKBAR/SKIP_PAGER 是 `Normal` 时代为"别进任务栏/alt-tab"加的，`PopUp`
+    // 下 mutter 忽略它们，所以这里一并撤掉。
     log_overlay_geometry(window);
 }
 

@@ -506,3 +506,153 @@ fn probe_client_resize_overrides_workarea_clamp() {
     conn.destroy_window(win).unwrap();
     conn.flush().unwrap();
 }
+
+/// 写入单个 atom 值的 `_NET_WM_WINDOW_TYPE`。
+fn set_window_type(conn: &RustConnection, win: u32, name: &[u8]) {
+    let ty = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let val = conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+    conn.change_property(
+        PropMode::REPLACE,
+        win,
+        ty,
+        x11rb::protocol::xproto::AtomEnum::ATOM,
+        32,
+        1,
+        &val.to_ne_bytes(),
+    )
+    .unwrap();
+    conn.flush().unwrap();
+}
+
+fn atom_name(conn: &RustConnection, atom: u32) -> String {
+    conn.get_atom_name(atom)
+        .unwrap()
+        .reply()
+        .map(|r| String::from_utf8_lossy(&r.name).to_string())
+        .unwrap_or_default()
+}
+
+/// 打印某个 atom 列表属性的可读名字。
+fn prop_atoms(conn: &RustConnection, win: u32, name: &[u8]) -> String {
+    let a = conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+    match conn
+        .get_property(
+            false,
+            win,
+            a,
+            x11rb::protocol::xproto::AtomEnum::ATOM,
+            0,
+            64,
+        )
+        .unwrap()
+        .reply()
+    {
+        Ok(r) => {
+            let names: Vec<String> = r
+                .value32()
+                .map(|it| it.map(|v| atom_name(conn, v)).collect())
+                .unwrap_or_default();
+            format!("{:?}", names)
+        }
+        Err(e) => format!("<err {:?}>", e),
+    }
+}
+
+/// 变体 E：窗口**已经 map 成整屏**（NOTIFICATION 类型、不被工作区夹）之后，只改
+/// `_NET_WM_WINDOW_TYPE` 为 NORMAL，再请求 `_NET_WM_STATE_FULLSCREEN`。
+///
+/// 这是"让顶上那条可见（压过 GNOME 顶栏）又不变几何"的最省事路子：不重新 map，
+/// 所以理论上不会触发 map 时的工作区安置，也就没有"窗口大小的遮罩"那个中间态。
+///
+/// 观感验证：整屏**透明** ARGB 窗口，只在顶上 32px 画一条不透明绿条——顶栏让位前
+/// 绿条被它压住（看不到），让位后绿条露出＝说明覆盖层能在那一条里被看见。
+#[test]
+#[ignore]
+fn probe_e_type_change_then_fullscreen() {
+    use x11rb::protocol::xproto::{ColormapAlloc, CreateGCAux, Rectangle};
+    let (conn, screen_num) = x11rb::connect(None).unwrap();
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let w = screen.width_in_pixels;
+    let h = screen.height_in_pixels;
+    let (depth, visual) = find_argb_visual(&conn, screen_num).expect("no 32-bit visual");
+    let win = conn.generate_id().unwrap();
+    let cmap = conn.generate_id().unwrap();
+    conn.create_colormap(ColormapAlloc::NONE, cmap, root, visual)
+        .unwrap();
+    conn.create_window(
+        depth,
+        win,
+        root,
+        0,
+        0,
+        w,
+        h,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        visual,
+        &CreateWindowAux::new()
+            .colormap(cmap)
+            .background_pixel(0)
+            .border_pixel(0)
+            .event_mask(EventMask::STRUCTURE_NOTIFY),
+    )
+    .unwrap();
+    set_window_type(&conn, win, b"_NET_WM_WINDOW_TYPE_NOTIFICATION");
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    println!(
+        "  [E] map 后       geom={} type={} allowed={}",
+        abs_geom(&conn, win),
+        prop_atoms(&conn, win, b"_NET_WM_WINDOW_TYPE"),
+        prop_atoms(&conn, win, b"_NET_WM_ALLOWED_ACTIONS")
+    );
+    // 只画顶上 32px，其余保持透明（alpha=0）。
+    let gc = conn.generate_id().unwrap();
+    conn.create_gc(gc, win, &CreateGCAux::new().foreground(0xff00ff00u32))
+        .unwrap();
+    conn.poly_fill_rectangle(
+        win,
+        gc,
+        &[Rectangle {
+            x: 0,
+            y: 0,
+            width: w,
+            height: 32,
+        }],
+    )
+    .unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    println!("  [E] 绿条已画（此刻顶栏应仍压在上面 → 看不到绿）");
+    set_window_type(&conn, win, b"_NET_WM_WINDOW_TYPE_NORMAL");
+    std::thread::sleep(Duration::from_millis(250));
+    println!(
+        "  [E] 改类型后     geom={} type={} allowed={}",
+        abs_geom(&conn, win),
+        prop_atoms(&conn, win, b"_NET_WM_WINDOW_TYPE"),
+        prop_atoms(&conn, win, b"_NET_WM_ALLOWED_ACTIONS")
+    );
+    send_state(&conn, root, win, b"_NET_WM_STATE_FULLSCREEN", true);
+    for i in 1..=8u64 {
+        std::thread::sleep(Duration::from_millis(60));
+        println!(
+            "  [E] +{}ms  geom={} states={}",
+            i * 60,
+            abs_geom(&conn, win),
+            prop_atoms(&conn, win, b"_NET_WM_STATE")
+        );
+    }
+    println!("  [E] 保持 5s：看顶栏是否让位、绿条是否露出");
+    std::thread::sleep(Duration::from_secs(5));
+    conn.destroy_window(win).unwrap();
+    conn.free_gc(gc).unwrap();
+    conn.flush().unwrap();
+    println!("  [E] 结束");
+}
