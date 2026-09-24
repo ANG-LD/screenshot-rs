@@ -6056,6 +6056,9 @@ impl Render for PinWindowView {
         );
 
         let entity_for_top = entity.clone();
+        // 只有 Windows 的「放大/还原」回调要用它（见下方 cfg(target_os = "windows") 块），
+        // Linux 上 Pin 的放大态由窗口管理器持有，这份克隆用不到，所以按平台条件编译。
+        #[cfg(target_os = "windows")]
         let entity_for_max = entity.clone();
         // 放大态下按钮语义变「还原」。只有 Windows 自持该状态（见
         // `PinWindowView::maximize_restore`）；Linux 由窗口管理器持有，无法回读。
@@ -6179,6 +6182,11 @@ impl Render for PinWindowView {
                         PinBtnTone::Neutral,
                         max_tip,
                         move |_ev: &MouseDownEvent, window: &mut Window, app: &mut App| {
+                            // App 句柄只在 Windows 分支里用到（下面 `app.spawn` 需要它把
+                            // SetWindowPos 延后到 App 借期外）；Linux 上放大/还原交给窗口
+                            // 管理器，这里显式标记"本平台不用"，避免 unused 告警。
+                            #[cfg(not(target_os = "windows"))]
+                            let _ = &mut *app;
                             // ── Windows：自绘「放大 / 还原」──────────────────────
                             // Pin 窗口是固定尺寸窗口（没有 WS_MAXIMIZEBOX），
                             // `ShowWindow(SW_MAXIMIZE)` 在 Win32 里是空操作——
