@@ -433,3 +433,76 @@ fn probe_clamp_timeline_prestate() {
     conn.destroy_window(win).unwrap();
     conn.flush().unwrap();
 }
+
+/// 变体 C：停靠状态下就先发 ADD FULLSCREEN，再 map——看 mutter 会不会一上来
+/// 就按整屏安置（＝没有"先按工作区夹一次"的那 1~2 帧），以及会不会提前显示窗口。
+#[test]
+#[ignore]
+fn probe_fullscreen_while_parked() {
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    let root = conn.setup().roots[0].root;
+    let win = make_invisible_overlay_probe(&conn);
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    conn.unmap_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    println!("  [C] 停靠后: {} geom={}", map_state(&conn, win), abs_geom(&conn, win));
+
+    send_state(&conn, root, win, b"_NET_WM_STATE_FULLSCREEN", true);
+    std::thread::sleep(Duration::from_millis(250));
+    println!(
+        "  [C] 停靠中发 ADD FULLSCREEN 后: {} geom={}",
+        map_state(&conn, win),
+        abs_geom(&conn, win)
+    );
+
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    sample_timeline(&conn, win, 600, "C 先ADD再map");
+    conn.destroy_window(win).unwrap();
+    conn.flush().unwrap();
+}
+
+/// 变体 D：map 后**由客户端自己**把窗口改成整屏（不依赖 WM 的全屏过渡）。
+/// 这是"消除 map 时工作区夹持那 1~2 帧"的另一条路：WM 的全屏过渡实测要 ~200ms
+/// （顶栏隐藏动画），而客户端 ConfigureWindow 只要一次往返。
+///
+/// ⚠️ 结论（2026-09-24）：**这条只在探针窗口上成立**（+10ms 生效），对真实的覆盖
+/// 窗口**无效**——应用里改成整屏后连发 80ms，几何仍被 mutter 安置回 `1920x1048`
+/// （日志：`唤醒校验：连发 78ms 后窗口仍未到整屏`）。所以**不要**据此去改
+/// `unpark_overlay_window`；这个探针留着只作为"探针不等于真实窗口"的反例。
+#[test]
+#[ignore]
+fn probe_client_resize_overrides_workarea_clamp() {
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    let win = make_invisible_overlay_probe(&conn);
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    conn.unmap_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    println!("  [D] 停靠后: {} geom={}", map_state(&conn, win), abs_geom(&conn, win));
+
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    println!("  [D] map 后立刻读: {}", abs_geom(&conn, win));
+    conn.configure_window(
+        win,
+        &x11rb::protocol::xproto::ConfigureWindowAux::new()
+            .x(0)
+            .y(0)
+            .width(1920)
+            .height(1080),
+    )
+    .unwrap();
+    conn.flush().unwrap();
+    for i in 1..=10 {
+        std::thread::sleep(Duration::from_millis(5));
+        println!("  [D] +{}ms geom={}", i * 5, abs_geom(&conn, win));
+    }
+    conn.destroy_window(win).unwrap();
+    conn.flush().unwrap();
+}

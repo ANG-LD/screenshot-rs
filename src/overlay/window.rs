@@ -7235,9 +7235,24 @@ fn reuse_overlay_window(
         // update 借用，再读会 panic；Root::hide_tooltip 内部直接更新
         // TooltipOverlay 实体，不触碰 root 自身。
         root.hide_tooltip(window, cx);
-        // 2) 放大到全屏：X11 平台窗口尺寸从头到尾不变（park 只 unmap），无需
-        //    resize——gpui 的 bounds 一直正确，map 后即为最终尺寸；非 X11
-        //    平台 park 时缩成了 1×1，需要恢复。
+        // 2) 放大到全屏：非 X11 平台 park 时缩成了 1×1，需要在这里恢复。
+        //
+        //    X11 下不需要 resize，但**别把"窗口尺寸从头到尾不变"当成事实**：park
+        //    只 unmap 是真的，可 mutter 在重新 map 一个 `Normal` 窗口（见
+        //    `overlay_window_kind`）时会先按工作区安置一次——实测头 1~2 帧是
+        //    `1920x1048+0+32`（`_NET_WORKAREA = 0,32,1920,1048`），随后才应用
+        //    `_NET_WM_STATE_FULLSCREEN`（约 130~200ms，含顶栏让位动画）。这期间
+        //    的渲染会被 X 裁掉顶上 32px，用户看到的是"先出现一个窗口大小的遮罩、
+        //    再变成整屏一致的遮罩"。老版是 `PopUp`/NOTIFICATION 类型：不受工作区
+        //    夹持、也没资格全屏，所以没有这个中间态——代价是顶上那一条被 GNOME
+        //    面板压着，覆盖层画在那里的十字线上半截/选区上边线看不见。
+        //
+        //    已试过但**无效**的修法（别重复踩）：
+        //    ① 停靠态就先请求全屏：mutter 对 unmap 的窗口直接忽略，600ms 都不进
+        //       整屏（tests/x11_wm_race_probe.rs::probe_fullscreen_while_parked）；
+        //    ② map 后由客户端自己 `ConfigureWindow` 改成整屏（含 80ms 有界重发）：
+        //       探针窗口 +10ms 生效，但真实覆盖窗口会被 mutter 安置回 `1920x1048`
+        //       （2026-09-24 实测日志：`唤醒校验：连发 78ms 后窗口仍未到整屏`）。
         #[cfg(not(target_os = "linux"))]
         window.resize(Size::new(px(actual_w), px(actual_h)));
         // Windows：把遮罩窗口客户端顶对齐到帧捕获原点（主屏物理 0,0）。
