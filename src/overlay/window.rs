@@ -257,6 +257,8 @@ pub struct OverlayView {
     /// 鼠标光标位置（逻辑像素，窗口坐标系）。用来画全屏十字参考线与坐标徽章。
     /// `None` = 本次会话还没收到过鼠标移动（刚唤起覆盖层时）。
     cursor_pos: Option<BoundsPoint>,
+    /// 马赛克笔刷：隐藏系统光标，让自绘圆盘当指针（见 overlay/brush_cursor.rs）
+    brush_cursor: crate::overlay::brush_cursor::BrushCursor,
     /// 上一次**已经显示过**的物理像素坐标（取整）。只有它变化才 `notify`：
     /// 否则鼠标每移动一个亚像素都要重绘整个覆盖层（画布 + 工具栏 + 形状），白烧 CPU。
     cursor_phys: Option<(i32, i32)>,
@@ -413,6 +415,7 @@ impl OverlayView {
             cmd_drag: None,
             hover_shape: false,
             cursor_pos: None,
+            brush_cursor: crate::overlay::brush_cursor::BrushCursor::new(),
             cursor_phys: None,
             forbidden_hover: false,
             scale_factor,
@@ -494,6 +497,9 @@ impl OverlayView {
         self.hover_shape = false;
         self.cursor_pos = None;
         self.cursor_phys = None;
+        // 窗口是复用的：上一轮若停在马赛克笔刷（光标被隐藏），这里必须恢复，
+        // 否则新会话里用户会看不到鼠标
+        self.brush_cursor.set_hidden(false);
         self.forbidden_hover = false;
         self.scale_factor = scale_factor;
         tracing::info!("[overlay] start_session scale_factor={scale_factor} frame={}x{}", self.frame_width, self.frame_height);
@@ -626,6 +632,9 @@ impl OverlayView {
             scroll_manual,
             frame: Some(frame),
         });
+        // 隐藏的系统光标必须在会话结束时恢复：窗口是停靠复用的，光标留着不还
+        // 会让下一次截图一进来就"看不见鼠标"
+        self.brush_cursor.set_hidden(false);
         // 停靠而非关闭：窗口与 WgpuRenderer（含已编译的 shader pipeline）保持
         // 存活，下次截图直接复用，免去每窗重编译 pipeline 的 ~570ms。
         park_overlay_window(window);
@@ -2222,6 +2231,95 @@ fn render_simple_button(
 /// 两个尺寸的关系是"一笔就能遮挡"的关键：块必须**大到跨过笔画与背景**（否则块平均
 /// 就等于原文那一小块的颜色，等于没遮），笔刷要**宽到一笔扫过一片内容**。所以块有
 /// 8px 下限（再小块均值就贴近原文局部色），块上限 28px（再粗就糊成一片、看不出是马赛克）。
+/// 画布上的光标形态提示：决定系统光标样式，以及要不要画马赛克笔刷圆环。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CursorHint {
+    /// 不干预：让元素级光标（小手 / IBeam / 缩放箭头）照常生效
+    Default,
+    /// 框选类操作：十字光标
+    Crosshair,
+    /// 马赛克笔刷：十字光标 + 跟随鼠标的圆环（直径 = 笔刷直径，颜色 = 当前标注色）
+    Brush { diameter: f32, color: RGBA },
+}
+
+/// 按当前状态同步「系统光标是否隐藏」。
+///
+/// 只在马赛克笔刷形态下隐藏：这时鼠标处已经有自绘圆盘，用户要求指针本身就是那个
+/// 圆（而不是圆盘 + 箭头叠在一起）。其余形态一律恢复，避免出现"看不见鼠标"。
+///
+/// 幂等且只在状态翻转时才碰 X 服务器，所以可以放心地在每次鼠标移动时调用。
+fn sync_brush_cursor(this: &mut OverlayView) {
+    let over_ui = this.cursor_pos.is_some_and(|c| {
+        ui_zone(
+            this.selection.current(),
+            this.screen_bounds,
+            this.toolbar.popup.is_some(),
+        )
+        .contains(c)
+    });
+    let hint = cursor_hint(
+        this.toolbar.active_tool,
+        this.mosaic_box_armed,
+        this.toolbar.line_width,
+        this.toolbar.current_color,
+        over_ui,
+    );
+    this.brush_cursor
+        .set_hidden(matches!(hint, CursorHint::Brush { .. }));
+}
+
+/// 是否要把系统光标设成十字。
+///
+/// **只有 [`CursorHint::Crosshair`] 才设**——马赛克的 [`CursorHint::Brush`] 只画
+/// 自绘圆盘、保持默认箭头（用户要求：马赛克有圆就够了，不要再叠十字）。
+/// 单独抽成函数是为了让"消费端"这条判断也能被测试钉住：曾经条件写成
+/// `hint != Default`，于是 Brush 也被当成 Crosshair，用户看到"圆形中间还是有 +"。
+fn cursor_wants_crosshair(hint: CursorHint) -> bool {
+    matches!(hint, CursorHint::Crosshair)
+}
+
+/// 由「当前工具 / 一键模糊待命 / 指针是否在 UI 上」推出光标形态。
+///
+/// 用户反馈：**矩形、椭圆、一键模糊**这三个"拉框"操作看不出"现在是在拉框"，希望
+/// 鼠标变成 + 形；马赛克则希望像一支笔刷——一个圆跟着鼠标走，大小跟着笔刷档位、
+/// 颜色跟着当前标注色。范围刻意收得很窄：首次框选屏幕区域、箭头、OCR/翻译都不改
+/// （用户明确要求"不是所有操作都改"）。
+///
+/// 注意：GPUI 的 `CursorStyle` 没有"隐藏光标"这一项，所以马赛克的圆是**自绘**的
+/// （HUD 层画一个圆盘），系统光标保持默认箭头——不叠十字。
+///
+/// `over_ui`（指针在工具栏/二级弹层上）时一律不干预：那些控件各有自己的元素级光标
+/// （按钮是小手、输入框是 IBeam），而 window 级光标会盖掉它们。
+fn cursor_hint(
+    tool: Option<ToolButton>,
+    mosaic_box_armed: bool,
+    line_width: f32,
+    color: RGBA,
+    over_ui: bool,
+) -> CursorHint {
+    if over_ui {
+        return CursorHint::Default;
+    }
+    // 一键模糊的框选阶段（二级弹窗里点过「一键模糊」后待命）也是拉框
+    if mosaic_box_armed {
+        return CursorHint::Crosshair;
+    }
+    match tool {
+        // 马赛克：只画笔刷圆环，**不**改系统光标（用户要求：有圆就够了，
+        // 不要再叠一个十字）。直径与拖拽时的 stamp 完全同源（mosaic_geom），
+        // 所以圆环圈住的就是真正会被涂到的范围。
+        Some(ToolButton::Mosaic) => CursorHint::Brush {
+            diameter: mosaic_geom(line_width).0,
+            color,
+        },
+        // 十字只给「拉框拉出一个矩形区域」的三个操作：矩形、椭圆、一键模糊（arg 在上面
+        // 已返回）。其余（首次框选、箭头、OCR、翻译、画笔…）一律不干预——用户明确
+        // 要求「不是所有操作都改」。
+        Some(ToolButton::Rectangle | ToolButton::Ellipse) => CursorHint::Crosshair,
+        _ => CursorHint::Default,
+    }
+}
+
 fn mosaic_geom(lw: f32) -> (f32, u32) {
     let brush = (lw * 8.0).max(12.0).round();
     let block = (brush * 0.5).round().max(8.0);
@@ -3265,6 +3363,8 @@ fn update_cursor_readout(
     let changed = this.cursor_phys != Some(phys);
     this.cursor_pos = Some(BoundsPoint::new(phys.0 as f32 / sx, phys.1 as f32 / sy));
     this.cursor_phys = Some(phys);
+    // 光标形态跟着工具走，所以每次移动都同步一次（内部幂等，不翻转不发 X 请求）
+    sync_brush_cursor(this);
     if changed {
         cx.notify();
     }
@@ -4529,6 +4629,23 @@ impl Render for OverlayView {
         let dim_opacity = self.dim_opacity;
         let hover_shape = self.hover_shape;
         let forbidden_hover = self.forbidden_hover;
+        // 系统光标形态 + 马赛克笔刷圆环。指针落在工具栏/弹层上时不干预（那些控件
+        // 有自己的元素级光标，而 window 级光标会盖掉它们）。
+        let over_ui = self.cursor_pos.is_some_and(|c| {
+            ui_zone(
+                self.selection.current(),
+                self.screen_bounds,
+                self.toolbar.popup.is_some(),
+            )
+            .contains(c)
+        });
+        let cursor_hint = cursor_hint(
+            self.toolbar.active_tool,
+            self.mosaic_box_armed,
+            self.toolbar.line_width,
+            self.toolbar.current_color,
+            over_ui,
+        );
         // 文字框 auto_grow 测量提前到 render 开头：canvas 边框与 Input 必须基于
         // 同一份 text_input_rect。若在 Input 渲染时才更新 size，canvas closure 捕获
         // 的是测量前的旧值，导致边框与输入框错位（光标跑到框外、文字被边框盖住）。
@@ -4618,8 +4735,8 @@ impl Render for OverlayView {
         };
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg, cursor_hint),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg, cursor_hint), window, cx| {
                 // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
                 // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
                 if forbidden_hover {
@@ -4627,6 +4744,10 @@ impl Render for OverlayView {
                     window.set_window_cursor_style(gpui::CursorStyle::OperationNotAllowed);
                 } else if hover_shape {
                     window.set_window_cursor_style(gpui::CursorStyle::PointingHand);
+                } else if cursor_wants_crosshair(cursor_hint) {
+                    // 只有矩形/椭圆/一键模糊待命设十字。马赛克**不设**：它的"圆形笔刷"
+                    // 是 HUD 层自绘的圆盘，系统光标保持默认箭头（用户要求不要叠十字）。
+                    window.set_window_cursor_style(gpui::CursorStyle::Crosshair);
                 }
 
                 let win_bounds = window.bounds();
@@ -4984,13 +5105,17 @@ impl Render for OverlayView {
                     (c.x, c.y - GAP - ARM, 1.0, ARM),
                     (c.x, c.y + GAP, 1.0, ARM),
                 ];
-                root = root.children(arms.iter().flat_map(|(ax, ay, aw, ah)| {
-                    [
-                        // 深色线偏 1px 当描边、亮色线压在上面：浅底深底都看得清
-                        div().absolute().left(px(*ax + 1.0)).top(px(*ay + 1.0)).w(px(*aw)).h(px(*ah)).bg(shade),
-                        div().absolute().left(px(*ax)).top(px(*ay)).w(px(*aw)).h(px(*ah)).bg(line),
-                    ]
-                }));
+                // 马赛克笔刷例外：此时鼠标处已经有圆盘，再叠短十字就成了用户反馈的
+                // "圆形中间还是有 +"（还没画选区时 show_hud 恰好为真）。
+                if !matches!(cursor_hint, CursorHint::Brush { .. }) {
+                    root = root.children(arms.iter().flat_map(|(ax, ay, aw, ah)| {
+                        [
+                            // 深色线偏 1px 当描边、亮色线压在上面：浅底深底都看得清
+                            div().absolute().left(px(*ax + 1.0)).top(px(*ay + 1.0)).w(px(*aw)).h(px(*ah)).bg(shade),
+                            div().absolute().left(px(*ax)).top(px(*ay)).w(px(*aw)).h(px(*ah)).bg(line),
+                        ]
+                    }));
+                }
 
                 // 坐标徽章：物理像素坐标（与成图像素一一对应）；拖框时补上「宽 × 高」
                 let mut label = format!("{phys_x}, {phys_y}");
@@ -5006,6 +5131,27 @@ impl Render for OverlayView {
                 // ② 选区已落定 + 指针在选区外：明确的「禁止点击」角标。画布那边同时把
                 //    光标换成 not-allowed，这里做双保险（部分 Linux 后端不一定映射该光标）。
                 root = root.child(hud_badge(c, "禁止点击".to_string(), window, Some(crate::assets::icons::BAN)));
+            }
+
+            // ③ 马赛克笔刷圆环：空心圆贴着鼠标走，直径 = 笔刷直径（与拖拽时的 stamp
+            //    同源，见 mosaic_geom，所以"粗/细"档位一改圆环立刻跟着变），
+            //    颜色 = 当前标注色。中间留空，配合十字光标仍然看得准落点
+            //    （Photoshop 画笔光标的做法）。
+            if let CursorHint::Brush { diameter, color } = cursor_hint {
+                let r = (diameter / 2.0).max(2.0);
+                // 一个实心圆盘（半透明标注色），**不描边**：用户反馈"圆形不要有外边线"。
+                // 颜色/透明度都不改系统光标，所以它只是"笔刷覆盖范围"的提示。
+                let disc = Hsla::from(gpui::rgba(rgba_u32(RGBA { a: 40, ..color })));
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(c.x - r))
+                        .top(px(c.y - r))
+                        .w(px(r * 2.0))
+                        .h(px(r * 2.0))
+                        .rounded_full()
+                        .bg(disc),
+                );
             }
         }
 
@@ -9483,6 +9629,129 @@ fn adjust_window_client_top(hwnd: *mut core::ffi::c_void, desired_client_top: i3
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 光标形态映射：框选类工具给十字、马赛克给笔刷圆环、其余不干预。
+    ///
+    /// 这一层是纯函数，所以"鼠标长什么样"可以在没有窗口的情况下钉住。
+    #[test]
+    fn cursor_hint_maps_tools_to_cursor_shapes() {
+        let color = RGBA::RED;
+        let hint = |tool, armed| cursor_hint(tool, armed, 3.0, color, false);
+
+        // 十字**只**给矩形、椭圆（外加下面的一键模糊待命）：用户明确要求
+        //"只有矩形、椭圆、一键模糊才有 + 字，不是所有操作都改"。
+        for tool in [Some(ToolButton::Rectangle), Some(ToolButton::Ellipse)] {
+            assert_eq!(
+                hint(tool, false),
+                CursorHint::Crosshair,
+                "{tool:?} 应当显示十字光标"
+            );
+        }
+
+        // 其余一律不干预：首次框选屏幕区域、箭头、OCR、翻译都不改成 + 字
+        for tool in [
+            None,
+            Some(ToolButton::Arrow),
+            Some(ToolButton::Ocr),
+            Some(ToolButton::Translate),
+        ] {
+            assert_eq!(
+                hint(tool, false),
+                CursorHint::Default,
+                "{tool:?} 不该改光标（用户要求只有矩形/椭圆/一键模糊改）"
+            );
+        }
+
+        // 马赛克：只有笔刷圆盘，直径与拖拽 stamp 同源、颜色用当前标注色。
+        // Brush ≠ Crosshair 本身就是"不再叠十字"的断言（画布只在 Crosshair 时改光标）。
+        assert_eq!(
+            hint(Some(ToolButton::Mosaic), false),
+            CursorHint::Brush { diameter: mosaic_geom(3.0).0, color }
+        );
+        assert_ne!(
+            hint(Some(ToolButton::Mosaic), false),
+            CursorHint::Crosshair,
+            "马赛克不该再显示十字（有圆就够）"
+        );
+
+        // 「一键模糊」待命时是拉框，即使当前工具还是马赛克也要给十字（不能画圆环）
+        assert_eq!(
+            hint(Some(ToolButton::Mosaic), true),
+            CursorHint::Crosshair,
+            "一键模糊待命时应当是框选十字，而不是笔刷圆环"
+        );
+
+        // 待命状态与工具无关，一律十字（矩形/椭圆下也一样）
+        for tool in [Some(ToolButton::Rectangle), Some(ToolButton::Ellipse)] {
+            assert_eq!(hint(tool, true), CursorHint::Crosshair, "{tool:?} 待命也应是十字");
+        }
+
+        // 不涉及拖拽框选的工具不干预（保留元素级光标：文字输入框要 IBeam 等）
+        for tool in [
+            Some(ToolButton::Freehand),
+            Some(ToolButton::Text),
+            Some(ToolButton::ColorPicker),
+            Some(ToolButton::Undo),
+            Some(ToolButton::Redo),
+        ] {
+            assert_eq!(hint(tool, false), CursorHint::Default, "{tool:?} 不该改光标");
+        }
+
+        // 指针在工具栏/二级弹层上：一律不干预，别盖掉按钮的小手 / 输入框的 IBeam
+        for tool in [Some(ToolButton::Mosaic), Some(ToolButton::Rectangle), None] {
+            assert_eq!(
+                cursor_hint(tool, false, 3.0, color, true),
+                CursorHint::Default,
+                "{tool:?} 悬停 UI 时不干预光标"
+            );
+        }
+    }
+
+    /// 消费端判断：只有十字形态才动系统光标，笔刷形态**不**动。
+    ///
+    /// 这条是补测的：之前只钉了 `cursor_hint` 的映射，而画布里的判断写成
+    /// `hint != Default`，于是 Brush 也被设成十字 → 用户看到"马赛克圆形中间还是有 +"。
+    /// 所以"谁在消费这个枚举、怎么消费"也必须被测到，光测映射不够。
+    #[test]
+    fn brush_hint_does_not_set_crosshair_cursor() {
+        assert!(cursor_wants_crosshair(CursorHint::Crosshair));
+        assert!(!cursor_wants_crosshair(CursorHint::Default));
+        assert!(
+            !cursor_wants_crosshair(CursorHint::Brush {
+                diameter: 24.0,
+                color: RGBA::RED
+            }),
+            "马赛克笔刷不得设置系统十字光标"
+        );
+
+        // 端到端组合：马赛克工具实际产出的形态不得要求十字
+        for armed in [false, true] {
+            let h = cursor_hint(Some(ToolButton::Mosaic), armed, 3.0, RGBA::RED, false);
+            let want = cursor_wants_crosshair(h);
+            assert_eq!(
+                want, armed,
+                "马赛克工具 armed={armed}: 只有一键模糊待命才该是十字"
+            );
+        }
+    }
+
+    /// 笔刷圆环直径随「粗细」档位联动（用户要求：圆形大小和选择大小联动）。
+    #[test]
+    fn cursor_brush_diameter_follows_line_width() {
+        let d = |lw| match cursor_hint(Some(ToolButton::Mosaic), false, lw, RGBA::RED, false) {
+            CursorHint::Brush { diameter, .. } => diameter,
+            other => panic!("马赛克应当是笔刷圆环，实际 {other:?}"),
+        };
+        // 与拖拽时真正使用的 stamp 直径完全一致（同源于 mosaic_geom）
+        for lw in [1.0f32, 3.0, 6.0, 12.0, 24.0] {
+            assert_eq!(d(lw), mosaic_geom(lw).0, "lw={lw} 时圆环直径应与笔刷一致");
+        }
+        // 档位越大圆环越大（严格单调）
+        assert!(d(1.0) < d(3.0));
+        assert!(d(3.0) < d(6.0));
+        assert!(d(6.0) < d(24.0));
+    }
 
     /// 只显示文件名：翻译模型清单里的 "onnx/xxx.onnx" 在界面上要跟 OCR 那几行一样
     /// 只给文件名，别把目录前缀当内容显示出来。
