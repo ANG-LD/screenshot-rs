@@ -69,7 +69,7 @@ struct ShapeLayerCache {
     revision: u64,
     /// 快照时的 scale_factor（缩放改变则失效）
     scale_factor: f32,
-    /// 已转 BGRA 的 RenderImage，可直接 paint_image
+    /// RGBA 的 RenderImage（gpui 的 `ImageBuffer<Rgba<u8>>`），可直接 paint_image
     image: Arc<RenderImage>,
     /// 联合包围盒（逻辑像素，含 AA 外扩），即 paint_image 的目标 Bounds
     bounds: ub::Bounds,
@@ -110,7 +110,7 @@ struct MosaicPreviewCache {
     last_region: Option<((f32, f32), (f32, f32))>,
     /// 画布逻辑坐标 → 帧物理像素的缩放比（窗口尺寸变了要重算）
     scale: (f32, f32),
-    /// 光栅化结果（BGRA，未覆盖处透明）
+    /// 光栅化结果（RGBA，未覆盖处透明）
     image: Arc<RenderImage>,
     /// paint_image 的目标 Bounds（逻辑像素）
     bounds: ub::Bounds,
@@ -135,7 +135,7 @@ struct IncrFreehand {
 
 /// GPUI 视图：覆盖窗口内容
 pub struct OverlayView {
-    /// 捕获帧的 GPUI 渲染图（已转 BGRA）
+    /// 捕获帧的 GPUI 渲染图（RGBA，与 `CapturedFrame.pixels` 同序）
     frame_image: Arc<RenderImage>,
     /// 待释放的图像：GPUI 的 `RenderImage` 在 GPU atlas 里占一块瓦片，换图后不显式
     /// `window.drop_image()` 就永不回收——`RenderImage` 没有 Drop 实现，而全仓此前
@@ -2887,30 +2887,6 @@ fn render_stroke_popover_content(
 ///
 /// 按 u32 批量位运算，一次处理 4 字节：迭代次数是逐字节 swap 的 1/4，debug
 /// 未优化构建下也快得多（release 下约 2-3ms / 1920×1080 帧，debug 下原先
-/// chunks_exact_mut(4)+swap 的 207 万次迭代要 ~100ms+，是复用路径的主要开销）。
-fn rgba_to_bgra(pixels: &mut [u8]) {
-    debug_assert_eq!(pixels.len() % 4, 0);
-    if (pixels.as_ptr() as usize).is_multiple_of(4) {
-        // 快路径：u32 批量位运算，一次处理 4 字节（迭代数是逐字节 swap 的 1/4）
-        let words: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u32, pixels.len() / 4)
-        };
-        for w in words {
-            // 输入 RGBA(LE u32): R | G<<8 | B<<16 | A<<24 → 输出 BGRA: B | G<<8 | R<<16 | A<<24
-            *w = ((*w & 0x0000_00FF) << 16)
-                | (*w & 0x0000_FF00)
-                | ((*w & 0x00FF_0000) >> 16)
-                | (*w & 0xFF00_0000);
-        }
-    } else {
-        // 慢路径：缓冲区未 4 字节对齐时退回避让（罕见）
-        for c in pixels.chunks_exact_mut(4) {
-            c.swap(0, 2);
-        }
-    }
-}
-
-/// 检测点击是否落在文字输入框的边框（Move）或 resize 手柄上，返回对应的 DragState
 fn hit_test_text_drag(rect: ub::Bounds, p: BoundsPoint) -> Option<TextDragState> {
     // 手柄命中容差：±4px（对应 8px 手柄，与矩形选中框一致）
     const HANDLE_HALF: f32 = 4.0;
@@ -3626,48 +3602,50 @@ fn make_resize_handle(
 /// 避免整帧 clone）。调用方不再需要该像素时直接传入，零拷贝。
 /// RGBA → BGRA **拷到新缓冲**（一次遍历同时完成拷贝与换道）。
 ///
-/// 与"先 `clone()` 再 [`rgba_to_bgra`] 原地换道"相比省掉一整趟内存搬运：
+/// 直接拷一份（**不做任何通道换道**，见 `build_render_image_from_pixels`）：
 /// 后者对 8MB 帧是 memcpy 8MB + 读 8MB + 写 8MB，而这里只有读 8MB + 写 8MB。
 /// 调用方仍需要原 buffer（增量笔迹缓冲、整帧 RGBA 供 OCR/提交用）时用这个。
-///
-/// 返回新 Vec；容量恰好 len，避免多留内存。
-fn rgba_to_bgra_copy(src: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(src.len() % 4, 0);
-    let mut out = vec![0u8; src.len()];
-    // 与 rgba_to_bgra 同一套 u32 批量位运算（迭代数是逐字节 swap 的 1/4）
-    if (src.as_ptr() as usize).is_multiple_of(4) && (out.as_ptr() as usize).is_multiple_of(4) {
-        let words_in: &[u32] = unsafe {
-            std::slice::from_raw_parts(src.as_ptr() as *const u32, src.len() / 4)
+/// chunks_exact_mut(4)+swap 的 207 万次迭代要 ~100ms+，是复用路径的主要开销）。
+fn rgba_to_bgra(pixels: &mut [u8]) {
+    debug_assert_eq!(pixels.len() % 4, 0);
+    if (pixels.as_ptr() as usize).is_multiple_of(4) {
+        // 快路径：u32 批量位运算，一次处理 4 字节（迭代数是逐字节 swap 的 1/4）
+        let words: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u32, pixels.len() / 4)
         };
-        let words_out: &mut [u32] = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len() / 4)
-        };
-        for (dst, w) in words_out.iter_mut().zip(words_in) {
-            *dst = ((*w & 0x0000_00FF) << 16)
+        for w in words {
+            // 输入 RGBA(LE u32): R | G<<8 | B<<16 | A<<24 → 输出 BGRA: B | G<<8 | R<<16 | A<<24
+            *w = ((*w & 0x0000_00FF) << 16)
                 | (*w & 0x0000_FF00)
                 | ((*w & 0x00FF_0000) >> 16)
                 | (*w & 0xFF00_0000);
         }
     } else {
-        for (dst, chunk) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            dst[0] = chunk[2];
-            dst[1] = chunk[1];
-            dst[2] = chunk[0];
-            dst[3] = chunk[3];
+        // 慢路径：缓冲区未 4 字节对齐时退回避让（罕见）
+        for c in pixels.chunks_exact_mut(4) {
+            c.swap(0, 2);
         }
     }
-    out
 }
 
-/// 与 [`build_render_image_from_pixels`] 相同，但从 `&[u8]` 拷一份（调用方保留原 buffer）。
 ///
-/// 用于"原 buffer 还要继续用"的场景（增量笔迹缓冲、整帧 RGBA 供 OCR/提交），
-/// 避免 `clone()` + 原地换道 的两趟内存流量。
 fn build_render_image_from_slice(width: u32, height: u32, src: &[u8]) -> Arc<RenderImage> {
-    build_render_image_from_pixels(width, height, rgba_to_bgra_copy(src))
+    // 只拷贝：换道统一由 `build_render_image_from_pixels` 做一次，
+    // 这里再换一次就会出现"两次对调＝没换"的整屏 R/B 互换（见那里的注释）。
+    build_render_image_from_pixels(width, height, src.to_vec())
 }
 
 fn build_render_image_from_pixels(width: u32, height: u32, mut pixels: Vec<u8>) -> Arc<RenderImage> {
+    // 交给 gpui 之前**换道一次**：gpui 的图集是 BGRA（它自己的 SVG→图路径就调
+    // `swap_rgba_pa_to_bgra`），而我们的像素源都是 RGBA：`CapturedFrame.pixels`
+    // （见 `capture::linux` 模块头，Z_PIXMAP 的 BGRA 在捕获时就转成 RGBA 了）、
+    // 以及马赛克/笔迹光栅化的输出。
+    //
+    // **必须且只能换一次。** 曾经 `build_render_image_from_slice` 里先换一次、又经
+    // 这里换了第二次（两次对调等于没换），于是遮罩里的画面整屏 R/B 互换——红变蓝、
+    // 蓝变橙，就是用户报的"alt+s 出现遮罩层后屏幕颜色变了"。
+    // 实证：真实屏幕上 #3355CC 的蓝块，在遮罩里显示成 (68,28,17)，
+    // 恰好是 (51,85,204) 的 R/B 互换再乘暗层透过率 0.331。
     rgba_to_bgra(&mut pixels);
     let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
         .expect("CapturedFrame 像素长度必须与 width*height*4 一致");
@@ -4094,7 +4072,7 @@ fn update_in_progress_incr(
     // 复用判据：已有 buffer 的矩形**覆盖**当前笔画包围盒即可，不再要求逐像素相等。
     // 旧判据比对的是"旧 buffer ∪ 当前笔画 bbox"算出的 origin/size，笔尖每往外扩 1px
     // 这个并集就变一次 → 立刻掉回重建分支（vec![0; A] 清零 + 交集拷贝 + A 克隆 +
-    // rgba_to_bgra + GPU 上传，约 6×缓冲字节）；而画笔只会落在 buffer 内部，图层位置
+    // 通道换道 + GPU 上传，约 6×缓冲字节）；而画笔只会落在 buffer 内部，图层位置
     // 完全由 bounds 决定，所以只要 buffer 覆盖住这一笔，画出来就是像素级一致的。
     let reusable = match &self_.freehand_incr {
         Some(st) => {
@@ -10078,7 +10056,29 @@ mod tests {
     /// 光标形态映射：框选类工具给十字、马赛克给笔刷圆环、其余不干预。
     ///
     /// 这一层是纯函数，所以"鼠标长什么样"可以在没有窗口的情况下钉住。
+    /// 回归测试：交给 gpui 的像素必须**恰好换道一次**（gpui 图集是 BGRA）。
+    ///
+    /// 换 0 次或 2 次都会让遮罩里整屏 R/B 互换（红变蓝、蓝变橙）——用户报的
+    /// "alt+s 出现遮罩层后屏幕颜色变了"。曾经 `build_render_image_from_slice`
+    /// 和 `build_render_image_from_pixels` 各换一次，正好是"换 2 次"。
     #[test]
+    fn render_image_channel_swap_happens_exactly_once() {
+        // 输入一个 RGBA 像素：R=0x11 G=0x22 B=0x33 A=0xCC
+        let px = vec![0x11, 0x22, 0x33, 0xCC];
+        // 两条构造路径（Vec 与切片）都必须得到同一个结果：BGRA
+        let from_pixels = build_render_image_from_pixels(1, 1, px.clone());
+        let from_slice = build_render_image_from_slice(1, 1, &px);
+        for (name, img) in [("pixels", from_pixels), ("slice", from_slice)] {
+            let bytes = img.as_bytes(0).expect("单帧图像应有第 0 帧");
+            assert_eq!(
+                &bytes[..4],
+                &[0x33, 0x22, 0x11, 0xCC],
+                "{name}: 应当是 BGRA（恰好换道一次），实际 {:?}",
+                &bytes[..4]
+            );
+        }
+    }
+
     fn cursor_hint_maps_tools_to_cursor_shapes() {
         let color = RGBA::RED;
         let hint = |tool, armed| cursor_hint(tool, armed, 3.0, color, false);
@@ -10499,116 +10499,6 @@ mod tests {
         );
     }
 
-    /// 拷贝式换道必须与原地换道**逐字节等价**（含未按 4 字节对齐的兜底分支）。
-    #[test]
-    fn rgba_to_bgra_copy_matches_in_place() {
-        // 长度 4 的整数倍（走 u32 快路径）
-        let src: Vec<u8> = (0..64u8).collect();
-        let mut in_place = src.clone();
-        rgba_to_bgra(&mut in_place);
-        assert_eq!(rgba_to_bgra_copy(&src), in_place);
-        assert_eq!(src, (0..64u8).collect::<Vec<u8>>(), "源缓冲不得被改动");
-
-        // 对齐偏移：切片起点不按 4 字节对齐时应走逐字节兜底，结果仍须一致
-        let buf: Vec<u8> = (0..128u8).collect();
-        for off in 1..4usize {
-            let unaligned = &buf[off..64 + off];
-            let mut in_place = unaligned.to_vec();
-            rgba_to_bgra(&mut in_place);
-            assert_eq!(
-                rgba_to_bgra_copy(unaligned),
-                in_place,
-                "偏移 {off} 的未对齐切片结果不一致"
-            );
-        }
-    }
-
-    /// 按需基准：`cargo test --release bench_ -- --ignored --nocapture`
-    ///
-    /// 量的是"大缓冲的搬运/分配"这类每帧都可能发生的固定开销。
-    #[test]
-    #[ignore]
-    fn bench_rgba_to_bgra_paths() {
-        use std::time::Instant;
-        for (w, h, label) in [
-            (1920u32, 1080u32, "整帧 1080p"),
-            (900, 900, "笔迹缓冲 900x900"),
-        ] {
-            let n = (w * h * 4) as usize;
-            let src: Vec<u8> = vec![0x40; n];
-            let reps = if n > 4_000_000 { 30 } else { 80 };
-
-            let t = Instant::now();
-            let mut sink = 0usize;
-            for _ in 0..reps {
-                // 现状：clone（memcpy 一整份）+ 原地换道
-                let mut v = src.clone();
-                let b = std::hint::black_box(&mut v);
-                rgba_to_bgra(b);
-                sink += v[0] as usize;
-            }
-            let old = t.elapsed() / reps;
-
-            let t = Instant::now();
-            for _ in 0..reps {
-                // 方案：拷贝式换道（一趟）
-                let v = rgba_to_bgra_copy(std::hint::black_box(&src));
-                sink += v[0] as usize;
-            }
-            let new = t.elapsed() / reps;
-
-            // 纯分配 + 清零（mmap + 缺页）成本：决定"复用 scratch buffer"值不值
-            let reps_alloc = 100;
-            let t = Instant::now();
-            for _ in 0..reps_alloc {
-                let v = vec![0u8; n];
-                sink += std::hint::black_box(v)[0] as usize;
-            }
-            let alloc = t.elapsed() / reps_alloc;
-            // 复用同一块缓冲：resize 到同长度（已映射页，只 memset）
-            let mut reused: Vec<u8> = Vec::with_capacity(n);
-            let t = Instant::now();
-            for _ in 0..reps_alloc {
-                reused.clear();
-                reused.resize(n, 0);
-                sink += reused[0] as usize;
-            }
-            let reuse = t.elapsed() / reps_alloc;
-            println!(
-                "BENCH-ALLOC {label}: 新分配 {:?} vs 复用 {reuse:?}（差 {:?}）",
-                alloc,
-                alloc.saturating_sub(reuse)
-            );
-
-            println!(
-                "BENCH {label} ({:.1}MB): clone+原地 {old:?} → 拷贝式 {new:?}（省 {:?}，{:.0}%）  sink={sink}",
-                n as f64 / 1e6,
-                old.saturating_sub(new),
-                (1.0 - new.as_secs_f64() / old.as_secs_f64().max(1e-9)) * 100.0
-            );
-        }
-    }
-
-    #[test]
-    fn rgba_to_bgra_swaps_channels_correctly() {
-        // RGBA(LE u32) = R | G<<8 | B<<16 | A<<24 → BGRA = B | G<<8 | R<<16 | A<<24
-        let mut px: Vec<u8> = vec![
-            0x11, 0x22, 0x33, 0xFF, // 像素 0: R=0x11 G=0x22 B=0x33 A=0xFF
-            0xAA, 0xBB, 0xCC, 0x00, // 像素 1: 半透明/全透明通道也要保留
-            0x00, 0x00, 0x00, 0x00, // 像素 2: 全零
-            0xFF, 0x80, 0x40, 0x80, // 像素 3: 混合值
-        ];
-        rgba_to_bgra(&mut px);
-        assert_eq!(
-            px,
-            vec![
-                0x33, 0x22, 0x11, 0xFF, // BGRA
-                0xCC, 0xBB, 0xAA, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-                0x40, 0x80, 0xFF, 0x80,
-            ]
-        );
-    }
     /// 合成一张带"正文段落"的测试画面：白底 + 30px 高的一段文字（比一笔的笔刷窄，
     /// 所以"一次画笔"就该盖满）。字内的笔画都比块小，必须被块平均抹掉。
     fn synth_text_screen(fw: u32, fh: u32) -> Vec<u8> {
