@@ -4,12 +4,13 @@
 
 ## 特性
 
-- 区域选择截图（鼠标拖拽）
-- 矩形 / 箭头 / 画图 / 文字 / 马赛克 工具栏
+- 区域选择截图（鼠标拖拽；Linux/GNOME 下从屏幕最顶部那条也能起框）
+- 矩形 / 箭头 / 画图 / 文字 / 马赛克 工具栏（马赛克支持「一键模糊」二级弹窗）
+- 框选时显示十字光标与坐标徽章
 - HSV 调色板
 - 撤销 / 重做
 - 全局热键 `alt+s` 启动，esc 取消
-- 系统托盘驻留
+- 系统托盘驻留（单实例锁：同一会话不会开出多个实例）
 - 截图完成自动复制到系统剪贴板
 - OCR 文字识别（PaddleOCR PP-OCRv6，中英混排；框选后立即关闭遮罩、
   后台识别并把文字复制到剪贴板）
@@ -17,6 +18,10 @@
 - 支持 Windows 10/11 和 Linux X11
 
 ## 安装
+
+从 [Releases](https://github.com/ANG-LD/screenshot-rs/releases) 下载对应平台的安装包
+（Linux：`.deb` / `.AppImage`；Windows：`.exe` 安装器；macOS：`.dmg`），
+或从源码构建：
 
 ```bash
 cargo build --release
@@ -88,7 +93,9 @@ GPU 收益：det+rec 推理从 CPU 的数百毫秒~秒级降到几十毫秒（�
 ## 平台说明
 
 - **Windows 10/11**：完整支持（含滚动截长图；已修正 HiDPI/缩放 DPI 下的抓取坐标）
-- **Linux X11**：完整支持
+- **Linux X11**：完整支持。GNOME 下屏幕最上方那条被 Shell 顶栏占据（约 32px），覆盖层
+  在那儿既画不出也收不到指针事件：自绘十字与坐标徽章会钉在该条下沿显示，而按下/拖动/
+  松手由覆盖层在显示期间轮询补齐，因此**从屏幕最顶部往下拉也能正常框选**
 - **Linux Wayland**：MVP 阶段请在登录时选择 X11 会话（XWayland fallback 也可）。纯 Wayland 原生支持将在 v0.2 版本提供
 - **macOS**：支持普通截图、OCR（CoreML）与滚动截长图（CoreGraphics 注入滚轮）。首次使用需在「系统设置 → 隐私与安全性」授予 **屏幕录制**（截图）与 **辅助功能/输入监控**（滚轮注入）。注：Pin 窗口的置顶/最小化/最大化按钮与覆盖窗口"隐藏"在 macOS 上仍为有限行为（覆盖窗口以 1×1 复位而不是真正隐藏）；滚动截长图、HiDPI 抓取等以真实设备验证为准
 
@@ -103,7 +110,7 @@ GPU 收益：det+rec 推理从 CPU 的数百毫秒~秒级降到几十毫秒（�
 ## 开发
 
 ```bash
-cargo test            # 单元测试（42 个 + 1 个 OCR 端到端，需模型文件）
+cargo test            # 单元测试（135 个 + OCR 端到端等忽略项，需模型文件）
 cargo build           # 编译
 cargo run             # 运行（开发模式）
 cargo clippy          # Lint
@@ -125,10 +132,20 @@ cargo test --test ocr_paddle -- --ignored --nocapture
 - [ ] 点完成 → 关闭覆盖窗口 → 粘贴到任意位置能看到带绘图的图像
 - [ ] 按 esc 取消，不污染剪贴板
 - [ ] 在 Windows 10/11 + Ubuntu 22.04（X11）上都能跑
+- [ ] 覆盖层出现后画面颜色不变（不偏色、红不变成蓝）
+- [ ] （GNOME）从屏幕最顶部那条按下也能起框，拖拽时十字与坐标徽章跟随指针
+- [ ] （GNOME）从下往上拉到顶后还能再次拉到顶（不会第二次拉不上去）
+- [ ] 重复启动第二个实例会被拒绝（单实例锁）
+- [ ] 马赛克「一键模糊」二级弹窗可用（框选模糊 / 达 80% 还原）
 
 ## 已知警告
 
 `screenshots v0.6.0` crate 在编译时输出 `future-incompat` 警告（Rust 未来版本可能拒绝该 crate 的代码）。当前不影响构建；跟踪细节见 `docs/follow-ups.md`。
+
+## 更新日志
+
+各版本的用户可见变化见 [CHANGELOG.md](CHANGELOG.md)；历史版本的安装包与说明见
+[Releases](https://github.com/ANG-LD/screenshot-rs/releases)。
 
 ## 许可证
 
