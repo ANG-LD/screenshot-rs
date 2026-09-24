@@ -257,6 +257,18 @@ pub struct OverlayView {
     /// 鼠标光标位置（逻辑像素，窗口坐标系）。用来画全屏十字参考线与坐标徽章。
     /// `None` = 本次会话还没收到过鼠标移动（刚唤起覆盖层时）。
     cursor_pos: Option<BoundsPoint>,
+    /// 会话活动期间是否在轮询指针（顶上那一条的输入补丁，见 `poll_top_strip_input`）。
+    pointer_poll_active: bool,
+    /// 上一次轮询到的"左键是否按下"（识别按下/抬起的边沿）。
+    pointer_poll_down: bool,
+    /// 轮询代次：每次 `start_session` 自增，旧循环据此自行退出（避免两个轮询并存）。
+    pointer_poll_gen: u64,
+    /// 轮询自己起的框是否还在拖：一旦由轮询起框，那段拖拽的移动/抬起也被壳层吞掉
+    /// （GNOME 在按下时自己抓指针），所以整段都交给轮询喂，直到按键抬起。
+    pointer_poll_dragging: bool,
+    /// "窗口不可见"的连续次数：只有持续不可见（约 1 秒）才认定已停靠并停掉轮询。
+    /// 启动瞬间窗口可能还在 map 途中，不能一看到不可见就退出。
+    pointer_poll_misses: u8,
     /// 指针是不是在屏幕顶上那一条里（GNOME 顶栏占的高度，见 `TOP_EDGE_STRIP`）。
     /// 那一条里覆盖层既收不到移动事件、又画在顶栏底下：自绘的短十字参考线/坐标徽章
     /// 会"卡"在那条下沿。所以这时把 `cursor_pos` 钉在 `TOP_EDGE_READOUT_Y`（那条下
@@ -421,6 +433,11 @@ impl OverlayView {
             hover_shape: false,
             cursor_pos: None,
             cursor_at_top: false,
+            pointer_poll_active: false,
+            pointer_poll_down: false,
+            pointer_poll_gen: 0,
+            pointer_poll_dragging: false,
+            pointer_poll_misses: 0,
             brush_cursor: crate::overlay::brush_cursor::BrushCursor::new(),
             cursor_phys: None,
             forbidden_hover: false,
@@ -447,6 +464,30 @@ impl OverlayView {
         tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) {
+        // 顶上那一条的输入补丁：GNOME 顶栏压在覆盖层之上，会吃掉那一条里的按下/抬起
+        // （以及悬停），事件驱动的状态机在那儿是瞎的。这里起一个只在会话期间活动、
+        // 只读轮询指针的小循环（见 `poll_top_strip_input`），不抢指针、不影响其它区域。
+        // 16ms 一次、且只在那一条里做动作，空转成本可忽略。
+        self.pointer_poll_active = true;
+        self.pointer_poll_down = false;
+        self.pointer_poll_dragging = false;
+        self.pointer_poll_misses = 0;
+        self.pointer_poll_gen = self.pointer_poll_gen.wrapping_add(1);
+        let poll_gen = self.pointer_poll_gen;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+            let keep_going = this
+                .update_in(cx, |view, window, cx| {
+                    view.pointer_poll_gen == poll_gen && poll_top_strip_input(view, window, cx)
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
+            }
+        })
+        .detach();
         // 换帧：拷一份转成 BGRA 给 RenderImage（gpui 数据约定 BGRA），原 RGBA
         // **移动**给 frame_pixels（OCR/提交用）。
         //
@@ -641,6 +682,10 @@ impl OverlayView {
         // 隐藏的系统光标必须在会话结束时恢复：窗口是停靠复用的，光标留着不还
         // 会让下一次截图一进来就"看不见鼠标"
         self.brush_cursor.set_hidden(false);
+        // 会话结束：停掉顶上那一条的输入轮询（循环下次 tick 就会自行退出）
+        self.pointer_poll_active = false;
+        self.pointer_poll_down = false;
+        self.pointer_poll_dragging = false;
         // 停靠而非关闭：窗口与 WgpuRenderer（含已编译的 shader pipeline）保持
         // 存活，下次截图直接复用，免去每窗重编译 pipeline 的 ~570ms。
         park_overlay_window(window);
@@ -3365,6 +3410,152 @@ const TOP_EDGE_STRIP: f32 = 32.0;
 /// 一点点，保证整个 `+` 都露在顶栏下面看得见。
 const TOP_EDGE_READOUT_Y: f32 = 34.0;
 
+/// 直接问 X server：指针现在在哪（屏幕物理坐标）、左键是否按下。
+///
+/// 为什么不靠事件：GNOME 顶栏压在覆盖层之上，顶上那一条（`TOP_EDGE_STRIP`）里的
+/// **按下**与悬停事件会被它吃掉（拖拽途中的移动能穿过来）。实测在 (500,5) 按下再往
+/// 右下拖，应用一个事件都收不到，最后 Return 变成整屏选区。
+///
+/// 为什么不用 XGrabPointer：实测抓取之后 gpui 的指针输入整个失效（连工作区里的拖拽
+/// 都收不到），所以改成只读轮询，把被吃掉的那几个事件补出来。
+#[cfg(target_os = "linux")]
+fn query_overlay_pointer(window: &Window) -> Option<(f32, f32, bool)> {
+    use x11rb::protocol::xproto::{ConnectionExt, KeyButMask};
+
+    with_x11_window(window, |conn, win| {
+        let r = conn.query_pointer(win).ok()?.reply().ok()?;
+        Some((f32::from(r.root_x), f32::from(r.root_y), r.mask.contains(KeyButMask::BUTTON1)))
+    })
+    .flatten()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn query_overlay_pointer(_window: &Window) -> Option<(f32, f32, bool)> {
+    None
+}
+
+/// 覆盖层窗口当前是否可见（未停靠）。停靠后轮询要停，否则会去改一个已隐藏窗口的状态。
+#[cfg(target_os = "linux")]
+fn overlay_window_viewable(window: &Window) -> bool {
+    use x11rb::protocol::xproto::{ConnectionExt, MapState};
+
+    with_x11_window(window, |conn, win| {
+        conn.get_window_attributes(win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|a| a.map_state == MapState::VIEWABLE)
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overlay_window_viewable(_window: &Window) -> bool {
+    false
+}
+
+/// 顶上那一条（GNOME 顶栏占的高度）的**输入补丁**：只在会话活动时跑，只在那一条里生效。
+///
+/// 顶栏会吃掉那一条里的按下与抬起（悬停也吃），事件驱动的状态机在那里是瞎的，所以用
+/// 轮询补齐三件事：按下 → 起框、按住移动 → 更新选区与坐标徽章、抬起 → 收尾
+/// （Selecting 且选区有效 → Editing）。其余区域一律不插手，交给正常事件。
+///
+/// 返回 false 表示该停止轮询（会话结束 / 窗口已停靠），调用方的循环据此退出。
+fn poll_top_strip_input(
+    this: &mut OverlayView,
+    window: &Window,
+    cx: &mut Context<OverlayView>,
+) -> bool {
+    if !this.pointer_poll_active {
+        return false;
+    }
+    if !overlay_window_viewable(window) {
+        // 启动瞬间可能还在 map 途中；只有持续不可见（≈1 秒）才认定已停靠。
+        this.pointer_poll_misses = this.pointer_poll_misses.saturating_add(1);
+        return this.pointer_poll_misses < 60;
+    }
+    this.pointer_poll_misses = 0;
+    let Some((px, py, down)) = query_overlay_pointer(window) else {
+        // 偶发查询失败：保持循环，别因为一次 X 抖动把补丁关掉
+        return true;
+    };
+    let was_down = this.pointer_poll_down;
+    this.pointer_poll_down = down;
+    let (sx, sy) = frame_scale(window, this.frame_width, this.frame_height);
+    let logical = BoundsPoint::new(px / sx, py / sy);
+    // 轮询起的框：整段拖拽都由轮询喂（见 `pointer_poll_dragging` 的注释），
+    // 位置不分区域，抬手才收尾。
+    if this.pointer_poll_dragging {
+        if down {
+            this.selection.mouse_move(logical);
+            cx.notify();
+        } else {
+            tracing::info!(
+                "[overlay] 轮询起的框抬手（同为顶栏吞事件的那一段）→ 补一次收尾 p=({:.1},{:.1})",
+                logical.x,
+                logical.y
+            );
+            if this.selection.is_dragging() {
+                this.selection.mouse_up();
+            }
+            if this.mode == OverlayMode::Selecting {
+                if let Some(b) = this.selection.current() {
+                    if b.size.x > 1.0 && b.size.y > 1.0 {
+                        this.mode = OverlayMode::Editing;
+                    }
+                }
+            }
+            this.pointer_poll_dragging = false;
+            cx.notify();
+        }
+        return true;
+    }
+    if logical.y >= TOP_EDGE_STRIP && !this.pointer_poll_dragging {
+        // 那一条之外（且不是轮询起的框）由正常事件驱动
+        return true;
+    }
+    // 那一条里：位置一律用轮询值刷新，**包括纯悬停**——悬停的移动事件会被顶栏吃掉，
+    // 否则 + 与坐标徽章会停在最后一次工作区事件的位置，看着"卡住"、也看不到 3 条线。
+    update_cursor_readout(this, logical, window, cx);
+    if down && !was_down {
+        // 顶上按下：事件被顶栏吃掉，这里补"开始框选"。只在 Selecting 且没有正在拖的
+        // 选区时起框，避免把 Editing 模式里已有的选区打散。
+        if this.mode == OverlayMode::Selecting && !this.selection.is_dragging() {
+            tracing::info!(
+                "[overlay] 顶栏那条里按下（事件被顶栏吃掉）→ 轮询补一次起框 p=({:.1},{:.1})",
+                logical.x,
+                logical.y
+            );
+            this.selection.mouse_down(logical);
+            // 这段拖拽的移动/抬起壳层也会吞掉（按下时它自己抓了指针），
+            // 所以整段交给轮询，直到抬手。
+            this.pointer_poll_dragging = true;
+            update_cursor_readout(this, logical, window, cx);
+            cx.notify();
+        }
+    } else if down {
+        // 按住在那一条里移动：位置用轮询值刷新（选区 + 坐标徽章）
+        if this.selection.is_dragging() {
+            this.selection.mouse_move(logical);
+            update_cursor_readout(this, logical, window, cx);
+            cx.notify();
+        }
+    } else if was_down && this.selection.is_dragging() {
+        // 在那一条里抬起：同样收不到，这里补"收尾"
+        tracing::info!("[overlay] 顶栏那条里松手（事件被顶栏吃掉）→ 轮询补一次收尾");
+        this.selection.mouse_up();
+        if this.mode == OverlayMode::Selecting {
+            if let Some(b) = this.selection.current() {
+                if b.size.x > 1.0 && b.size.y > 1.0 {
+                    this.mode = OverlayMode::Editing;
+                }
+            }
+        }
+        cx.notify();
+    }
+    true
+}
+
 fn update_cursor_readout(
     this: &mut OverlayView,
     p: BoundsPoint,
@@ -3378,11 +3569,15 @@ fn update_cursor_readout(
     // 事件：自绘的短十字参考线/坐标徽章钉在那条**下沿**显示，那一条的观感交给系统
     // 光标（见 `TOP_EDGE_STRIP`）。注意只挪**绘制**位置：`cursor_phys` 仍是真实坐标，
     // 所以坐标徽章显示的数值不会骗人。
-    let draw_y = if phys.1 as f32 / sy < TOP_EDGE_STRIP {
+    let at_top = p.y < TOP_EDGE_STRIP;
+    let draw_y = if at_top {
         TOP_EDGE_READOUT_Y
     } else {
         phys.1 as f32 / sy
     };
+    // `cursor_at_top` 在这里统一推导：事件路径与轮询路径（顶上那条悬停收不到事件）
+    // 都走这个函数，HUD 据此少画朝上的那条臂，画布据此把光标换成系统箭头。
+    this.cursor_at_top = at_top;
     this.cursor_pos = Some(BoundsPoint::new(phys.0 as f32 / sx, draw_y));
     this.cursor_phys = Some(phys);
     // 光标形态跟着工具走，所以每次移动都同步一次（内部幂等，不翻转不发 X 请求）
@@ -5129,12 +5324,22 @@ impl Render for OverlayView {
                 const GAP: f32 = 5.0;
                 let shade = gpui::rgba(0x00000066);
                 let line = gpui::rgba(0xFFFFFFCC);
-                let arms: [(f32, f32, f32, f32); 4] = [
+                // 指针贴在屏幕顶上那一条（GNOME 顶栏占的高度）时，朝上的那条臂会画到
+                // 顶栏底下、根本看不见——直接不画，只留左右下 3 条线（用户要求，也和他
+                // 给的参考图一致）。其余情况仍是完整的四臂十字。
+                let up_arm = if self.cursor_at_top {
+                    None
+                } else {
+                    Some((c.x, c.y - GAP - ARM, 1.0, ARM))
+                };
+                let arms: Vec<(f32, f32, f32, f32)> = [
                     (c.x - GAP - ARM, c.y, ARM, 1.0),
                     (c.x + GAP, c.y, ARM, 1.0),
-                    (c.x, c.y - GAP - ARM, 1.0, ARM),
                     (c.x, c.y + GAP, 1.0, ARM),
-                ];
+                ]
+                .into_iter()
+                .chain(up_arm)
+                .collect();
                 // 马赛克笔刷例外：此时鼠标处已经有圆盘，再叠短十字就成了用户反馈的
                 // "圆形中间还是有 +"（还没画选区时 show_hud 恰好为真）。
                 if !matches!(cursor_hint, CursorHint::Brush { .. }) {
@@ -7544,6 +7749,7 @@ fn unpark_overlay_window(window: &mut Window) {
 /// 非 X11 平台：窗口从未 unmap，无需唤醒
 #[cfg(not(target_os = "linux"))]
 fn unpark_overlay_window(_window: &mut Window) {}
+
 
 /// UI 视觉调试用的辅助窗口探针（见 [`OverlayView::apply_ui_probe`]）
 ///

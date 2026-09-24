@@ -656,3 +656,42 @@ fn probe_e_type_change_then_fullscreen() {
     conn.flush().unwrap();
     println!("  [E] 结束");
 }
+
+/// 变体 G：**现在**还能不能抓到指针？
+///
+/// 抓取成功＝当前没有别的 client 占着指针。用来验证覆盖层停靠（unmap）时确实
+/// `ungrab` 了——若忘了解除，指针事件会被送进一个已 unmap 的窗口，用户会觉得
+/// 鼠标失灵（`set_overlay_pointer_grab` 的注释里写了这个坑）。
+#[test]
+#[ignore]
+fn probe_pointer_grab_free() {
+    use x11rb::protocol::xproto::{GrabMode, GrabStatus};
+    let (conn, screen_num) = x11rb::connect(None).unwrap();
+    let win = make_probe_window(&conn, false);
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let status = conn
+        .grab_pointer(
+            false,
+            win,
+            EventMask::POINTER_MOTION | EventMask::BUTTON_PRESS,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .unwrap()
+        .reply()
+        .unwrap()
+        .status;
+    println!(
+        "  [G] 尝试抓指针 → {:?}（成功＝没人占着；{:?} 表示还被占）",
+        status,
+        GrabStatus::ALREADY_GRABBED
+    );
+    conn.ungrab_pointer(x11rb::CURRENT_TIME).unwrap();
+    conn.destroy_window(win).unwrap();
+    conn.flush().unwrap();
+}
