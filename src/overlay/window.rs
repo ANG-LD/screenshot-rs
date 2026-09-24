@@ -175,6 +175,12 @@ pub struct OverlayView {
     mosaic_preview: Option<MosaicPreviewCache>,
     /// 已提交马赛克笔迹的显示层（见 `CommittedMosaicCache`）
     mosaic_layer: Option<CommittedMosaicCache>,
+    /// 「一键模糊」已就绪：下一次在画布上拖框 = 对该框做一键模糊/还原
+    mosaic_box_armed: bool,
+    /// 一键模糊正在拖框的起点
+    mosaic_box_start: Option<BoundsPoint>,
+    /// 一键模糊正在拖的框（用于画预览虚线框）
+    mosaic_box_rect: Option<ub::Bounds>,
     /// Freehand 统一增量层（累积所有已画 Freehand；committed 不渲染 Freehand）
     freehand_incr: Option<IncrFreehand>,
 
@@ -384,6 +390,9 @@ impl OverlayView {
             shape_layer_cache: None,
             mosaic_preview: None,
             mosaic_layer: None,
+            mosaic_box_armed: false,
+            mosaic_box_start: None,
+            mosaic_box_rect: None,
             freehand_incr: None,
             text_input: None,
             text_input_anchor: BoundsPoint::ZERO,
@@ -449,6 +458,9 @@ impl OverlayView {
         // 新会话必须丢掉上一轮的像素层缓存（帧内容与命令都换了），否则可能残留旧图
         self.mosaic_preview = None;
         self.mosaic_layer = None;
+        self.mosaic_box_armed = false;
+        self.mosaic_box_start = None;
+        self.mosaic_box_rect = None;
         self.in_progress = None;
         // 清缓存前交出旧图：形状层缓存是"全部形状联合 bbox"的整幅光栅，
         // 大的能到整屏，直接置 None 就把这块 atlas 瓦片永久留下了
@@ -748,6 +760,146 @@ impl OverlayView {
     }
 
     /// 结束 in_progress：归一化 rect，过滤太小的图形，push 到 DrawingState
+    /// **一键模糊**：把框内的文字/线条全部打码；若框内已有 ≥80% 的内容被模糊过，
+    /// 则反过来**还原成清晰**（同一位置再框一次即切换回来）。
+    ///
+    /// 判定"内容块"用的是与打码同一套规则（`mosaic_content_coverage`），所以"能被
+    /// 模糊的块"与"算进比例的块"永远是同一批，不会判定错位。
+    ///
+    /// 选区是被笔迹覆盖的：模糊只需要**一条**覆盖整框的马赛克命令 —— 空白块会被
+    /// 内容过滤自动跳过，所以效果就是"框内文字全糊、空白不动"。
+    fn one_click_blur(&mut self, rect: ub::Bounds, window: &Window) {
+        use crate::overlay::commands::{
+            mosaic_content_coverage, mosaic_should_restore, mosaic_stamp_center_in_box,
+        };
+        if rect.size.x < 2.0 || rect.size.y < 2.0 {
+            return;
+        }
+        let wb = window.bounds();
+        let sx = self.frame_width as f32 / f32::from(wb.size.width).max(1.0);
+        let sy = self.frame_height as f32 / f32::from(wb.size.height).max(1.0);
+        let (fx0, fy0) = (
+            (rect.origin.x * sx).floor() as i32,
+            (rect.origin.y * sy).floor() as i32,
+        );
+        let (fx1, fy1) = (
+            ((rect.origin.x + rect.size.x) * sx).ceil() as i32,
+            ((rect.origin.y + rect.size.y) * sy).ceil() as i32,
+        );
+        let bs = mosaic_geom(self.toolbar.line_width).1;
+
+        // 已有的马赛克笔迹（转到帧像素，用于判断"这块是不是已经模糊过了"）
+        let stamps: Vec<(crate::overlay::drawing::Point, crate::overlay::drawing::Point)> = self
+            .drawing
+            .visible_commands()
+            .filter_map(|cmd| match &**cmd {
+                DrawCommand::Mosaic { regions, .. } => Some(regions.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|(a, b)| {
+                (
+                    crate::overlay::drawing::Point::new(a.x * sx, a.y * sy),
+                    crate::overlay::drawing::Point::new(b.x * sx, b.y * sy),
+                )
+            })
+            .collect();
+
+        let (total, covered) = mosaic_content_coverage(
+            &self.frame_pixels,
+            self.frame_width,
+            self.frame_height,
+            fx0,
+            fy0,
+            fx1,
+            fy1,
+            bs,
+            &stamps,
+        );
+        if total == 0 {
+            tracing::info!("一键模糊: 框内没有可模糊的内容，忽略");
+            return;
+        }
+
+        if mosaic_should_restore(total, covered) {
+            // 还原：把所有马赛克命令里**落在框内**的笔迹挖掉，空掉的命令一并删除
+            let (bx0, by0, bx1, by1) = (
+                rect.origin.x,
+                rect.origin.y,
+                rect.origin.x + rect.size.x,
+                rect.origin.y + rect.size.y,
+            );
+            let mut emptied: Vec<usize> = Vec::new();
+            let idxs: Vec<usize> = self
+                .drawing
+                .visible_commands_with_indices()
+                .map(|(i, _)| i)
+                .collect();
+            for idx in idxs {
+                if let Some(DrawCommand::Mosaic { regions, .. }) = self.drawing.get_visible_mut(idx)
+                {
+                    regions.retain(|r| {
+                        // 笔迹在画布坐标 → 直接与框比较
+                        !mosaic_stamp_center_in_box(r, bx0, by0, bx1, by1)
+                    });
+                    if regions.is_empty() {
+                        emptied.push(idx);
+                    }
+                }
+            }
+            for idx in emptied.into_iter().rev() {
+                self.drawing.remove_visible(idx);
+            }
+            self.drawing.revision += 1;
+            self.selected_cmd_actual_idx = None;
+            tracing::info!(
+                "一键模糊: 框内 {covered}/{total} 块已模糊（≥{}%）→ 还原",
+                crate::overlay::commands::MOSAIC_RESTORE_RATIO
+            );
+        } else {
+            // 模糊：**每个内容块一条笔迹**（而不是一个大方块盖住整框）。
+            //
+            // 逐块建笔迹是为了让"还原"能精确到块：一个大方块在还原时只能整块删掉，
+            // 于是"第二次框一小片"会把第一次框的整大片一起还原（用户报的 bug）。
+            // 逐块后，还原按块中心的落框判断，框哪块还原哪块。
+            let rects = crate::overlay::commands::mosaic_content_block_rects(
+                &self.frame_pixels,
+                self.frame_width,
+                self.frame_height,
+                fx0,
+                fy0,
+                fx1,
+                fy1,
+                bs,
+            );
+            if rects.is_empty() {
+                tracing::info!("一键模糊: 框内没有可模糊的内容，忽略");
+                return;
+            }
+            let color = self.toolbar.current_color;
+            let regions: Vec<(
+                crate::overlay::drawing::Point,
+                crate::overlay::drawing::Point,
+            )> = rects
+                .iter()
+                .map(|(a, b, c, d)| {
+                    (
+                        crate::overlay::drawing::Point::new(*a as f32 / sx, *b as f32 / sy),
+                        crate::overlay::drawing::Point::new(*c as f32 / sx, *d as f32 / sy),
+                    )
+                })
+                .collect();
+            let n = regions.len();
+            self.drawing.push(DrawCommand::Mosaic {
+                regions,
+                block_size: bs,
+                color,
+            });
+            self.selected_cmd_actual_idx = None;
+            tracing::info!("一键模糊: 框内内容块 {total}（已模糊 {covered}）→ 模糊 {n} 块");
+        }
+    }
+
     fn finish_draw(&mut self) {
         let Some(cmd) = self.in_progress.take() else { return };
         // 解 Arc：唯一持有者直接取出，否则克隆内容
@@ -1730,6 +1882,10 @@ fn render_tool_button_with_popover(
                         this.finalize_text_input_if_active(cx);
                         this.toolbar.active_tool = Some(btn);
                         this.toolbar.popup = None;
+                        // 换工具就退出「一键模糊」待命（否则下一次拖拽还会被当成框选）
+                        this.mosaic_box_armed = false;
+                        this.mosaic_box_start = None;
+                        this.mosaic_box_rect = None;
                         cx.notify();
                     }
                     // 已 active：弹层开/关完全由 GPUI popover 状态驱动
@@ -1783,7 +1939,7 @@ fn render_tool_button_with_popover(
             // content 闭包不能捕获 view 借用（要求 'static）。
             // 每次渲染通过 weak 读当前 OverlayView 状态，确保选中态紧跟最新 toolbar。
             let weak = weak_content.clone();
-            let (cur_color, cur_size, cur_weight, cur_bg, cur_lw) = weak
+            let (cur_color, cur_size, cur_weight, cur_bg, cur_lw, active_tool_for_popover) = weak
                 .read_with(cx, |this, _| {
                     (
                         this.toolbar.current_color,
@@ -1791,9 +1947,17 @@ fn render_tool_button_with_popover(
                         this.toolbar.current_weight,
                         this.toolbar.current_bg,
                         this.toolbar.line_width,
+                        this.toolbar.active_tool,
                     )
                 })
-                .unwrap_or((RGBA::new(0, 0, 0, 255), 24.0, FontWeight::Normal, RGBA::TRANSPARENT, 4.0));
+                .unwrap_or((
+                    RGBA::new(0, 0, 0, 255),
+                    24.0,
+                    FontWeight::Normal,
+                    RGBA::TRANSPARENT,
+                    4.0,
+                    None,
+                ));
             match popup_kind {
                 ToolbarPopup::Text => render_text_popover_content(
                     popover_panel(),
@@ -1804,7 +1968,14 @@ fn render_tool_button_with_popover(
                     weak,
                 ),
                 ToolbarPopup::Stroke => {
-                    render_stroke_popover_content(popover_panel(), cur_color, cur_lw, weak)
+                    let is_mosaic = active_tool_for_popover == Some(ToolButton::Mosaic);
+                    render_stroke_popover_content(
+                        popover_panel(),
+                        cur_color,
+                        cur_lw,
+                        is_mosaic,
+                        weak,
+                    )
                 }
             }
         })
@@ -2455,8 +2626,11 @@ fn render_stroke_popover_content(
     panel: gpui::Div,
     cur_color: RGBA,
     cur_lw: f32,
+    is_mosaic: bool,
     weak: gpui::WeakEntity<OverlayView>,
 ) -> gpui::Div {
+    let mut panel = panel;
+    let weak_one_click = weak.clone();
     use crate::overlay::toolbar::LINE_WIDTHS;
 
     // 粗细档位：同样固定宽度 + 不换行（理由见 `fixed_chip_button`）
@@ -2499,11 +2673,45 @@ fn render_stroke_popover_content(
         ));
     }
 
-    panel
+    panel = panel
         .child(section_label("粗细"))
         .child(width_row)
         .child(section_label("颜色"))
-        .child(swatch_grid(cur_color, SwatchTarget::StrokeColor, false, weak))
+        .child(swatch_grid(cur_color, SwatchTarget::StrokeColor, false, weak.clone()));
+
+    // 马赛克专属：「一键模糊」——点一下后在画布上拖一个框，框内文字全部模糊；
+    // 若框内已有 ≥80% 的内容被模糊过，则还原成清晰（见 `one_click_blur`）。
+    if is_mosaic {
+        // 标签与按钮**同一行**（按钮在「一键模糊」文字右边），不占一整行高度
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(section_label("一键模糊"))
+                .child(fixed_chip_button(
+                    "mosaic_one_click",
+                    104.0,
+                    icon_label_content(
+                        Icon::empty().path(crate::assets::icons::SPARKLES),
+                        "一键模糊",
+                    ),
+                    false,
+                    move |_, _, cx| {
+                        let _ = weak_one_click.update(cx, |this, cx| {
+                            this.mosaic_box_armed = true;
+                            this.mosaic_box_rect = None;
+                            // 关掉弹层，让用户能直接在画布上拖框
+                            this.toolbar.popup = None;
+                            cx.notify();
+                        });
+                    },
+                )),
+        );
+    }
+
+    panel
 }
 
 /// RGBA → BGRA 通道 swap（GPUI RenderImage 用 BGRA）
@@ -4248,6 +4456,8 @@ impl Render for OverlayView {
 
         let ocr_rect = self.ocr_rect;
         let ocr_dragging = self.ocr_drag_start.is_some();
+        // 一键模糊正在拖的框（画虚线框给用户看）
+        let mosaic_box: Option<ub::Bounds> = self.mosaic_box_rect;
         let dim_opacity = self.dim_opacity;
         let hover_shape = self.hover_shape;
         let forbidden_hover = self.forbidden_hover;
@@ -4333,8 +4543,8 @@ impl Render for OverlayView {
         };
 
         let paint_canvas = canvas(
-            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg),
-            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg), window, cx| {
+            move |_, _, _| (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg),
+            move |_, (in_progress, visible_cmds, committed_shape_layer, committed_mosaic_layers, in_progress_shape_layer, mosaic_preview_layer, sel_visible_idx, scale_factor, skip_canvas_idx, ocr_rect, ocr_dragging, mosaic_box, dim_opacity, hover_shape, forbidden_hover, text_editing, text_input_rect, editing_bg), window, cx| {
                 // 悬停在可选中形状的描边上时，整个窗口显示小手光标（window 级光标
                 // 优先级高于元素级 cursor；未悬停时不设置，让文字/手柄的 cursor 正常生效）。
                 if forbidden_hover {
@@ -4491,6 +4701,23 @@ impl Render for OverlayView {
                                 ocr_fill,
                                 px(2.0),
                                 ocr_border,
+                                Default::default(),
+                            ));
+                        }
+                    }
+
+                    // 2.56) 一键模糊的拖拽框（青色实线描边 + 半透明填充）
+                    if let Some(bx) = mosaic_box {
+                        if bx.size.x > 0.0 && bx.size.y > 0.0 {
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(px(bx.origin.x), px(bx.origin.y)),
+                                    size: Size::new(px(bx.size.x), px(bx.size.y)),
+                                },
+                                px(0.),
+                                Hsla::from(rgba(0x22D3EE22)),
+                                px(2.0),
+                                Hsla::from(rgba(0x22D3EEFF)),
                                 Default::default(),
                             ));
                         }
@@ -5105,6 +5332,16 @@ impl Render for OverlayView {
                                 this.open_text_input(p, window, cx);
                                 return;
                             }
+                            // 2.4) 「一键模糊」待命：在画布上拖框
+                            if this.mosaic_box_armed {
+                                this.finalize_text_input_if_active(cx);
+                                this.mosaic_box_start = Some(p);
+                                this.mosaic_box_rect = Some(ub::Bounds {
+                                    origin: p,
+                                    size: BoundsPoint::ZERO,
+                                });
+                                return;
+                            }
                             // 2.5) OCR 工具 + 选区内点击 → 开始框选识别区域
                             if matches!(
                                 this.toolbar.active_tool,
@@ -5193,6 +5430,17 @@ impl Render for OverlayView {
                     cx.notify();
                     return;
                 }
+                // 一键模糊：更新拖拽中的框
+                if let Some(start) = this.mosaic_box_start {
+                    let (x1, y1) = (start.x.min(p.x), start.y.min(p.y));
+                    let (x2, y2) = (start.x.max(p.x), start.y.max(p.y));
+                    this.mosaic_box_rect = Some(ub::Bounds {
+                        origin: BoundsPoint::new(x1, y1),
+                        size: BoundsPoint::new(x2 - x1, y2 - y1),
+                    });
+                    cx.notify();
+                    return;
+                }
                 // OCR 框选中：更新 ocr_rect
                 if let Some(start) = this.ocr_drag_start {
                     let x1 = start.x.min(p.x);
@@ -5238,6 +5486,17 @@ impl Render for OverlayView {
                     // 命令拖拽结束
                     if this.cmd_drag.is_some() {
                         this.cmd_drag = None;
+                        return;
+                    }
+                    // 一键模糊：框选结束 → 模糊 / 还原
+                    if this.mosaic_box_start.take().is_some() {
+                        let rect = this.mosaic_box_rect.take();
+                        // **保持待命**：用户可以接着框下一片，不必每次回去点「一键模糊」
+                        // （退出方式：Esc，或切换到别的工具）
+                        if let Some(rect) = rect {
+                            this.one_click_blur(rect, window);
+                        }
+                        cx.notify();
                         return;
                     }
                     // OCR/翻译 框选结束 → 交给共用入口（提取像素、开结果窗、后台识别）
@@ -5319,6 +5578,15 @@ impl Render for OverlayView {
                     if popup_showing {
                         tracing::info!("ESC closes popover only (popup_showing=true)");
                         this.toolbar.popup = None;
+                        cx.notify();
+                        return;
+                    }
+                    // 「一键模糊」待命中按 Esc：只取消这次待命，不关掉整个截图窗口
+                    if this.mosaic_box_armed || this.mosaic_box_start.is_some() {
+                        tracing::info!("ESC 取消一键模糊待命");
+                        this.mosaic_box_armed = false;
+                        this.mosaic_box_start = None;
+                        this.mosaic_box_rect = None;
                         cx.notify();
                         return;
                     }

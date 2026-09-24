@@ -1108,6 +1108,7 @@ fn blend_pixel(dst: &mut [u8], src: RGBA) {
 /// 返回 `(块均色像素, 每块是否"有内容")`，两者都按 `gw×gh` 的块序排列。
 /// "有内容"的判定见 [`mosaic_block_has_content`]：**空白背景不打码**，只有文字、
 /// 线条这类有内容的块才打码（用户要求："无效区域没有任何内容只有颜色的不做模糊"）。
+#[allow(clippy::too_many_arguments)]
 pub fn mosaic_block_average_ex(
     src: &[u8],
     sw: u32,
@@ -1210,6 +1211,149 @@ pub fn mosaic_block_average_ex(
         }
     }
     (out, content)
+}
+
+/// 「一键模糊」的阈值（百分比）：选区内 **≥ 此比例**的内容块已被马赛克覆盖，
+/// 就认为"这块已经模糊过了"，再次框选时**还原成清晰**；否则把选区内的内容全部模糊。
+pub const MOSAIC_RESTORE_RATIO: usize = 80;
+
+/// 选区的内容块网格 → `(gx0, gy0, 每行块数, 每块是否有内容)`。
+///
+/// 网格原点与 [`mosaic_block_average_ex`]、渲染器完全一致（钉在 `bs` 整数倍上），
+/// 否则"数出来的内容块"和"实际会被打码的块"会错位。
+#[allow(clippy::too_many_arguments)]
+fn mosaic_content_grid(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    bs: i32,
+) -> Option<(i32, i32, usize, Vec<bool>)> {
+    let bsi = bs.max(1);
+    if x1 <= x0 || y1 <= y0 || sw == 0 || sh == 0 {
+        return None;
+    }
+    let (_, content) = mosaic_block_average_ex(src, sw, sh, x0, y0, x1, y1, bsi);
+    if content.is_empty() {
+        return None;
+    }
+    let gx0 = x0.div_euclid(bsi) * bsi;
+    let gy0 = y0.div_euclid(bsi) * bsi;
+    let gw = (((x1 + bsi - 1).div_euclid(bsi) * bsi - gx0).max(0) / bsi).max(1) as usize;
+    Some((gx0, gy0, gw, content))
+}
+
+/// 列出选区内**内容块**的矩形（帧像素坐标，`bs×bs`，绝对网格）。
+///
+/// 「一键模糊」用它**逐块**建马赛克笔迹，而不是拿一个大方块盖住整框 —— 后者在还原时
+/// 只能整块删掉：框一小片就会把整大片一起还原（"第二次框很小区域，框外一大片也变清晰了"）。
+/// 逐块建笔迹后，还原能精确到块。
+#[allow(clippy::too_many_arguments)]
+pub fn mosaic_content_block_rects(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    bs: u32,
+) -> Vec<(i32, i32, i32, i32)> {
+    let bsi = bs.max(1) as i32;
+    let Some((gx0, gy0, gw, content)) = mosaic_content_grid(src, sw, sh, x0, y0, x1, y1, bsi)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (idx, &has) in content.iter().enumerate() {
+        if !has {
+            continue;
+        }
+        let (i, j) = (idx % gw, idx / gw);
+        let bx0 = gx0 + i as i32 * bsi;
+        let by0 = gy0 + j as i32 * bsi;
+        out.push((bx0, by0, bx0 + bsi, by0 + bsi));
+    }
+    out
+}
+
+/// 统计选区内**内容块**的数量，以及其中已被马赛克覆盖的数量 → `(总数, 已覆盖)`。
+///
+/// "内容块"用的是与打码同一套判定（块内有色差，或纯色但明显不是背景色），所以
+/// "能被模糊的块"与"会被算进比例的块"永远是同一批，不会出现判定错位。
+///
+/// `stamps` 是已有的马赛克笔迹（**帧像素**坐标）；块中心落在任一 stamp 内即视为
+/// 已覆盖。
+#[allow(clippy::too_many_arguments)]
+pub fn mosaic_content_coverage(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    bs: u32,
+    stamps: &[(DrawPoint, DrawPoint)],
+) -> (usize, usize) {
+    let bsi = bs.max(1) as i32;
+    if x1 <= x0 || y1 <= y0 || sw == 0 || sh == 0 {
+        return (0, 0);
+    }
+    let grid = mosaic_content_grid(src, sw, sh, x0, y0, x1, y1, bsi);
+    let Some((gx0, gy0, gw, content)) = grid else {
+        return (0, 0);
+    };
+    let mut total = 0usize;
+    let mut covered = 0usize;
+    for (idx, &has) in content.iter().enumerate() {
+        if !has {
+            continue;
+        }
+        total += 1;
+        let (i, j) = (idx % gw, idx / gw);
+        let bx0 = (gx0 + i as i32 * bsi) as f32;
+        let by0 = (gy0 + j as i32 * bsi) as f32;
+        let (bx1, by1) = (bx0 + bsi as f32, by0 + bsi as f32);
+        // 块与笔迹**相交**即算"这块已经模糊过"（而不是要求块中心落在笔迹内）：
+        // 用户第二次框选不可能和第一次严丝合缝，差几像素就判成"没模糊过"会让
+        // 切换变得不可用 —— 明明看着已经糊了，再框一次却又糊一层。
+        if stamps.iter().any(|(a, b)| {
+            let (sx0, sx1) = (a.x.min(b.x), a.x.max(b.x));
+            let (sy0, sy1) = (a.y.min(b.y), a.y.max(b.y));
+            bx1 > sx0 && bx0 < sx1 && by1 > sy0 && by0 < sy1
+        }) {
+            covered += 1;
+        }
+    }
+    (total, covered)
+}
+
+/// 选区内已有 ≥ [`MOSAIC_RESTORE_RATIO`]% 的内容被模糊 → 该还原成清晰。
+///
+/// 选区内一个内容块都没有（纯背景）时返回 `false` —— 没有东西可还原。
+pub fn mosaic_should_restore(total: usize, covered: usize) -> bool {
+    total > 0 && covered * 100 >= total * MOSAIC_RESTORE_RATIO
+}
+
+/// 笔迹的中心是否落在框内（用于"还原"时把框内的笔迹挖掉）。
+///
+/// 用中心而不是整体包含：画笔是一串方块的并集，按整体包含判断会让半个方块卡在
+/// 框边的笔迹永远删不掉；按中心判断的结果与"视觉上框住了这块"一致。
+pub fn mosaic_stamp_center_in_box(
+    region: &(DrawPoint, DrawPoint),
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> bool {
+    let (a, b) = region;
+    let cx = (a.x + b.x) / 2.0;
+    let cy = (a.y + b.y) / 2.0;
+    cx >= x0.min(x1) && cx <= x0.max(x1) && cy >= y0.min(y1) && cy <= y0.max(y1)
 }
 
 /// 被涂抹区域的**背景色**：整片像素里出现最多的颜色（量化到 32 级后取众数）。
@@ -1573,6 +1717,166 @@ mod tests {
         // 局部 (2, 2) 应该是红色
         let idx = (2 * 20 + 2) * 4;
         assert!(f.pixels[idx] > 200, "r = {}", f.pixels[idx]);
+    }
+
+    /// **一键模糊的判定**：框内"内容块"的统计与 ≥80% 还原阈值。
+    ///
+    /// 统计口径必须与打码口径一致（同一套内容块判定），否则会出现"看着已经全糊了，
+    /// 但再框一次不还原"或者"只糊了一点点就还原了"。
+    #[test]
+    fn one_click_blur_counts_content_blocks_and_toggles_at_80_percent() {
+        let (w, h) = (40u32, 20u32);
+        let mut f = empty_frame(w, h);
+        // 左半 4 块宽是"文字"，右半是纯背景
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let ink = x < 16 && x % 4 == 0;
+                let v = if ink { 20 } else { 240 };
+                for c in 0..3 {
+                    f.pixels[i + c] = v;
+                }
+                f.pixels[i + 3] = 0xFF;
+            }
+        }
+        let bs = 8u32;
+        let box_ = (0i32, 0i32, 16i32, 16i32); // 只框住左半"文字"
+
+        // ① 没有任何马赛克笔迹 → 内容块数 > 0，覆盖数 = 0 → 不还原（该模糊）
+        let (total, covered) =
+            mosaic_content_coverage(&f.pixels, w, h, box_.0, box_.1, box_.2, box_.3, bs, &[]);
+        assert!(total > 0, "文字区应当能数出内容块");
+        assert_eq!(covered, 0);
+        assert!(!mosaic_should_restore(total, covered), "还没模糊过，不该还原");
+
+        // ② 笔迹覆盖整框 → 覆盖率 100% → 该还原
+        let full_stamp = vec![(
+            DrawPoint::new(0.0, 0.0),
+            DrawPoint::new(16.0, 16.0),
+        )];
+        let (total2, covered2) = mosaic_content_coverage(
+            &f.pixels, w, h, box_.0, box_.1, box_.2, box_.3, bs, &full_stamp,
+        );
+        assert_eq!(total2, total);
+        assert_eq!(covered2, total2, "整框被笔迹盖住 → 内容块应全部计入已覆盖");
+        assert!(mosaic_should_restore(total2, covered2), "全覆盖 → 该还原");
+
+        // ③ 只有零头被覆盖 → 不还原（继续模糊）
+        let tiny_stamp = vec![(
+            DrawPoint::new(0.0, 0.0),
+            DrawPoint::new(8.0, 8.0),
+        )];
+        let (t3, c3) = mosaic_content_coverage(
+            &f.pixels, w, h, box_.0, box_.1, box_.2, box_.3, bs, &tiny_stamp,
+        );
+        assert!(c3 * 100 < t3 * MOSAIC_RESTORE_RATIO, "零头覆盖不该触发还原");
+
+        // ④ 纯背景框 → 没有内容块 → 不还原（也没得还原）
+        let (t4, c4) =
+            mosaic_content_coverage(&f.pixels, w, h, 24, 0, 40, 16, bs, &full_stamp);
+        assert_eq!((t4, c4), (0, 0), "纯背景框不该数出内容块");
+        assert!(!mosaic_should_restore(t4, c4));
+    }
+
+    /// **一键模糊是逐内容块建笔迹**：还原才能精确到块。
+    ///
+    /// 针对的 bug：原来用**一个大方块**盖住整框，还原时只能整块删掉 —— 于是
+    /// "第一次框一大片、第二次框一小片"会把第一次的整大片一起还原。
+    #[test]
+    fn one_click_blur_builds_one_stamp_per_content_block() {
+        let (w, h) = (40u32, 20u32);
+        let mut f = empty_frame(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let ink = x < 16 && x % 4 == 0;
+                let v = if ink { 20 } else { 240 };
+                for c in 0..3 {
+                    f.pixels[i + c] = v;
+                }
+                f.pixels[i + 3] = 0xFF;
+            }
+        }
+        let bs = 8u32;
+        let rects = mosaic_content_block_rects(&f.pixels, w, h, 0, 0, 16, 16, bs);
+        assert!(!rects.is_empty(), "文字区应当有内容块");
+        // 每块都是 bs×bs、落在绝对网格上（否则还原会错位）
+        for (a, b, c, d) in &rects {
+            assert_eq!(c - a, bs as i32);
+            assert_eq!(d - b, bs as i32);
+            assert_eq!(a.rem_euclid(bs as i32), 0, "块起点必须钉在 bs 整数倍上");
+            assert_eq!(b.rem_euclid(bs as i32), 0);
+        }
+        // 纯背景区没有块 → 不会建笔迹
+        assert!(
+            mosaic_content_block_rects(&f.pixels, w, h, 24, 0, 40, 16, bs).is_empty(),
+            "纯背景不该产出内容块"
+        );
+        // 与覆盖面统计口径一致：块数 = 内容块总数
+        let (total, _) = mosaic_content_coverage(&f.pixels, w, h, 0, 0, 16, 16, bs, &[]);
+        assert_eq!(rects.len(), total, "逐块笔迹数必须等于内容块总数（口径要一致）");
+    }
+
+    /// **小块还原不牵连大块**：一大片模糊里，只还原被小框框住的那几块。
+    #[test]
+    fn one_click_blur_small_box_restores_only_its_own_blocks() {
+        let (w, h) = (48u32, 16u32);
+        let mut f = empty_frame(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let ink = x % 4 == 0;
+                let v = if ink { 20 } else { 240 };
+                for c in 0..3 {
+                    f.pixels[i + c] = v;
+                }
+                f.pixels[i + 3] = 0xFF;
+            }
+        }
+        let bs = 8u32;
+        // 第一次：一大片（整行文字）
+        let big = mosaic_content_block_rects(&f.pixels, w, h, 0, 0, 48, 16, bs);
+        assert!(big.len() > 6, "大片应当有很多块，实际 {}", big.len());
+        // 第二次：只用小框框住最左边一块
+        let small_box = (0.0f32, 0.0f32, 8.0f32, 16.0f32);
+        let keep: Vec<_> = big
+            .iter()
+            .map(|(a, b, c, d)| {
+                (
+                    DrawPoint::new(*a as f32, *b as f32),
+                    DrawPoint::new(*c as f32, *d as f32),
+                )
+            })
+            .filter(|r| {
+                // 与实现同一判定：笔迹中心落在框内 → 还原时删掉
+                mosaic_stamp_center_in_box(r, small_box.0, small_box.1, small_box.2, small_box.3)
+            })
+            .collect();
+        let removed = big.len() - (big.len() - keep.len());
+        assert!(removed >= 1, "小框里应当至少有一块被还原");
+        assert!(
+            removed * 3 < big.len(),
+            "小框只该还原极少几块，实际删了 {removed}/{} —— 大片被牵连还原了",
+            big.len()
+        );
+    }
+
+    /// **还原时按笔迹中心挖框**：框内的笔迹被移除，框外的不受影响。
+    #[test]
+    fn one_click_blur_restore_removes_only_stamps_inside_the_box() {
+        let inside = (DrawPoint::new(10.0, 10.0), DrawPoint::new(30.0, 30.0)); // 中心 (20,20)
+        let outside = (DrawPoint::new(100.0, 10.0), DrawPoint::new(120.0, 30.0));
+        let straddling_edge = (DrawPoint::new(48.0, 10.0), DrawPoint::new(68.0, 30.0)); // 中心 (58,20)
+        let bx = (0.0, 0.0, 50.0, 50.0);
+        assert!(mosaic_stamp_center_in_box(&inside, bx.0, bx.1, bx.2, bx.3));
+        assert!(!mosaic_stamp_center_in_box(&outside, bx.0, bx.1, bx.2, bx.3));
+        assert!(!mosaic_stamp_center_in_box(
+            &straddling_edge,
+            bx.0,
+            bx.1,
+            bx.2,
+            bx.3
+        ));
     }
 
     /// **只对"有内容"的块打码**：同一笔同时扫过"文字区"和"纯空白区"，
