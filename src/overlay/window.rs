@@ -105,7 +105,8 @@ struct CommittedMosaicCache {
 struct MosaicPreviewCache {
     /// 快照时的 stamp 个数：笔迹只增不改，个数变了才需要重算
     region_count: usize,
-    /// 快照时的最后一个 stamp（同个数但换笔时兜底）
+    /// 快照时的最后一个 stamp，**画布逻辑坐标（未缩放）**：比较它不需要先做
+    /// 一次缩放，命中时因此可以完全跳过坐标换算（拖动期间每帧都会走到这里）。
     last_region: Option<((f32, f32), (f32, f32))>,
     /// 画布逻辑坐标 → 帧物理像素的缩放比（窗口尺寸变了要重算）
     scale: (f32, f32),
@@ -372,10 +373,10 @@ impl OverlayView {
         cx: &mut Context<Self>,
     ) -> Self {
         let this = Self {
-            frame_image: build_render_image_from_pixels(
+            frame_image: build_render_image_from_slice(
                 frame.width,
                 frame.height,
-                frame.pixels.clone(),
+                &frame.pixels,
             ),
             pending_image_drops: Vec::new(),
             screen_bounds,
@@ -437,15 +438,18 @@ impl OverlayView {
         tx: Sender<OverlayResult>,
         cx: &mut Context<Self>,
     ) {
-        // 换帧：clone 一份 RGBA 原地转 BGRA 给 RenderImage（gpui 数据约定
-        // BGRA），原 RGBA 移动给 frame_pixels（OCR/提交用）。
-        // 注意：不要改成"拷贝+转换合并"的一次遍历——基准实测 debug 构建下
-        // 合并版 25.9ms/帧 vs clone+原地转换 12.4ms/帧（debug 下 Vec::clone
-        // 走优化的 memcpy，显式 u32 循环无优化反而慢 2 倍）。
+        // 换帧：拷一份转成 BGRA 给 RenderImage（gpui 数据约定 BGRA），原 RGBA
+        // **移动**给 frame_pixels（OCR/提交用）。
+        //
+        // 用 build_render_image_from_slice（拷贝式换道，一趟遍历）而不是
+        // `pixels.clone()` + 原地换道（两趟）：1080p 整帧基准 1.36ms → 0.88ms，
+        // 省 36%（超过 L3 的大缓冲才有这个收益，3MB 级进缓存的缓冲两者相当）。
+        // 早先注释里"合并版更慢"的结论是在 debug 构建 + 逐字节循环下测的，release
+        // 下有了 u32 批量位运算后结论相反，故更新。
         // 用 replace 取得旧图并挂起释放：直接赋值会让旧帧的 atlas 瓦片永久泄漏
         let old_frame_image = std::mem::replace(
             &mut self.frame_image,
-            build_render_image_from_pixels(frame.width, frame.height, frame.pixels.clone()),
+            build_render_image_from_slice(frame.width, frame.height, &frame.pixels),
         );
         self.pending_image_drops.push(old_frame_image);
         self.screen_bounds = screen_bounds;
@@ -3303,6 +3307,49 @@ fn make_resize_handle(
 
 /// 由 RGBA 像素数据构建 GPUI RenderImage（原地转 BGRA 后移交所有权，
 /// 避免整帧 clone）。调用方不再需要该像素时直接传入，零拷贝。
+/// RGBA → BGRA **拷到新缓冲**（一次遍历同时完成拷贝与换道）。
+///
+/// 与"先 `clone()` 再 [`rgba_to_bgra`] 原地换道"相比省掉一整趟内存搬运：
+/// 后者对 8MB 帧是 memcpy 8MB + 读 8MB + 写 8MB，而这里只有读 8MB + 写 8MB。
+/// 调用方仍需要原 buffer（增量笔迹缓冲、整帧 RGBA 供 OCR/提交用）时用这个。
+///
+/// 返回新 Vec；容量恰好 len，避免多留内存。
+fn rgba_to_bgra_copy(src: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(src.len() % 4, 0);
+    let mut out = vec![0u8; src.len()];
+    // 与 rgba_to_bgra 同一套 u32 批量位运算（迭代数是逐字节 swap 的 1/4）
+    if (src.as_ptr() as usize).is_multiple_of(4) && (out.as_ptr() as usize).is_multiple_of(4) {
+        let words_in: &[u32] = unsafe {
+            std::slice::from_raw_parts(src.as_ptr() as *const u32, src.len() / 4)
+        };
+        let words_out: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len() / 4)
+        };
+        for (dst, w) in words_out.iter_mut().zip(words_in) {
+            *dst = ((*w & 0x0000_00FF) << 16)
+                | (*w & 0x0000_FF00)
+                | ((*w & 0x00FF_0000) >> 16)
+                | (*w & 0xFF00_0000);
+        }
+    } else {
+        for (dst, chunk) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            dst[0] = chunk[2];
+            dst[1] = chunk[1];
+            dst[2] = chunk[0];
+            dst[3] = chunk[3];
+        }
+    }
+    out
+}
+
+/// 与 [`build_render_image_from_pixels`] 相同，但从 `&[u8]` 拷一份（调用方保留原 buffer）。
+///
+/// 用于"原 buffer 还要继续用"的场景（增量笔迹缓冲、整帧 RGBA 供 OCR/提交），
+/// 避免 `clone()` + 原地换道 的两趟内存流量。
+fn build_render_image_from_slice(width: u32, height: u32, src: &[u8]) -> Arc<RenderImage> {
+    build_render_image_from_pixels(width, height, rgba_to_bgra_copy(src))
+}
+
 fn build_render_image_from_pixels(width: u32, height: u32, mut pixels: Vec<u8>) -> Arc<RenderImage> {
     rgba_to_bgra(&mut pixels);
     let buffer = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, pixels)
@@ -3560,26 +3607,21 @@ fn update_committed_mosaic_layers(
     self_: &mut OverlayView,
     window: &Window,
 ) -> Vec<(Arc<RenderImage>, ub::Bounds)> {
-    // 先把各笔的 (regions, 块大小, 颜色) 取出来（克隆），后面要可变借用 self_
-    let strokes = mosaic_strokes_of(self_.drawing.visible_commands());
-    if strokes.is_empty() {
-        self_.mosaic_layer = None;
-        return Vec::new();
-    }
     let wb = window.bounds();
     let sx = self_.frame_width as f32 / f32::from(wb.size.width).max(1.0);
     let sy = self_.frame_height as f32 / f32::from(wb.size.height).max(1.0);
-    let fresh = self_
-        .mosaic_layer
-        .as_ref()
-        .is_some_and(|c| c.revision == self_.drawing.revision && c.scale == (sx, sy));
-    if fresh {
-        return self_
-            .mosaic_layer
-            .as_ref()
-            .map(|c| c.layers.clone())
-            .unwrap_or_default();
+
+    // **先判缓存、再收集**：`mosaic_strokes_of` 会把每一笔马赛克的 regions
+    // 整份 clone（一笔几百个 stamp 就是几 KB），而它在动画期间是**每帧**调用一次的
+    // —— 旧实现先 clone 再判断缓存是否新鲜，等于每次重绘都白克隆一遍。
+    // 缓存命中意味着命令集合没变（revision）且缩放没变，直接复用即可。
+    if let Some(c) = self_.mosaic_layer.as_ref() {
+        if c.revision == self_.drawing.revision && c.scale == (sx, sy) {
+            return c.layers.clone();
+        }
     }
+
+    let strokes = mosaic_strokes_of(self_.drawing.visible_commands());
     let mut layers = Vec::with_capacity(strokes.len());
     for (regions, block_size, color) in &strokes {
         if let Some(layer) = mosaic_layer_from_stroke(
@@ -3595,6 +3637,8 @@ fn update_committed_mosaic_layers(
             layers.push(layer);
         }
     }
+    // 即使一笔马赛克都没有也要写缓存（layers 为空）：否则每帧都会重新收集一遍。
+    // 新会话开始时 start_session 会显式清空缓存，不会误用上一轮的图层。
     self_.mosaic_layer = Some(CommittedMosaicCache {
         revision: self_.drawing.revision,
         scale: (sx, sy),
@@ -3631,7 +3675,21 @@ fn update_mosaic_preview(
     let sx = self_.frame_width as f32 / f32::from(wb.size.width).max(1.0);
     let sy = self_.frame_height as f32 / f32::from(wb.size.height).max(1.0);
 
-    // 画布逻辑坐标 → 帧物理像素
+    // 缓存判据：笔迹只增不改 → stamp 个数 + 最后一个 stamp 就够。
+    //
+    // 用**未缩放**的画布坐标比较（缩放比是独立的判据字段），这样缓存命中时
+    // 连一次坐标换算都不用做；旧实现先做完整份 scaled 再判缓存，拖动期间
+    // 每帧都白算一遍 N 个 stamp（N 可达数百）。
+    let last_raw = regions.last().map(|(a, b)| ((a.x, a.y), (b.x, b.y)));
+    let fresh = self_.mosaic_preview.as_ref().is_some_and(|c| {
+        c.region_count == regions.len() && c.last_region == last_raw && c.scale == (sx, sy)
+    });
+    if fresh {
+        let c = self_.mosaic_preview.as_ref()?;
+        return Some((c.image.clone(), c.bounds));
+    }
+
+    // 未命中才做坐标换算：画布逻辑坐标 → 帧物理像素
     let scaled: Vec<(crate::overlay::drawing::Point, crate::overlay::drawing::Point)> = regions
         .iter()
         .map(|(a, b)| {
@@ -3641,16 +3699,6 @@ fn update_mosaic_preview(
             )
         })
         .collect();
-
-    // 缓存判据：笔迹只增不改 → stamp 个数 + 最后一个 stamp 就够
-    let last = scaled.last().map(|(a, b)| ((a.x, a.y), (b.x, b.y)));
-    let fresh = self_.mosaic_preview.as_ref().is_some_and(|c| {
-        c.region_count == scaled.len() && c.last_region == last && c.scale == (sx, sy)
-    });
-    if fresh {
-        let c = self_.mosaic_preview.as_ref()?;
-        return Some((c.image.clone(), c.bounds));
-    }
 
     // 对齐裁剪：只抠出笔迹附近的一块（对齐到块网格，相位不变），避免克隆整帧
     let (crop, cw, ch, cx0, cy0, local) = crate::overlay::commands::mosaic_aligned_crop(
@@ -3681,8 +3729,8 @@ fn update_mosaic_preview(
     };
     let image = build_render_image_from_pixels(pw, ph, pix);
     self_.mosaic_preview = Some(MosaicPreviewCache {
-        region_count: scaled.len(),
-        last_region: last,
+        region_count: regions.len(),
+        last_region: last_raw,
         scale: (sx, sy),
         image: image.clone(),
         bounds,
@@ -3768,7 +3816,7 @@ fn update_in_progress_incr(
                 crate::overlay::commands::Cap::Exact,
             );
             st.rendered = now;
-            let img = build_render_image_from_pixels(bw, bh, st.frame.pixels.clone());
+            let img = build_render_image_from_slice(bw, bh, &st.frame.pixels);
             // 替换旧图：拖动时每帧都换一张，不释放就是每帧漏一块瓦片
             if let Some((old, _)) = st.image.replace((img, bounds)) {
                 self_.pending_image_drops.push(old);
@@ -3850,7 +3898,7 @@ fn update_in_progress_incr(
                 crate::overlay::commands::Cap::Exact,
             );
         }
-        let img = build_render_image_from_pixels(bw, bh, frame.pixels.clone());
+        let img = build_render_image_from_slice(bw, bh, &frame.pixels);
         // debug 而非 info：默认 filter 就是 info，留着等于每帧一次 format + stdout 写
         tracing::debug!(
             "freehand_incr: rebuild bbox=({:.0},{:.0} {}x{}) pts={}",
@@ -9719,6 +9767,114 @@ mod tests {
         );
         assert_eq!(clamp.size.y, 40.0);
         assert_eq!(clamp.origin.y, 158.0, "MIN_H 时顶边 = origin + (size - MIN_H)");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_type_sizes() {
+        macro_rules! sz { ($($t:ty),* $(,)?) => { $( println!("SIZE {:>52} = {:>5} B", stringify!($t), std::mem::size_of::<$t>()); )* } }
+        sz!(
+            DrawCommand,
+            CapturedFrame,
+            crate::capture::CapturedFrame,
+            crate::overlay::window::OverlayResult,
+            crate::overlay::window::OverlayView,
+            crate::overlay::window::MosaicPreviewCache,
+            crate::overlay::window::ShapeLayerCache,
+            Option<DrawCommand>,
+            std::sync::Arc<DrawCommand>,
+            Vec<DrawCommand>,
+        );
+    }
+
+    /// 拷贝式换道必须与原地换道**逐字节等价**（含未按 4 字节对齐的兜底分支）。
+    #[test]
+    fn rgba_to_bgra_copy_matches_in_place() {
+        // 长度 4 的整数倍（走 u32 快路径）
+        let src: Vec<u8> = (0..64u8).collect();
+        let mut in_place = src.clone();
+        rgba_to_bgra(&mut in_place);
+        assert_eq!(rgba_to_bgra_copy(&src), in_place);
+        assert_eq!(src, (0..64u8).collect::<Vec<u8>>(), "源缓冲不得被改动");
+
+        // 对齐偏移：切片起点不按 4 字节对齐时应走逐字节兜底，结果仍须一致
+        let buf: Vec<u8> = (0..128u8).collect();
+        for off in 1..4usize {
+            let unaligned = &buf[off..64 + off];
+            let mut in_place = unaligned.to_vec();
+            rgba_to_bgra(&mut in_place);
+            assert_eq!(
+                rgba_to_bgra_copy(unaligned),
+                in_place,
+                "偏移 {off} 的未对齐切片结果不一致"
+            );
+        }
+    }
+
+    /// 按需基准：`cargo test --release bench_ -- --ignored --nocapture`
+    ///
+    /// 量的是"大缓冲的搬运/分配"这类每帧都可能发生的固定开销。
+    #[test]
+    #[ignore]
+    fn bench_rgba_to_bgra_paths() {
+        use std::time::Instant;
+        for (w, h, label) in [
+            (1920u32, 1080u32, "整帧 1080p"),
+            (900, 900, "笔迹缓冲 900x900"),
+        ] {
+            let n = (w * h * 4) as usize;
+            let src: Vec<u8> = vec![0x40; n];
+            let reps = if n > 4_000_000 { 30 } else { 80 };
+
+            let t = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..reps {
+                // 现状：clone（memcpy 一整份）+ 原地换道
+                let mut v = src.clone();
+                let b = std::hint::black_box(&mut v);
+                rgba_to_bgra(b);
+                sink += v[0] as usize;
+            }
+            let old = t.elapsed() / reps;
+
+            let t = Instant::now();
+            for _ in 0..reps {
+                // 方案：拷贝式换道（一趟）
+                let v = rgba_to_bgra_copy(std::hint::black_box(&src));
+                sink += v[0] as usize;
+            }
+            let new = t.elapsed() / reps;
+
+            // 纯分配 + 清零（mmap + 缺页）成本：决定"复用 scratch buffer"值不值
+            let reps_alloc = 100;
+            let t = Instant::now();
+            for _ in 0..reps_alloc {
+                let v = vec![0u8; n];
+                sink += std::hint::black_box(v)[0] as usize;
+            }
+            let alloc = t.elapsed() / reps_alloc;
+            // 复用同一块缓冲：resize 到同长度（已映射页，只 memset）
+            let mut reused: Vec<u8> = Vec::with_capacity(n);
+            let t = Instant::now();
+            for _ in 0..reps_alloc {
+                reused.clear();
+                reused.resize(n, 0);
+                sink += reused[0] as usize;
+            }
+            let reuse = t.elapsed() / reps_alloc;
+            println!(
+                "BENCH-ALLOC {label}: 新分配 {:?} vs 复用 {reuse:?}（差 {:?}）",
+                alloc,
+                alloc.saturating_sub(reuse)
+            );
+
+            println!(
+                "BENCH {label} ({:.1}MB): clone+原地 {old:?} → 拷贝式 {new:?}（省 {:?}，{:.0}%）  sink={sink}",
+                n as f64 / 1e6,
+                old.saturating_sub(new),
+                (1.0 - new.as_secs_f64() / old.as_secs_f64().max(1e-9)) * 100.0
+            );
+        }
     }
 
     #[test]
