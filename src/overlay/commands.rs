@@ -401,6 +401,9 @@ pub fn apply_commands_step(
             }
             DrawCommand::Text { anchor, content, font_size, color, max_width, weight, background, box_size, text_inset } => {
                 let a = translate(*anchor, region_origin_x, region_origin_y);
+                // 竖向：anchor 是**文本框左上角**，字形要再往下让出「顶部 spacer + Input 内边距」，
+                // 与编辑态/窗口预览对齐（font_size 此处已是帧像素单位，与字形坐标同一坐标系）
+                let a = (a.0, a.1 + text_box_inset_y(*font_size));
                 // 应用层暂不支持文字旋转，固定 0 度（pivot 传 anchor，旋转分支不生效）
                 rasterize_text(frame, a, a, content, *font_size, *color, *max_width, *weight, 0.0, *background, *box_size, *text_inset)?;
             }
@@ -1211,6 +1214,52 @@ pub fn mosaic_block_average_ex(
         }
     }
     (out, content)
+}
+
+/// Input 组件**自带**的水平内边距（gpui-component `Size::Size` → `input_px()` = 8）。
+pub const TEXT_INPUT_PAD_X: f32 = 8.0;
+/// Input 组件**自带**的垂直内边距（`input_py()` = 2）。
+pub const TEXT_INPUT_PAD_Y: f32 = 2.0;
+
+/// 文本框左右内边距（box 自身那层，不含 Input 自带的），随**字号**缩放。
+///
+/// 原来是写死的 10px：小字号时框里空一大截，大字号时又显得局促。改成跟字号走
+/// （约 0.35 字宽，下限 3px 保证不贴边，上限 12px 防止超大字号留白失控）。
+/// **下限不能低于** [`TEXT_BOX_MIN_PAD_X`]：编辑器要求"光标右缘 + 安全边距"不得
+/// 超出视口，而视口宽 = 文字宽 + 本值。本值一旦小于安全边距，光标移到末尾时编辑器
+/// 会把整行文字左移，**首字被裁掉一半**（实测：字号从 64 缩到 14 时复现）。
+pub fn text_box_pad_x(font_size: f32) -> f32 {
+    (font_size * 0.35).clamp(TEXT_BOX_MIN_PAD_X, 12.0)
+}
+
+/// 左右内边距下限（逻辑像素）。
+///
+/// 必须 > gpui-component 的 `RIGHT_MARGIN`（本项目已收到 2px），再给光标自身宽度
+/// 留出余量。4px 在支持的全部字号下都满足（14→4.9、64→12）。
+pub const TEXT_BOX_MIN_PAD_X: f32 = 4.0;
+
+/// 文本框上下内边距（box 自身那层），随**字号**缩放。
+///
+/// 原来顶部 spacer 写死 6px，配上 Input 自带的 2px，文字行盒顶离框顶 8px ——
+/// 小字号时上下留白肉眼可见地空。改成约 0.08 字高（下限 1.5、上限 4）。
+pub fn text_box_pad_y(font_size: f32) -> f32 {
+    (font_size * 0.08).clamp(1.5, 4.0)
+}
+
+/// 文字插入点距文本框左边的总缩进 = box 内边距 + Input 自带内边距。
+///
+/// 编辑态（Input 的 box pl + input_px）、窗口预览（[`crate::overlay::window::paint_command`]）
+/// 与最终成图（[`rasterize_text`]）必须用**同一个值**，否则三者会横向错位。
+pub fn text_box_inset_x(font_size: f32) -> f32 {
+    text_box_pad_x(font_size) + TEXT_INPUT_PAD_X
+}
+
+/// 文字行盒顶距文本框顶的总缩进 = box 顶部 spacer + Input 自带垂直内边距。
+///
+/// 与 [`text_box_inset_x`] 同理，编辑态/预览/成图三处必须一致：此前成图路径**没有**
+/// 这一项，导致固化后的文字比编辑时高 8px（框内文字看着"跳"了一下）。
+pub fn text_box_inset_y(font_size: f32) -> f32 {
+    text_box_pad_y(font_size) + TEXT_INPUT_PAD_Y
 }
 
 /// 「一键模糊」的阈值（百分比）：选区内 **≥ 此比例**的内容块已被马赛克覆盖，
@@ -2253,6 +2302,113 @@ mod tests {
                 "DEBUG_RASTER {} ink_bbox=({},{})-({},{}) size={}x{}",
                 label, min_x, min_y, max_x, max_y, max_x - min_x + 1, max_y - min_y + 1
             );
+        }
+    }
+
+
+    /// **左右内边距必须大于编辑器的右安全边距**，否则光标移到末尾时整行文字被左移、
+    /// 首字裁半（用户实测：字号 64 → 14 后光标移到末尾复现）。
+    ///
+    /// 编辑器逻辑（gpui-component `element.rs`）：
+    /// `cursor_pos.x + RIGHT_MARGIN > 视口宽` → `scroll_offset.x` 变负 → 文字左移；
+    /// 而视口宽 = 文字宽 + `text_box_pad_x`，光标在末尾时 cursor_pos.x = 文字宽，
+    /// 于是条件退化成 `text_box_pad_x < RIGHT_MARGIN`。本项目把 RIGHT_MARGIN 收到 2，
+    /// 这里用 4（= TEXT_BOX_MIN_PAD_X）连光标宽度一起兜住。
+    #[test]
+    fn text_box_pad_x_stays_above_editor_right_margin() {
+        /// 本项目补丁后的 gpui-component `RIGHT_MARGIN`（见该 crate element.rs）
+        const EDITOR_RIGHT_MARGIN: f32 = 2.0;
+        for &fs in crate::overlay::toolbar::FONT_SIZES {
+            let pad = text_box_pad_x(fs);
+            assert!(
+                pad > EDITOR_RIGHT_MARGIN,
+                "fs={fs}: 左右内边距 {pad} 必须大于编辑器右安全边距 {EDITOR_RIGHT_MARGIN}，否则光标到末尾会左移裁字"
+            );
+            assert!(
+                pad >= TEXT_BOX_MIN_PAD_X,
+                "fs={fs}: 左右内边距 {pad} 不得低于下限 {TEXT_BOX_MIN_PAD_X}"
+            );
+        }
+        // 顺带钉住：字号越大留白越大（随字号缩放；字号再大就到上限 12 封顶）
+        assert!(text_box_pad_x(14.0) < text_box_pad_x(24.0));
+        assert!(text_box_pad_x(24.0) < text_box_pad_x(30.0));
+        assert_eq!(text_box_pad_x(64.0), 12.0, "上限封顶");
+    }
+
+    /// 文本框内边距：随字号缩放、比旧实现小，且**成图路径真的加进去了**。
+    ///
+    /// 背景：旧实现上下内边距写死（顶部 spacer 6 + Input 自带 2 = 8），与字号无关，
+    /// 用户反馈"上下内边距太大、且希望随字号调整"；同时成图路径当时**没有**这一项，
+    /// 固化后文字比编辑态高 8px —— 这个测试把两件事一起钉住。
+    #[test]
+    fn text_box_padding_scales_with_font_size_and_is_applied_on_commit() {
+        // ① 随字号单调增大，并有合理上下限
+        assert!(text_box_pad_x(14.0) < text_box_pad_x(24.0));
+        assert!(text_box_pad_x(24.0) < text_box_pad_x(64.0));
+        assert!(text_box_pad_y(14.0) <= text_box_pad_y(24.0));
+        assert!(text_box_pad_y(24.0) <= text_box_pad_y(64.0));
+        assert!(text_box_pad_x(4.0) >= 3.0, "小字号也不能贴边");
+        assert!(text_box_pad_x(400.0) <= 12.0, "大字号不能无限留白");
+        assert!(text_box_pad_y(400.0) <= 4.0);
+
+        // ② 总缩进 = box 内边距 + Input 自带内边距（三者必须同源，这里钉住定义）
+        assert_eq!(text_box_inset_x(24.0), text_box_pad_x(24.0) + TEXT_INPUT_PAD_X);
+        assert_eq!(text_box_inset_y(24.0), text_box_pad_y(24.0) + TEXT_INPUT_PAD_Y);
+
+        // ③ 比旧实现（顶部 6+2=8）小，且小字号更小
+        assert!(text_box_inset_y(24.0) < 8.0, "顶部缩进应当小于旧实现的 8px");
+        assert!(text_box_inset_y(14.0) < text_box_inset_y(48.0));
+
+        // ④ 成图：墨迹顶 = 锚点 + 行盒顶缩进 + 字形固有偏移 k（k 为改动前实测值）
+        for (fs, k) in [(14.0f32, 5.0f32), (24.0, 10.0), (40.0, 18.0)] {
+            let (w, h) = (400u32, 240u32);
+            let mut f = CapturedFrame {
+                width: w,
+                height: h,
+                pixels: vec![0u8; (w * h * 4) as usize],
+            };
+            let anchor_y = 40.0f32;
+            let inset = text_box_inset_y(fs);
+            let origin = (20.0f32, anchor_y + inset);
+            rasterize_text(
+                &mut f,
+                origin,
+                origin,
+                "Hg",
+                fs,
+                RGBA::new(0, 0, 0, 255),
+                None,
+                FontWeight::Normal,
+                0.0,
+                RGBA::TRANSPARENT,
+                (0.0, 0.0),
+                0.0,
+            )
+            .unwrap();
+            let (mut top, mut bottom) = (None, 0usize);
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    if f.pixels[(y * w as usize + x) * 4 + 3] > 40 {
+                        if top.is_none() {
+                            top = Some(y as f32);
+                        }
+                        bottom = y;
+                    }
+                }
+            }
+            let top = top.expect("应当画出字形");
+            let expect = anchor_y + inset + k;
+            assert!(
+                (top - expect).abs() <= 1.5,
+                "fs={fs}: 墨迹顶 {top} 应约等于 锚点+缩进+k = {expect}（缩进没加进去？）"
+            );
+            // ⑤ 墨迹必须落在框内：框高 = 行盒(1.5×字号) + 上下内边距
+            let box_bottom = anchor_y + fs * 1.5 + inset * 2.0;
+            assert!(
+                bottom as f32 <= box_bottom,
+                "fs={fs}: 墨迹底 {bottom} 超出框底 {box_bottom}"
+            );
+            assert!(top >= anchor_y + inset, "fs={fs}: 墨迹顶不能跑到框内边距之上");
         }
     }
 

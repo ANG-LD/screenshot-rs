@@ -1048,13 +1048,25 @@ impl OverlayView {
         // 初始框刻意做小：64×1行，输字后 auto_grow 按内容扩宽/扩高。
         let w = max_w_override.unwrap_or(64.0);
         // 空框行高由窗口 line_height 决定；输字后 auto_grow 测量里会再按
-        // max(窗口行高, 1.4×字号) 补足，避免大字号溢出。
-        // 默认高度提高：行高加成 14→22、下限 40→50，初始框更明显
+        // max(窗口行高, 1.5×字号) 补足，避免大字号溢出。
+        //
+        // 初始高度必须与 auto_grow 用的是**同一套公式**（行盒 + 上下内边距），
+        // 否则刚点开是一个高度、打第一个字又跳成另一个（旧实现 58 → 50）。
         let line_h = window.line_height().as_f32();
-        let init_h = (line_h + 22.0).max(50.0);
+        let fs_logical = text_fs_logical(self.toolbar.current_size, self.scale_factor);
+        let inset_y = crate::overlay::commands::text_box_inset_y(fs_logical);
+        let init_h = line_h.max(fs_logical * 1.5) + inset_y * 2.0;
         self.text_input_rect = ub::Bounds::new(p, BoundsPoint::new(p.x + w, p.y + init_h))
             .clamp_inside(limits);
-        tracing::debug!("open_text_input: anchor=({:.1}, {:.1}) initial={}", p.x, p.y, initial.is_some());
+        tracing::info!(
+            "open_text_input: anchor=({:.1}, {:.1}) initial={} fs={:.1} box=({:.1},{:.1}) pad=({:.2},{:.2}) inset=({:.2},{:.2})",
+            p.x, p.y, initial.is_some(),
+            self.toolbar.current_size, w, init_h,
+            crate::overlay::commands::text_box_pad_x(fs_logical),
+            crate::overlay::commands::text_box_pad_y(fs_logical),
+            crate::overlay::commands::text_box_inset_x(fs_logical),
+            crate::overlay::commands::text_box_inset_y(fs_logical),
+        );
 
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1183,7 +1195,10 @@ impl OverlayView {
                 weight: self.toolbar.current_weight,
                 background: self.toolbar.current_bg,
                 box_size: (self.text_input_rect.size.x, self.text_input_rect.size.y),
-                text_inset: crate::overlay::window::TEXT_BOX_INSET,
+                // 水平缩进随字号（与编辑态 Input 的 box pl + input_px 同源）
+                text_inset: crate::overlay::commands::text_box_inset_x(
+                    self.toolbar.current_size / self.scale_factor.max(0.01),
+                ),
             });
             // 记录对应 DrawCommand 索引，便于重新编辑时移除。
             self.text_input_cmd_idx = Some(self.drawing.history_index - 1);
@@ -3042,32 +3057,38 @@ fn any_shape_stroke_hit(drawing: &DrawingState, p: BoundsPoint) -> bool {
 /// Input 组件有 input_px=8、input_py=2 的 padding，Editor 元素位于
 /// padding 内部，所以文字原点相对于外层 box 约为 (8, 8)。
 /// Canvas 渲染时需加相同偏移以对齐。
-const TO_X: f32 = 8.0;
-const TO_Y: f32 = 8.0;
+/// 拖拽条/手柄所在边缘的命中宽度（逻辑像素，与内边距无关，固定值避免小字号点不中）
+const TEXT_EDGE_GRAB: f32 = 6.0;
 
-/// 文本框「文字插入点距框左」的水平缩进逻辑像素 = box 左内边距(10) + Input 内边距(约8)。
-/// 编辑态文本由 Input 按此缩进绘制；成图(rasterize_text)需用同一值偏移，否则文字会贴到框左。
-const TEXT_BOX_INSET: f32 = 18.0;
-/// Text 输入框内 Input 自己的水平内边距（gpui-component custom size 的 input_px）。
-const TEXT_INPUT_PAD: f32 = 8.0;
-/// 文本框左内边距（box div pl）：TEXT_BOX_INSET - TEXT_INPUT_PAD。
-const TEXT_BOX_LPAD: f32 = TEXT_BOX_INSET - TEXT_INPUT_PAD;
+/// 文本框内边距（上下左右）随**字号**缩放，见 [`crate::overlay::commands::text_box_pad_x`]
+/// / [`crate::overlay::commands::text_box_pad_y`]。
+///
+/// 曾用写死的 `TEXT_BOX_INSET = 18`（左内边距 10 + Input 自带 8）与 `TO_Y = 8`
+/// （顶部 spacer 6 + Input 自带 2），与字号无关：小字号框里空一大截（上下尤其明显），
+/// 大字号又显得局促；而且成图路径当时**没有**顶部缩进，固化后文字比编辑时高 8px。
+/// 现在统一走 `text_box_pad_*` / `text_box_inset_*`，三处（编辑态、窗口预览、成图）同源。
+fn text_fs_logical(font_size: f32, scale_factor: f32) -> f32 {
+    font_size / scale_factor.max(0.01)
+}
 
 /// 检测点击是否落在已固化的 Text 命令区域内（用于"点击重新编辑"）
 ///
-/// anchor 是外层 box 原点，文字实际渲染位置偏移 (TO_X, TO_Y)。
+/// anchor 是外层 box 原点，文字实际渲染位置偏移 (inset_x, inset_y)（随字号）。
 fn hit_test_text_cmd(cmd: &DrawCommand, p: BoundsPoint) -> bool {
     match cmd {
         DrawCommand::Text { anchor, content, font_size, .. } => {
             let char_w = font_size * 0.6;
-            let line_h = font_size * 1.25;
+            let line_h = font_size * 1.5;
             let lines: Vec<&str> = content.split('\n').collect();
             let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
             let w = char_w * max_chars.max(1.0);
             let h = line_h * lines.len().max(1) as f32;
+            // 与编辑态/预览/成图同一份缩进（随字号），否则"点文字重新编辑"会命中偏
+            let ins_x = crate::overlay::commands::text_box_inset_x(*font_size);
+            let ins_y = crate::overlay::commands::text_box_inset_y(*font_size);
             const PAD: f32 = 4.0;
-            p.x >= anchor.x + TO_X - PAD && p.x <= anchor.x + TO_X + w + PAD
-                && p.y >= anchor.y + TO_Y - PAD && p.y <= anchor.y + TO_Y + h + PAD
+            p.x >= anchor.x + ins_x - PAD && p.x <= anchor.x + ins_x + w + PAD
+                && p.y >= anchor.y + ins_y - PAD && p.y <= anchor.y + ins_y + h + PAD
         }
         _ => false,
     }
@@ -4013,11 +4034,10 @@ fn paint_command(cmd: &DrawCommand, window: &mut Window, cx: &mut App, scale_fac
                 // 保证提交预览与编辑/成图文字横坐标一致。旧 TO_X=8 仅等于 input_px，未含
                 // box 左内边距，会让提交预览文字比编辑态偏左。
                 let origin_fx = anchor.x + *text_inset;
-                // 编辑态文字行盒顶相对 box 的偏移：6px 顶部占位 spacer + 2px input_py
-                // 内边距 = +8（已用 range_to_bounds 实测，Linux 与 Windows 一致）。
-                // 旧实现 Linux 用 +7（当时编辑态 Input 带 1px 边框）；去掉边框后行盒顶
-                // 变为 +8，沿用 +7 会让提交后文字上移 1px。
-                let origin_fy = anchor.y + TO_Y;
+                // 编辑态文字行盒顶相对 box 的偏移 = 顶部 spacer + Input 自带 input_py，
+                // 两者都随字号缩放（见 text_box_inset_y）。此前写死 +8 是与字号无关的，
+                // 且成图路径没有这一项 → 固化后文字比编辑时高 8px。
+                let origin_fy = anchor.y + crate::overlay::commands::text_box_inset_y(fs);
                 let origin_x = window.pixel_snap(px(origin_fx));
                 // 先对 box 基准点做像素对齐（与 Input 所在 box 的整块栅格化一致），
                 // 再叠加行高偏移，避免偏移非整数时 pixel_snap 单独取整导致错位。
@@ -4496,9 +4516,14 @@ impl Render for OverlayView {
                     // 若框强撑到 MIN_W，文字贴左、右侧空出大段背景 → 左右内边距不一致。
                     // 改为「框宽 = 文字宽 + 2×inset」，文字在框内左右居中。
                     const MIN_W: f32 = 100.0;
-                    const MIN_H: f32 = 40.0;
+                    // 高度下限只兜底（正常由 行数×行盒 + 上下内边距 决定），
+                    // 原来 40 对小字号偏空
+                    let fs_logical = text_fs_logical(fs, sf);
+                    let inset_x = crate::overlay::commands::text_box_inset_x(fs_logical);
+                    let inset_y = crate::overlay::commands::text_box_inset_y(fs_logical);
+                    let min_h = fs_logical + inset_y * 2.0;
                     let new_w = if adv_px > 0.0 {
-                        (adv_px / sf + TEXT_BOX_INSET * 2.0).max(TEXT_BOX_INSET * 2.0)
+                        (adv_px / sf + inset_x * 2.0).max(inset_x * 2.0)
                     } else {
                         MIN_W
                     };
@@ -4512,8 +4537,10 @@ impl Render for OverlayView {
                     let rows = value.matches('\n').count() + 1;
                     let effective_rows = rows.clamp(1, 8);
                     let line_h = window.line_height().as_f32().max(fs / sf * 1.5);
-                    let new_h =
-                        (effective_rows as f32 * line_h + 6.0 + 2.0 + 2.0 + 4.0).max(MIN_H);
+                    // 高度 = 行数×行盒 + 上下内边距（对称、随字号）。
+                    // 旧式 `+6+2+2+4`（顶部 spacer 6 + input_py×2 + 余量 4）是写死的，
+                    // 小字号时框里空一大截 —— 用户反馈的"上下内边距太大"。
+                    let new_h = (effective_rows as f32 * line_h + inset_y * 2.0).max(min_h);
                     let old_w = self.text_input_rect.size.x;
                     let old_h = self.text_input_rect.size.y;
                     self.text_input_rect.size = BoundsPoint::new(new_w, new_h);
@@ -4963,12 +4990,16 @@ impl Render for OverlayView {
                         .h(px(lh))
                         .flex()
                         .flex_col()
-                        // 左内边距（TEXT_BOX_LPAD）：与右侧 input_px 对称，使文本在框内居中
-                        .pl(px(TEXT_BOX_LPAD))
+                        // 左内边距：与右侧 Input 自带 input_px 对称，使文本在框内居中（随字号）
+                        .pl(px(crate::overlay::commands::text_box_pad_x(text_fs_logical(
+                            self.toolbar.current_size,
+                            self.scale_factor,
+                        ))))
                         .child(
-                            div()
-                                .w_full()
-                                .h(px(6.0)),
+                            // 顶部占位：与编辑态 Input 的行盒顶对齐（随字号）
+                            div().w_full().h(px(crate::overlay::commands::text_box_pad_y(
+                                text_fs_logical(self.toolbar.current_size, self.scale_factor),
+                            ))),
                         )
                         .child(
                             div()
@@ -4995,7 +5026,8 @@ impl Render for OverlayView {
                         ),
                 );
             } else {
-                let h_size = 6.0_f32;
+                // 边缘拖拽区宽度固定（与字号无关，避免小字号时点不中）
+                let h_size = TEXT_EDGE_GRAB;
                 // 手柄 8×8（与矩形选中框一致），中心在边框线上（跨线各一半）：
                 // 外侧一半靠去掉 overflow_hidden 保持可见
                 let hh = HANDLE_VISUAL_SIZE / 2.0;
@@ -5013,14 +5045,17 @@ impl Render for OverlayView {
                         .h(px(lh))
                         .flex()
                         .flex_col()
-                        // 左内边距（TEXT_BOX_LPAD）：与右侧 input_px 对称，使文本在框内居中
-                        .pl(px(TEXT_BOX_LPAD))
+                        // 左内边距：与右侧 Input 自带 input_px 对称，使文本在框内居中（随字号）
+                        .pl(px(crate::overlay::commands::text_box_pad_x(text_fs_logical(
+                            self.toolbar.current_size,
+                            self.scale_factor,
+                        ))))
                         .child(
-                            // 顶部透明占位（6px）：保证 Input 位置与提交态一致。
+                            // 顶部透明占位：高度 = 上下内边距（随字号），保证 Input 位置与提交态一致。
                             // 边框线与移动由 text-move-top 覆盖层负责（单实线 + 小手拖动）。
-                            div()
-                                .w_full()
-                                .h(px(h_size)),
+                            div().w_full().h(px(crate::overlay::commands::text_box_pad_y(
+                                text_fs_logical(self.toolbar.current_size, self.scale_factor),
+                            ))),
                         )
                         .child(
                             div()
@@ -6550,6 +6585,12 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
             // OCR 面板都是深色玻璃风格，组件默认的浅色主题会让它们内部弹出的
             // 组件（tooltip / Button 变体 / 滚动条 / 文本选区）白得发亮、风格割裂。
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+
+            // 文字输入的**光标颜色**：深色主题给的是近白色（#fafafa），而覆盖窗口底下
+            // 往往是一张浅色截图（白底网页/文档），白光标叠在白底上几乎看不见 ——
+            // 用户反馈的"输入光标不清晰"。改成工具栏强调蓝，浅底深底都够醒目。
+            gpui_component::Theme::global_mut(cx).caret =
+                gpui::rgba(theme::tokens::ACCENT).into();
 
             // 把内置 Noto Sans CJK SC Regular/Bold 注册进 GPUI text system，
             // 这样预览文字用 family="Noto Sans CJK SC" + weight=BOLD 时能命中

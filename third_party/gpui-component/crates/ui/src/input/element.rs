@@ -24,7 +24,16 @@ use crate::{
 use super::{InputState, LastLayout, WhitespaceIndicators, mode::InputMode};
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
-pub(super) const RIGHT_MARGIN: Pixels = px(10.);
+// [本项目修补] 光标右侧安全边距 10 → 2。
+//
+// 这个值决定"光标右缘离视口右边界留多少"，一旦 光标x + RIGHT_MARGIN > 视口宽，
+// 编辑器就会把整行文字**水平左移**（scroll_offset.x 变负），首字被 overflow_hidden
+// 裁掉一半 —— 截图工具的文本框内边距是随字号缩放的自绘内边距（见
+// `commands::text_box_pad_x`），比上游默认紧凑，10px 的安全边距会让"小字号 +
+// 光标移到末尾"必然触发上面这条左移。
+// 我们自己已经在框内留了等于 `text_box_pad_x` 的视口余量（且不小于 4px，大于
+// 光标自身宽度），所以这里收到 2 即可，既不再左移，光标也不会贴边。
+pub(super) const RIGHT_MARGIN: Pixels = px(2.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
 const FOLD_ICON_WIDTH: Pixels = px(14.);
 const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
@@ -526,6 +535,17 @@ impl TextElement {
             }
 
             // cursor bounds
+            //
+            // [本项目修补] 光标（caret）宽度随字号缩放。
+            // 上游把宽度写死成 CURSOR_WIDTH（Linux/Windows 2px、macOS 1.5px），
+            // 字号一大（截图工具常用 40~64px 标注）这根发丝般的竖线就"看不清"了。
+            // 这里让宽度按字号走（约 0.9% 字号宽，下限 2px 避免小字号变糊，上限
+            // 8px 防止超大字号变成一根粗棒）。高度沿用上游系数（自定义字号 0.85
+            // 行盒）。
+            let cursor_width = match state.size {
+                crate::Size::Size(size_px) => (size_px * 0.875 * 0.09).max(px(2.0)).min(px(8.0)),
+                _ => CURSOR_WIDTH,
+            };
             let cursor_height = match state.size {
                 crate::Size::Large => 1.,
                 crate::Size::Small => 0.75,
@@ -544,7 +564,7 @@ impl TextElement {
             // stays visible without having to shift the text via scroll_offset.
             let cursor_x = bounds.left() + cursor_pos.x + line_number_width + cursor_scroll_x;
             let cursor_x = if last_layout.text_align == TextAlign::Right {
-                cursor_x.min(bounds.right() - CURSOR_WIDTH)
+                cursor_x.min(bounds.right() - cursor_width)
             } else {
                 cursor_x
             };
@@ -553,7 +573,7 @@ impl TextElement {
                     cursor_x,
                     bounds.top() + cursor_pos.y + ((line_height - cursor_height) / 2.),
                 ),
-                size(CURSOR_WIDTH, cursor_height),
+                size(cursor_width, cursor_height),
             ));
         }
 
