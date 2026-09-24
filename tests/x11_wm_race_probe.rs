@@ -290,3 +290,146 @@ fn probe_k_remove_fullscreen_keeps_unmapped() {
     conn.destroy_window(win).unwrap();
     conn.flush().unwrap();
 }
+
+/// 读窗口在 root 坐标系里的绝对几何。
+fn abs_geom(conn: &RustConnection, win: u32) -> String {
+    let root = conn.setup().roots[0].root;
+    let g = conn.get_geometry(win).unwrap().reply().unwrap();
+    let t = conn.translate_coordinates(win, root, 0, 0).unwrap().reply().unwrap();
+    format!("{}x{}+{}+{}", g.width, g.height, t.dst_x, t.dst_y)
+}
+
+/// 完全透明的整屏探针窗口：ARGB visual + background_pixel=0（X 服务器填充
+/// 0x00000000＝全透明，合成后不可见）+ WM_HINTS.input=False（不抢输入焦点）。
+fn make_invisible_overlay_probe(conn: &RustConnection) -> u32 {
+    let screen_num = 0usize;
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let (depth, visual) = find_argb_visual(conn, screen_num).unwrap();
+    let win = conn.generate_id().unwrap();
+    let colormap = conn.generate_id().unwrap();
+    conn.create_colormap(x11rb::protocol::xproto::ColormapAlloc::NONE, colormap, root, visual)
+        .unwrap();
+    conn.create_window(
+        depth,
+        win,
+        root,
+        0,
+        0,
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        visual,
+        &CreateWindowAux::new()
+            .colormap(colormap)
+            .background_pixel(0)
+            .border_pixel(0)
+            .event_mask(EventMask::STRUCTURE_NOTIFY),
+    )
+    .unwrap();
+    // WM_HINTS: flags=InputHint, input=False → mutter 不给它焦点
+    let wm_hints = conn.intern_atom(false, b"WM_HINTS").unwrap().reply().unwrap().atom;
+    let hints: [u32; 9] = [1, 0, 0, 0, 0, 0, 0, 0, 0];
+    conn.change_property(
+        PropMode::REPLACE,
+        win,
+        wm_hints,
+        wm_hints,
+        32,
+        9,
+        &hints.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let motif = conn.intern_atom(false, b"_MOTIF_WM_HINTS").unwrap().reply().unwrap().atom;
+    let mh: [u32; 5] = [1 << 1, 0, 0, 0, 0];
+    conn.change_property(PropMode::REPLACE, win, motif, motif, 32, 5,
+        &mh.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>()).unwrap();
+    conn.flush().unwrap();
+    win
+}
+
+/// 采样几何变化时间线，直到稳定在「整屏」或超时。
+fn sample_timeline(conn: &RustConnection, win: u32, budget_ms: u64, label: &str) {
+    let start = std::time::Instant::now();
+    let mut last = String::new();
+    let mut first_screen_at: Option<u128> = None;
+    while start.elapsed().as_millis() < budget_ms as u128 {
+        let g = abs_geom(conn, win);
+        if g != last {
+            let ms = start.elapsed().as_millis();
+            if last.is_empty() {
+                println!("  [{label}] {ms}ms 初始几何: {g}");
+            } else {
+                println!("  [{label}] {ms}ms → {g}");
+            }
+            last = g.clone();
+        }
+        if first_screen_at.is_none() && g.starts_with("1920x1080+0+0") {
+            first_screen_at = Some(start.elapsed().as_millis());
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    match first_screen_at {
+        Some(ms) => println!("  [{label}] 到达整屏 1920x1080+0+0: {ms}ms"),
+        None => println!("  [{label}] {budget_ms}ms 内始终没到整屏"),
+    }
+}
+
+/// 变体 A：当前实现时序——map → 立刻 ADD FULLSCREEN 客户端消息。
+#[test]
+#[ignore]
+fn probe_clamp_timeline_current_order() {
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    let root = conn.setup().roots[0].root;
+    let win = make_invisible_overlay_probe(&conn);
+    let t0 = std::time::Instant::now();
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    println!("  [A] map 到 unmap 前几何: {} ({}ms)", abs_geom(&conn, win), t0.elapsed().as_millis());
+    conn.unmap_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    // 唤醒：map → 置顶 → ADD FULLSCREEN
+    conn.map_window(win).unwrap();
+    conn.configure_window(win, &x11rb::protocol::xproto::ConfigureWindowAux::new()
+        .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE)).unwrap();
+    send_state(&conn, root, win, b"_NET_WM_STATE_FULLSCREEN", true);
+    sample_timeline(&conn, win, 700, "A 当前时序");
+    conn.destroy_window(win).unwrap();
+    conn.flush().unwrap();
+}
+
+/// 变体 B：先写 _NET_WM_STATE 属性（含 FULLSCREEN）再 map，看 mutter 是否
+/// 一上来就按整屏安置（＝没有工作区夹持），以及会不会提前把窗口显示出来。
+#[test]
+#[ignore]
+fn probe_clamp_timeline_prestate() {
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    let win = make_invisible_overlay_probe(&conn);
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    conn.unmap_window(win).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+
+    // 停靠状态下先写属性
+    let state_atom = conn.intern_atom(false, b"_NET_WM_STATE").unwrap().reply().unwrap().atom;
+    let fs = conn.intern_atom(false, b"_NET_WM_STATE_FULLSCREEN").unwrap().reply().unwrap().atom;
+    let skip_tb = conn.intern_atom(false, b"_NET_WM_STATE_SKIP_TASKBAR").unwrap().reply().unwrap().atom;
+    let skip_pg = conn.intern_atom(false, b"_NET_WM_STATE_SKIP_PAGER").unwrap().reply().unwrap().atom;
+    conn.change_property(PropMode::REPLACE, win, state_atom,
+        x11rb::protocol::xproto::AtomEnum::ATOM, 32, 3,
+        &[fs, skip_tb, skip_pg].iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>()).unwrap();
+    conn.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    println!("  [B] 写属性后（应仍 UNMAPPED）: {} / geom={}", map_state(&conn, win), abs_geom(&conn, win));
+
+    conn.map_window(win).unwrap();
+    conn.flush().unwrap();
+    sample_timeline(&conn, win, 700, "B 预置属性");
+    conn.destroy_window(win).unwrap();
+    conn.flush().unwrap();
+}
