@@ -4547,11 +4547,12 @@ impl OverlayView {
         };
         let pin_x = self.client_origin.x + rect.origin.x;
         let pin_y = self.client_origin.y + rect.origin.y;
-        // 选区区域像素（RGBA，几百 KB）给后台线程——只克隆选区而非整帧（整帧 8MB
-        // 一次性拷贝），显著减少内存与拷贝耗时。
-        let region_pixels = clipped.pixels.clone();
+        // 后台线程真正要的是 OCR 输入（RGB）。在这里就地转一次，然后 `clipped`
+        // **整体 move** 进 payload 给结果窗左侧显示——这样选区 RGBA 不再被克隆
+        // （以前这里 `clipped.pixels.clone()` 会再多拷一份整个选区）。
         let region_w = clipped.width;
         let region_h = clipped.height;
+        let region_rgb = rgba_to_rgb(&clipped.pixels, region_w, region_h);
         let payload = PinPayload {
             frame: clipped,
             origin_x: pin_x,
@@ -4563,10 +4564,10 @@ impl OverlayView {
         let _ = ensure_started().send(OverlayCommand::OpenResultPin { payload, translate });
         std::thread::spawn(move || {
             if translate {
-                run_translate_and_update(region_pixels, region_w, region_h);
+                run_translate_and_update(region_rgb, region_w, region_h);
                 return;
             }
-            let text = run_ocr_sync(region_pixels, region_w, region_h);
+            let text = run_ocr_sync_rgb(region_rgb, region_w, region_h);
             if !text.is_empty() {
                 if let Err(e) = crate::clipboard::global().write_text(&text) {
                     tracing::error!("OCR: 结果写入剪贴板失败: {e}");
@@ -4598,12 +4599,35 @@ impl OverlayView {
     }
 }
 
+/// RGBA → RGB（丢掉 OCR 用不到的 alpha）。
+///
+/// 用定长缓冲 + 分块写，避免逐字节 `push` 的容量探测与边界检查——选区常几百 KB 到
+/// 几 MB，逐字节 push 是 3×像素数 次调用。长度不足时按行截断（0 填充），不 panic。
+fn rgba_to_rgb(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![0u8; w * h * 3];
+    if w == 0 || h == 0 {
+        return out;
+    }
+    for (src_row, dst_row) in pixels
+        .chunks_exact(w * 4)
+        .zip(out.chunks_exact_mut(w * 3))
+    {
+        for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(3)) {
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+        }
+    }
+    out
+}
+
 /// 翻译工具的后台任务：确保模型就位 → OCR → 翻译 → 回填窗口 + 复制译文。
 ///
 /// 独立成一个函数是因为 OCR 与翻译**共用同一条框选/裁剪路径**，只在"松开之后"
 /// 分岔。首次使用会先下载约 110MB 模型（进度由 `translate::progress()` 暴露），
 /// 这期间结果窗一直显示「翻译中…」。
-fn run_translate_and_update(region_pixels: Vec<u8>, region_w: u32, region_h: u32) {
+fn run_translate_and_update(region_rgb: Vec<u8>, region_w: u32, region_h: u32) {
     let dir = crate::config::translate_cache_dir();
     if !crate::translate::models_ready(&dir) {
         tracing::info!("翻译: 模型未就绪，先下载到 {}", dir.display());
@@ -4616,7 +4640,7 @@ fn run_translate_and_update(region_pixels: Vec<u8>, region_w: u32, region_h: u32
             return;
         }
     }
-    let text = run_ocr_sync(region_pixels, region_w, region_h);
+    let text = run_ocr_sync_rgb(region_rgb, region_w, region_h);
     if text.trim().is_empty() {
         tracing::info!("翻译: 未识别到文字");
         let _ = ensure_started().send(OverlayCommand::UpdateResultPin {
@@ -4642,8 +4666,12 @@ fn run_translate_and_update(region_pixels: Vec<u8>, region_w: u32, region_h: u32
     });
 }
 
-fn run_ocr_sync(
-    region_pixels: Vec<u8>,
+/// 识别一块 **RGB** 图像（`w*h*3` 字节，move 进来避免再拷一份）。
+///
+/// 调用方负责 RGBA→RGB 的转换（见 `rgba_to_rgb`）：转换挪到分叉之前做，线程拿到
+/// 的就已经是 OCR 真正需要的格式，省掉一次选区大小的额外拷贝。
+fn run_ocr_sync_rgb(
+    rgb: Vec<u8>,
     region_width: u32,
     region_height: u32,
 ) -> String {
@@ -4651,18 +4679,6 @@ fn run_ocr_sync(
     let h = region_height;
     if w == 0 || h == 0 {
         return String::new();
-    }
-
-    // 从 RGBA 区域像素转 RGB
-    let mut rgb: Vec<u8> = Vec::with_capacity((w * h * 3) as usize);
-    for row in 0..h {
-        let base = row as usize * w as usize * 4;
-        for col in 0..w {
-            let idx = base + col as usize * 4;
-            rgb.push(region_pixels[idx]);     // R
-            rgb.push(region_pixels[idx + 1]); // G
-            rgb.push(region_pixels[idx + 2]); // B
-        }
     }
 
     // 注意：不再放大。PaddleOCR 检测器内部会把输入 resize 到
@@ -4693,7 +4709,8 @@ fn run_ocr_sync(
 
     // PaddleOCR（PP-OCRv6 medium）识别：首次使用自动下载模型（约 132 MB）
     // 到缓存目录；推理在本地 ONNX Runtime 完成。
-    match crate::ocr::paddle::recognize_rgb(up.as_raw(), up.width(), up.height()) {
+    // `up` 整体 move 进识别函数（内部直接用它当推理输入），省掉一次整图拷贝
+    match crate::ocr::paddle::recognize_image(up) {
         Ok(text) => {
             tracing::info!("OCR: 识别结果 ({} bytes): {:?}", text.len(), text);
             text
@@ -10060,6 +10077,65 @@ mod tests {
     /// 光标形态映射：框选类工具给十字、马赛克给笔刷圆环、其余不干预。
     ///
     /// 这一层是纯函数，所以"鼠标长什么样"可以在没有窗口的情况下钉住。
+    /// `rgba_to_rgb` 的正确性：逐像素丢 alpha，长度不足时按行截断不 panic。
+    #[test]
+    fn rgba_to_rgb_drops_alpha_and_tolerates_short_input() {
+        let src = vec![
+            1, 2, 3, 4, // 第 0 行第 0 列
+            5, 6, 7, 8, // 第 0 行第 1 列
+            9, 10, 11, 12, // 第 1 行第 0 列
+            13, 14, 15, 16, // 第 1 行第 1 列
+        ];
+        assert_eq!(rgba_to_rgb(&src, 2, 2), vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15]);
+        // 少一行输入：那一行按 0 填充，不 panic
+        assert_eq!(rgba_to_rgb(&src[..8], 2, 2), vec![1, 2, 3, 5, 6, 7, 0, 0, 0, 0, 0, 0]);
+        // 退化尺寸
+        assert!(rgba_to_rgb(&[], 0, 5).is_empty());
+    }
+
+    /// 按需基准：`cargo test --release bench_rgba_to_rgb -- --ignored --nocapture`
+    ///
+    /// 比的是"逐字节 push"（改动前的写法）与"定长缓冲 + 分块"在真实选区尺寸下的差距。
+    #[test]
+    #[ignore]
+    fn bench_rgba_to_rgb() {
+        for (w, h) in [(600u32, 400u32), (1200, 700), (2560, 1440)] {
+            let src: Vec<u8> = (0..(w as usize * h as usize * 4))
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let t0 = std::time::Instant::now();
+            let mut old = Vec::with_capacity((w as usize * h as usize * 3) as usize);
+            for row in 0..h {
+                let base = row as usize * w as usize * 4;
+                for col in 0..w {
+                    let idx = base + col as usize * 4;
+                    old.push(src[idx]);
+                    old.push(src[idx + 1]);
+                    old.push(src[idx + 2]);
+                }
+            }
+            let d_old = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let new = rgba_to_rgb(&src, w, h);
+            let d_new = t1.elapsed();
+            assert_eq!(old, new, "两种写法结果必须逐字节一致");
+            // 顺带量一下"省掉的那次整块拷贝"值多少：改前后台线程还额外 clone 了一份
+            // 同样大小的 RGBA 选区（分配 + memcpy）。
+            let t2 = std::time::Instant::now();
+            let dup = src.clone();
+            let d_dup = t2.elapsed();
+            std::hint::black_box(&dup);
+            println!(
+                "  rgba_to_rgb {w}x{h} ({} MB 输入): 逐字节 push {:?} → 分块 {:?}  ({:.1}x)；省掉的那次选区 clone 约 {:?}",
+                (w as usize * h as usize * 4) / 1_048_576,
+                d_old,
+                d_new,
+                d_old.as_secs_f64() / d_new.as_secs_f64().max(1e-9),
+                d_dup
+            );
+        }
+    }
+
     /// 回归测试：交给 gpui 的像素必须**恰好换道一次**（gpui 图集是 BGRA）。
     ///
     /// 换 0 次或 2 次都会让遮罩里整屏 R/B 互换（红变蓝、蓝变橙）——用户报的

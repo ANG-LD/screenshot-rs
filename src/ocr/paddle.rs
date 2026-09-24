@@ -927,25 +927,42 @@ fn infer_once(
 /// 结果尽可能保留原始排版（缩进/列对齐），便于表格、代码、列表的复制：
 /// 利用每个文字块的 bounding box 坐标做行聚类、行内排序、缩进与列对齐重建。
 pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
+    // 兼容入口（测试与外部调用）：这里必须拷一份交给推理。
+    // 热路径（覆盖层 OCR/翻译）走 `recognize_image`，直接 move 已建好的图像。
     let img = oar_ocr::utils::create_rgb_image(w, h, rgb.to_vec())
         .ok_or_else(|| format!("RGB 数据长度不符: {w}x{h}"))?;
+    recognize_image(img)
+}
+
+/// 识别一张已经建好的 RGB 图像（**move** 进来，避免再拷一份整图）。
+///
+/// 推理引擎本来就需要 owned 图像，所以调用方手里那张直接交过来即可；表格网格
+/// 检测也在 move 之前用图像自己的字节完成（零拷贝）。
+pub fn recognize_image(img: image::RgbImage) -> Result<String, String> {
+    let (w, h) = (img.width(), img.height());
     let cache_dir = crate::config::ocr_cache_dir();
     let provider = crate::config::ocr_execution_provider();
+    // 网格检测只依赖输入像素，与识别结果无关，所以放在 move 之前做
+    let grid = detect_table_grid(img.as_raw(), w, h);
+    // 只有「加速 EP 失败 → CPU 重试」这条路需要第二张图；默认纯 CPU 配置下零拷贝。
+    let retry_src = if provider != "cpu" && !FORCE_CPU.load(Ordering::Relaxed) {
+        Some(img.clone())
+    } else {
+        None
+    };
     let results = match infer_once(&cache_dir, img) {
         Ok(r) => r,
         Err(first_err) => {
             // 加速 EP（DirectML/CUDA/CoreML/OpenVINO）在「建会话」或「推理」任一步
             // 真实失败（算子不支持、图优化失败等）：置 FORCE_CPU 锁死纯 CPU 并重试一次，
             // 让 OCR 在 Windows/GPU 不兼容的情况下仍可用。CPU 再失败则返回完整根因。
-            if provider != "cpu" && !FORCE_CPU.load(Ordering::Relaxed) {
+            if let Some(src) = retry_src {
                 tracing::warn!(
                     "OCR: 当前 EP（{provider}）失败（{first_err}），自动回退 CPU 重试"
                 );
                 FORCE_CPU.store(true, Ordering::Relaxed);
                 reset_engine();
-                let img2 = oar_ocr::utils::create_rgb_image(w, h, rgb.to_vec())
-                    .ok_or_else(|| format!("RGB 数据长度不符: {w}x{h}"))?;
-                infer_once(&cache_dir, img2)?
+                infer_once(&cache_dir, src)?
             } else {
                 return Err(first_err);
             }
@@ -956,7 +973,7 @@ pub fn recognize_rgb(rgb: &[u8], w: u32, h: u32) -> Result<String, String> {
         return Ok(String::new());
     }
     // 检测表格网格（水平线/竖线）：命中则输出 Markdown 表格，否则按布局输出
-    if let Some((xs, ys)) = detect_table_grid(rgb, w, h) {
+    if let Some((xs, ys)) = grid {
         if xs.len() >= 2 && ys.len() >= 2 {
             tracing::info!("OCR: 检测到表格网格 {}x{}（竖线{}条 横线{}条）", xs.len() - 1, ys.len() - 1, xs.len(), ys.len());
             return Ok(layout_as_table(&words, &xs, &ys));
