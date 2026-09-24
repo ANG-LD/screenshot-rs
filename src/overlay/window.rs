@@ -3462,6 +3462,10 @@ fn poll_top_strip_input(
     // 轮询起的框：整段拖拽都由轮询喂（见 `pointer_poll_dragging` 的注释），
     // 位置不分区域，抬手才收尾。
     if this.pointer_poll_dragging {
+        // 这一段 gpui 收不到任何指针事件（起框时壳层抓了指针），所以 `+` 与坐标徽章
+        // 也必须在这里跟着轮询值走：否则它们会停在起框那一刻钉死不动（用户报的
+        // "顶部往下拉时 + 不随鼠标移动"）。
+        update_cursor_readout(this, logical, window, cx);
         if down {
             this.selection.mouse_move(logical);
             cx.notify();
