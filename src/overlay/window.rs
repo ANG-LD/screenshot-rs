@@ -7069,7 +7069,14 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
             })),
             window_background: WindowBackgroundAppearance::Transparent,
             titlebar: None,
-            kind: WindowKind::PopUp,
+            // Linux 必须显式要客户端装饰：默认值会写 `_MOTIF_WM_HINTS` 的
+            // decorations=1（服务端标题栏）。以前窗口是 PopUp/NOTIFICATION，
+            // mutter 忽略该 hint 所以看不出问题；换成 Normal 后 mutter 真给它加
+            // 了 37px 标题栏（`_NET_FRAME_EXTENTS=0,0,37,0`），把全屏客户端挤成
+            // 1920×895，截出来的图整体错位。Client ⇒ decorations=0，无标题栏。
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(WindowDecorations::Client),
+            kind: overlay_window_kind(),
             is_movable: false,
             is_resizable: false,
             focus: false,
@@ -7114,6 +7121,32 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
             tracing::warn!("[overlay] 覆盖窗口创建失败（将退化为每次新建）：{e}");
             None
         }
+    }
+}
+
+/// 覆盖窗口的 `WindowKind`：Linux 必须用 `Normal`，其它平台保持 `PopUp`。
+///
+/// gpui 只在 `PopUp` 时给窗口打 `_NET_WM_WINDOW_TYPE_NOTIFICATION`（见
+/// gpui_linux/.../x11/window.rs 的 PopUp 分支），而 mutter 对这类窗口**不允许进全屏
+/// 状态**——本机实测其 `_NET_WM_ALLOWED_ACTIONS` 只有 CHANGE_DESKTOP/ABOVE/BELOW，
+/// 没有 FULLSCREEN，于是 `set_overlay_fullscreen` 发的请求被直接丢掉。
+///
+/// 为什么必须要全屏：GNOME 顶栏画在 gnome-shell 那个 `_NET_WM_WINDOW_TYPE_DESKTOP`
+/// 的 stage 窗口上（铺满全屏，且在普通窗口之上，见 `set_overlay_fullscreen` 的说明），
+/// 只有全屏窗口才能压过它。不进全屏的话，屏幕最上面那一条（顶栏高度）的指针事件
+/// 到不了覆盖层，用户就"框选/画矩形到不了屏幕最上边"。
+///
+/// `Normal` 不带 `_NET_WM_WINDOW_TYPE` 属性 = 普通窗口，mutter 允许 FULLSCREEN。
+/// 代价是普通窗口会进任务栏/alt-tab，所以唤醒时同时发 SKIP_TASKBAR/SKIP_PAGER。
+/// Windows/macOS 维持 `PopUp`：那边的置顶、不进任务栏语义都依赖它。
+const fn overlay_window_kind() -> WindowKind {
+    #[cfg(target_os = "linux")]
+    {
+        WindowKind::Normal
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        WindowKind::PopUp
     }
 }
 
@@ -7242,6 +7275,157 @@ fn reuse_overlay_window(
     });
 }
 
+/// 取到覆盖窗口在 X11 里的连接与窗口 id（X11 专用；非 XCB 后端返回 None）。
+#[cfg(target_os = "linux")]
+fn with_x11_window<R>(window: &Window, f: impl FnOnce(&x11rb::xcb_ffi::XCBConnection, u32) -> R) -> Option<R> {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    // 显式走 raw_window_handle 的 trait 方法：gpui 的 Window 自带一个同名
+    // `window_handle()`（返回 AnyWindowHandle），不限定就会解析到它。
+    let (Ok(wh), Ok(dh)) = (
+        HasWindowHandle::window_handle(window),
+        HasDisplayHandle::display_handle(window),
+    ) else {
+        return None;
+    };
+    let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) = (wh.as_raw(), dh.as_raw())
+    else {
+        return None;
+    };
+    let conn_ptr = xcb_dh.connection?;
+    // SAFETY: 连接来自 gpui 自己的 display handle，进程存活期间有效；
+    // 第二个参数 false = 不接管所有权（不负责关闭）
+    let conn = unsafe { XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false) }.ok()?;
+    Some(f(&conn, xcb_wh.window.into()))
+}
+
+/// 通过 EWMH `_NET_WM_STATE` 给窗口增删一个状态（ADD=1 / REMOVE=0）。
+///
+/// EWMH 规定改状态必须发 ClientMessage 给 root（直接改属性已废弃，WM 可能不认），
+/// 消息体里 data[0]=动作、data[1]=状态 atom、data[3]=1 表示"作用于本窗口属性"。
+#[cfg(target_os = "linux")]
+fn send_wm_state(window: &Window, state_name: &[u8], add: bool) -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt, EventMask, send_event};
+
+    with_x11_window(window, |conn, win| {
+        let root = conn.setup().roots[0].root;
+        let atom = |name: &[u8]| {
+            conn.intern_atom(false, name)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.atom)
+        };
+        let (Some(state_atom), Some(target)) = (atom(b"_NET_WM_STATE"), atom(state_name)) else {
+            return false;
+        };
+        let action: u32 = if add { 1 } else { 0 };
+        let event = ClientMessageEvent::new(32, win, state_atom, [action, target, 0, 1, 0]);
+        let sent = send_event(
+            conn,
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )
+        .is_ok();
+        let _ = conn.flush();
+        sent
+    })
+    .unwrap_or(false)
+}
+
+/// 让覆盖窗口压过 GNOME 顶栏：请求 WM 把窗口设成全屏；停靠时撤销。
+///
+/// 背景（用户反馈"框选不到屏幕最上边，左右下正常"）：GNOME 的顶栏画在 gnome-shell 的
+/// `_NET_WM_WINDOW_TYPE_DESKTOP` stage 窗口上（本机实测：1920×1080+0+0，类型 DESKTOP），
+/// 该窗口叠在普通窗口之上，只是它的输入区域只占顶栏那一条。于是屏幕最上面那一条里的
+/// 指针事件根本到不了覆盖层——鼠标一移进去就收不到 MouseMoveEvent，选区停在那条的下沿，
+/// 而左右下都正常。
+///
+/// mutter 只在窗口处于 `_NET_WM_STATE_FULLSCREEN` 时才允许它压过顶栏（GNOME 全屏时自动
+/// 隐藏顶栏），所以这里在 map 之后发一条 EWMH 请求。停靠（unmap）时撤销该状态：截图是在
+/// 覆盖层显示**之前**做的，那时必须是正常窗口，否则顶栏一直隐藏、拍出来的图会缺顶栏。
+#[cfg(target_os = "linux")]
+fn set_overlay_fullscreen(window: &Window, on: bool) {
+    let ok = send_wm_state(window, b"_NET_WM_STATE_FULLSCREEN", on);
+    tracing::info!(
+        "[overlay] {}覆盖窗口全屏（盖过 GNOME 顶栏）成功={ok}",
+        if on { "请求" } else { "撤销" }
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_overlay_fullscreen(_window: &Window, _on: bool) {}
+
+/// 回读覆盖窗口在 root 坐标系下的实际位置/尺寸（诊断用）。
+///
+/// WM 有可能不按我们要求的摆窗口（约束到工作区、加边框等），而这会直接表现成
+/// "某条边选不到"。把它打进日志，就不用再靠猜。
+#[cfg(target_os = "linux")]
+fn log_overlay_geometry(window: &Window) {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let info = with_x11_window(window, |conn, win| {
+        let geom = conn.get_geometry(win).ok()?.reply().ok()?;
+        let root = conn.setup().roots[0].root;
+        let abs = conn
+            .translate_coordinates(win, root, 0, 0)
+            .ok()?
+            .reply()
+            .ok()?;
+        Some((abs.dst_x, abs.dst_y, geom.width, geom.height))
+    })
+    .flatten();
+    match info {
+        Some((x, y, w, h)) => {
+            tracing::info!("[overlay] 覆盖窗口实际几何: +{x}+{y} {w}x{h}（root 坐标系）")
+        }
+        None => tracing::warn!("[overlay] 覆盖窗口几何回读失败"),
+    }
+}
+
+/// unmap 覆盖窗口，并校验它真的停靠了（必要时补发）。
+///
+/// **为什么需要校验**：mutter 处理「创建即 map」时会先跑一段 show 流程。启动时
+/// 我们的 park（unmap）正好和 gpui 第一次 present 触发的 map 撞在一起，mutter
+/// 事后把 show 跑完，窗口就**留在 mapped**——而此时它一帧都没绘制过，内容未定义
+/// ＝全黑全屏，用户看到的就是「程序启动成功后出现一个黑屏」，而且这个全屏窗口还会
+/// 吃掉整个工作区的点击。
+///
+/// 实测（`tests/x11_wm_race_probe.rs`，用 1×1 隐形窗口复刻同一时序）：
+/// - 「map → 立刻 unmap」→ 窗口仍是 VIEWABLE（竞态输）
+/// - 「map → 立刻 unmap → 隔 50ms 再 unmap」→ UNMAPPED（补发有效）
+/// - 「map → 隔 400ms 再 unmap」→ UNMAPPED（说明 mutter 的 show 早已跑完）
+/// 所以这里 unmap 后回读 Map State，仍在 mapped 就补发，间隔逐步拉长、次数有界，
+/// 正常情况下第一次检查（30ms）就已经是 UNMAPPED，不做多余请求。
+#[cfg(target_os = "linux")]
+fn unmap_overlay_and_verify(conn: &x11rb::xcb_ffi::XCBConnection, xid: u32) {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt, MapState};
+
+    let _ = conn.unmap_window(xid);
+    let _ = conn.flush();
+    let still_mapped = |conn: &x11rb::xcb_ffi::XCBConnection| {
+        conn.get_window_attributes(xid)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|a| a.map_state == MapState::VIEWABLE)
+            .unwrap_or(false)
+    };
+    for (attempt, wait_ms) in [30u64, 50, 80, 120, 160].into_iter().enumerate() {
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        if !still_mapped(conn) {
+            return;
+        }
+        let _ = conn.unmap_window(xid);
+        let _ = conn.flush();
+        tracing::warn!("[overlay] 停靠校验：窗口仍 mapped，第 {} 次补发 unmap", attempt + 1);
+    }
+}
+
 /// 停靠覆盖窗口：X11 下直接 unmap（不可见、不挡输入、X 服务器自动释放键盘
 /// 焦点），窗口与渲染器保持存活，下次截图由 `unpark_overlay_window` 唤醒。
 /// GPUI 后端对 UnmapNotify 只更新内部 is_mapped 标志、不会销毁窗口，因此
@@ -7249,8 +7433,6 @@ fn reuse_overlay_window(
 #[cfg(target_os = "linux")]
 fn park_overlay_window(window: &mut Window) {
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::ConnectionExt;
     use x11rb::xcb_ffi::XCBConnection;
 
     if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
@@ -7261,12 +7443,14 @@ fn park_overlay_window(window: &mut Window) {
                 if let Ok(conn) = unsafe {
                     XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
                 } {
-                    let _ = conn.unmap_window(xcb_wh.window.into());
-                    let _ = conn.flush();
+                    unmap_overlay_and_verify(&conn, xcb_wh.window.into());
                 }
             }
         }
     }
+    // 撤销全屏：截图发生在覆盖层显示之前，那时窗口必须是正常窗口，
+    // 否则顶栏会保持隐藏状态、拍出来的图缺顶栏。
+    set_overlay_fullscreen(window, false);
 }
 
 /// 非 X11 平台退化为 1×1 缩窗停靠（无 unmap 原语；窗口保持 1×1 时几乎不可见）。
@@ -7309,6 +7493,15 @@ fn unpark_overlay_window(window: &mut Window) {
             }
         }
     }
+    // 必须等窗口已 map 再请求全屏：WM 只处理已映射窗口的状态变更。
+    // 目的见 `set_overlay_fullscreen`——盖过 GNOME 顶栏，否则最上面那一条
+    // 收不到指针事件，用户"框选不到屏幕最上边"。
+    set_overlay_fullscreen(window, true);
+    // Linux 用的是 Normal 类型（见 `overlay_window_kind`），不设这两个状态
+    // 它会出现在任务栏和 alt-tab 里。
+    let _ = send_wm_state(window, b"_NET_WM_STATE_SKIP_TASKBAR", true);
+    let _ = send_wm_state(window, b"_NET_WM_STATE_SKIP_PAGER", true);
+    log_overlay_geometry(window);
 }
 
 /// 非 X11 平台：窗口从未 unmap，无需唤醒
@@ -9787,7 +9980,6 @@ mod tests {
         assert_eq!(super::hotkey_caps("alt++s"), vec!["Alt", "S"]);
         assert!(super::hotkey_caps("").is_empty());
     }
-    use super::*;
 
     /// 「UI 区域」必须把工具栏本体盖住——工具栏被摆到选区外时（选区小/贴屏幕边），
     /// 这是"悬停操作栏不该算选区外"的唯一依据。顺便锁住弹层展开方向：只往远离
@@ -10214,7 +10406,6 @@ mod tests {
     /// 钉死：同一笔的预览像素与提交后帧像素在笔迹范围内必须完全相同。
     ///
     /// 顺带守住第二件事：**一笔就把原文墨色抹掉**（遮挡），且块间保留色差。
-    #[test]
     /// **换色只影响新笔，不改前面已画的笔**（用户报"第一个模糊也变色了"）。
     ///
     /// 缺陷成因：已提交笔迹的显示层把所有马赛克命令**合并成一层**渲染，颜色只取最后一
