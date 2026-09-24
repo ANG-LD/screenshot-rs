@@ -443,7 +443,12 @@ pub fn relocate_to_user_dir() {
 
     // 3) 用同一参数重新 exec 用户目录副本，退出当前进程。
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match std::process::Command::new(&target_exe).args(&args).spawn() {
+    // 子进程要接管单实例锁（此刻锁还在本进程手里），所以带上标记让它等我们退出
+    match std::process::Command::new(&target_exe)
+        .args(&args)
+        .env(crate::single_instance::TAKEOVER_ENV, "1")
+        .spawn()
+    {
         Ok(_) => {
             tracing::info!("[update] 已迁移到 {}，重启子进程后退出当前进程", target_exe.display());
             std::process::exit(0);
@@ -467,7 +472,12 @@ pub fn restart_app() {
     };
 
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match std::process::Command::new(&exe).args(&args).spawn() {
+    // 同上：自更新重启时当前进程仍持有单实例锁，新进程需要等待接管
+    match std::process::Command::new(&exe)
+        .args(&args)
+        .env(crate::single_instance::TAKEOVER_ENV, "1")
+        .spawn()
+    {
         Ok(_) => {
             // 新进程已启动，结束当前（旧版本）进程。由非主线程调用也安全。
             std::process::exit(0);

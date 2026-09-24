@@ -58,6 +58,15 @@ fn main() -> AppResult<()> {
         tracing::info!("GTK 初始化完成");
     }
 
+    // 单实例：同一会话只允许一个实例。放在 GTK/迁移之后、AppState 之前——
+    // 迁移（relocate_to_user_dir）会 spawn 新进程再 exit 当前进程，它拉起的子进程带
+    // SCREENSHOT_RS_TAKEOVER=1，会等我们让出锁；在此之前抢锁反而会把迁移/自更新搞死。
+    // 抢不到说明已经有实例在跑（托盘图标、全局热键都在那边），本次启动安静退出。
+    let _single_instance = match screenshot_rs::single_instance::SingleInstance::acquire() {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
+
     let state = AppState::new()?;
     tracing::info!("服务启动完成，等待 alt+s 热键或托盘菜单事件...");
     state.run()
