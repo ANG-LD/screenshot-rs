@@ -295,10 +295,48 @@ fn user_copy_version(target: &std::path::Path) -> Option<String> {
 /// - 副本 **>= 当前** → 保留。副本可能是应用内自更新后的更新版本，不能降级。
 /// - 副本版本**未知**（连 `--version` 都不认识，或报出来的不是合法 semver）→ 覆盖。
 ///   不支持 `--version` 的必然比当前这份老；报不出合法版本号的副本也不该拦着装新包。
-fn should_replace_user_copy(current: &str, copy_version: Option<&str>) -> bool {
-    match copy_version {
-        Some(v) if semver::Version::parse(v.trim_start_matches('v')).is_ok() => is_newer(current, v),
-        _ => true,
+fn should_replace_user_copy(
+    current: &str,
+    copy_version: Option<&str>,
+    src_is_newer_file: bool,
+) -> bool {
+    let parse = |s: &str| semver::Version::parse(s.trim_start_matches('v')).ok();
+    let Some(copy) = copy_version.and_then(parse) else {
+        // 读不出副本版本（老副本不支持 --version）→ 替换
+        return true;
+    };
+    let Some(cur) = parse(current) else {
+        // 自身版本都解析不了（异常构建）→ 以替换为准，别让用户卡在老副本上
+        return true;
+    };
+    if cur > copy {
+        return true;
+    }
+    if cur < copy {
+        // 副本比当前新：可能是应用内自更新后的更新版本，不能降级覆盖
+        return false;
+    }
+    // 同版本：**看文件更新时间**。
+    //
+    // 这一条是给"版本号没变的重新构建 / 重打包"用的：开发时 `cargo build --release`
+    // 再重装 deb 很常见，而版本号常常没动，只比版本号的话用户目录副本永远不会刷新，
+    // `relocate_to_user_dir` 就会每次都 spawn 那个旧副本再退出当前进程——用户看到的
+    // 永远是上一份老二进制，连自更新检查都一直拿老版本号在比。
+    src_is_newer_file
+}
+
+/// 源文件是否比目标文件更新。取不到时间戳时返回 false（保守：维持"不替换"，
+/// 避免因为 stat 失败而反复覆盖用户目录里正在自更新的副本）。
+#[cfg(target_os = "linux")]
+fn file_is_newer(src: &std::path::Path, dst: &std::path::Path) -> bool {
+    let mtime = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    match (mtime(src), mtime(dst)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
     }
 }
 
@@ -361,12 +399,14 @@ pub fn relocate_to_user_dir() {
         let _ = std::fs::set_permissions(&target_exe, std::fs::Permissions::from_mode(0o755));
     } else {
         let copy_version = user_copy_version(&target_exe);
-        if should_replace_user_copy(CURRENT_VERSION, copy_version.as_deref()) {
+        let src_newer = file_is_newer(&exe, &target_exe);
+        if should_replace_user_copy(CURRENT_VERSION, copy_version.as_deref(), src_newer) {
             match replace_user_copy(&exe, &target_exe) {
                 Ok(()) => tracing::info!(
-                    "[update] 用户目录副本版本 {} 低于当前 {}，已替换为当前版本",
+                    "[update] 已用当前二进制({})替换用户目录副本(版本 {}，源文件更新={})",
+                    CURRENT_VERSION,
                     copy_version.as_deref().unwrap_or("未知(不支持 --version)"),
-                    CURRENT_VERSION
+                    src_newer
                 ),
                 Err(e) => tracing::warn!(
                     "[update] 替换用户目录副本 {} 失败({e})，继续用旧副本运行",
@@ -459,19 +499,55 @@ mod tests {
     use super::*;
 
     /// 用户目录副本的替换决策：旧副本要换掉（否则装新包也被粘住、永不提示更新），
-    /// 同版本/更新版本要保留（自更新产物不能降级），问不出版本的老副本当作旧的处理。
+    /// 更新版本要保留（自更新产物不能降级），问不出版本的老副本当作旧的处理。
+    /// 第三个参数是"源文件是否比副本文件更新"，只在**同版本**时才起作用。
     #[test]
     fn user_copy_replacement_decision() {
-        // 副本旧（0.1.0 副本 vs 当前 0.1.1）→ 换
-        assert!(should_replace_user_copy("0.1.1", Some("0.1.0")));
+        // 副本旧（0.1.0 副本 vs 当前 0.1.1）→ 换，与文件时间无关
+        assert!(should_replace_user_copy("0.1.1", Some("0.1.0"), false));
         // 副本不认识 --version（老版本）→ 换
-        assert!(should_replace_user_copy("0.1.1", None));
-        // 同版本 → 保留
-        assert!(!should_replace_user_copy("0.1.1", Some("0.1.1")));
-        // 副本更新（应用内自更新到 0.2.0）→ 保留，绝不降级
-        assert!(!should_replace_user_copy("0.1.1", Some("0.2.0")));
+        assert!(should_replace_user_copy("0.1.1", None, false));
+        // 副本更新（应用内自更新到 0.2.0）→ 保留，绝不降级（即使源文件时间更晚）
+        assert!(!should_replace_user_copy("0.1.1", Some("0.2.0"), true));
         // 非 semver 的副本版本串 → 当作未知 → 换（不 panic）
-        assert!(should_replace_user_copy("0.1.1", Some("garbage")));
+        assert!(should_replace_user_copy("0.1.1", Some("garbage"), false));
+
+        // **同版本**：不再无条件保留。这是"重建 + 重装同版本 deb"能生效的关键——
+        // 以前这里恒为 false，于是 `relocate_to_user_dir` 每次都 spawn 用户目录里
+        // 那份老二进制再退出当前进程，用户看到的永远不是自己刚构建的那份。
+        assert!(
+            should_replace_user_copy("0.1.1", Some("0.1.1"), true),
+            "同版本但源文件更新时必须替换，否则重新构建永远不生效"
+        );
+        assert!(
+            !should_replace_user_copy("0.1.1", Some("0.1.1"), false),
+            "同版本且源文件不更新时保持不动，避免每次启动都白拷一份"
+        );
+    }
+
+    /// 迁移判据里那个"源文件是否更新"的实测（真的用两个文件比 mtime）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_is_newer_compares_mtime() {
+        let dir = std::env::temp_dir().join(format!("screenshot-rs-mtime-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let old = dir.join("old");
+        let new = dir.join("new");
+        std::fs::write(&old, b"x").expect("写 old");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&new, b"x").expect("写 new");
+
+        assert!(file_is_newer(&new, &old), "后写的文件应当被判为更新");
+        assert!(!file_is_newer(&old, &new), "先写的文件不应被判为更新");
+        assert!(
+            !file_is_newer(&old, &dir.join("不存在")),
+            "取不到目标时间戳时应当保守返回 false"
+        );
+        assert!(
+            !file_is_newer(&dir.join("不存在"), &old),
+            "取不到源时间戳时应当保守返回 false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 能力探针扫描：含标记的文件判为支持 `--version`；标记**骑在分块边界上**也要命中
