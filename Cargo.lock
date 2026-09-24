@@ -7114,7 +7114,7 @@ dependencies = [
 
 [[package]]
 name = "screenshot-rs"
-version = "0.1.8"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arboard",
