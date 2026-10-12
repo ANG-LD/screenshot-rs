@@ -1225,28 +1225,41 @@ pub const TEXT_INPUT_PAD_Y: f32 = 2.0;
 ///
 /// 原来是写死的 10px：小字号时框里空一大截，大字号时又显得局促。改成跟字号走
 /// （约 0.35 字宽，下限 3px 保证不贴边，上限 12px 防止超大字号留白失控）。
-/// **下限不能低于** [`TEXT_BOX_MIN_PAD_X`]：编辑器要求"光标右缘 + 安全边距"不得
-/// 超出视口，而视口宽 = 文字宽 + 本值。本值一旦小于安全边距，光标移到末尾时编辑器
-/// 会把整行文字左移，**首字被裁掉一半**（实测：字号从 64 缩到 14 时复现）。
+/// **下限不能低于** [`TEXT_BOX_MIN_PAD_X`]：编辑器要求「末尾光标 + 右安全边距」不得
+/// 越过编辑器视口右边，越界就把整行文字左移、**首字被裁**。代入本仓的几何算式
+/// （框宽 = 文字宽 + 2×[`text_box_inset_x`]，编辑器视口 = 框宽 − 本值，
+/// 内容宽 = 文字宽 + [`TEXT_INPUT_PAD_X`] + 右安全边距），条件化简成
+/// `本值 > 右安全边距 − TEXT_INPUT_PAD_X`。推算过程见 [`TEXT_BOX_MIN_PAD_X`]。
 pub fn text_box_pad_x(font_size: f32) -> f32 {
     (font_size * 0.35).clamp(TEXT_BOX_MIN_PAD_X, 12.0)
 }
 
 /// 左右内边距下限（逻辑像素）。
 ///
-/// **历史**：编辑器规定「光标右缘 + `RIGHT_MARGIN` 不得越过视口右边」，越界就横向
-/// 滚动/裁字。本项目过去把 gpui-component 的 `RIGHT_MARGIN` 从 10 收到 2，好让浮层
-/// 文本框的左右内边距能很小；4px 是当时按「> 2 + 光标宽度」定下来的。
+/// 编辑器（gpui-base `src/input/base/element.rs`）要求「末尾光标 + `RIGHT_MARGIN`」不得
+/// 越过视口右边，越界就把整行左移、首字被裁。把本仓的几何算式代进去：
 ///
-/// **迁移后**：该常量的归属变成了 gpui-base（`src/input/base/element.rs`，
-/// `RIGHT_MARGIN = px(10.)`），本项目当初那个补丁**没有跟着走**。
+/// ```text
+/// 框宽       = 文字宽 + 2 × inset_x           （window.rs 的 textbox auto-grow）
+/// inset_x    = 本值 + TEXT_INPUT_PAD_X        （= 插入点距框左的总缩进）
+/// 编辑器视口 = 框宽 − 本值 = 文字宽 + 本值 + 2 × TEXT_INPUT_PAD_X
+/// 编辑器内容 = 文字宽 + TEXT_INPUT_PAD_X + RIGHT_MARGIN
+/// 滚动/裁字 ⇔ 内容 > 视口 ⇔ 本值 < RIGHT_MARGIN − TEXT_INPUT_PAD_X = 10 − 8 = 2
+/// ```
 ///
-/// 按该文件的算法推：`scroll_size` = 文字 + 右内边距 + `RIGHT_MARGIN`（element.rs:188），
-/// 而视口宽 = 文字 + 左右内边距，于是编辑器为把末尾光标留在右边框内，最多要向右滚
-/// `10 - pad` px —— 可左侧能挪出去的余量只有 `pad`。所以 `pad < 10` 时首字有被裁掉的
-/// 风险。当前 `pad = clamp(fs * 0.35, 4, 12)`：fs ≤ 28 → pad = 4.9~9.8（< 10，**怀疑区间**），
-/// fs ≥ 32 → pad = 11.2~12（安全）。**这只是从代码推出来的，待桌面实测**；
-/// 真出问题时的两条出路见 `text_box_pad_x_stays_above_min` 的注释。
+/// 本值取 4（最坏情况就是小字号被 clamp 到 4）→ 还有 2px 余量，**任何字号都不触发**。
+///
+/// **实测**（`examples/text_box_inset_probe.rs`：真窗口、光标推到末尾 `character=16`、
+/// 16 个 CJK 字符、按上面的算式定框宽）：fs=14 / 24 / 64 三档 `scroll_offset.x` 全为
+/// `0px`，首字相对缩进 13.00 / 16.00 / 20.00，对上 `inset_x` 的 12.90 / 16.40 / 20.00
+/// （差值是字形左边距）。历史那条「整行左移、首字被裁」在新库**不复现**。
+///
+/// **历史与补丁去向**：`RIGHT_MARGIN` 过去是本项目给 gpui-component 打的补丁（10 → 2），
+/// 因为那时视口宽按「文字宽 + 本值」算、要求「本值 > 安全边距」；现在框宽按 `inset_x`
+/// 对称留白，安全边距回到上游默认的 10 也不再触发滚动 —— 所以**这处补丁不必再带到新库**
+/// （`TEXT_INPUT_PAD_X` 仍是 8；新库对自定义尺寸 `Size::Size(..)` 的 `input_px()`
+/// 也仍返回 8，几何假设成立）。守卫测试见
+/// [`text_box_inset_x_covers_editor_right_margin`]。
 pub const TEXT_BOX_MIN_PAD_X: f32 = 4.0;
 
 /// 文本框上下内边距（box 自身那层），随**字号**缩放。
@@ -2319,23 +2332,7 @@ mod tests {
 
     /// **左右内边距必须大于编辑器的右安全边距**，否则光标移到末尾时整行文字被左移、
     /// 首字裁半（用户实测：字号 64 → 14 后光标移到末尾复现）。
-    ///
-    /// 编辑器逻辑（gpui-component `element.rs`）：
-    /// `cursor_pos.x + RIGHT_MARGIN > 视口宽` → `scroll_offset.x` 变负 → 文字左移；
-    /// 而视口宽 = 文字宽 + `text_box_pad_x`，光标在末尾时 cursor_pos.x = 文字宽，
-    /// 于是条件退化成 `text_box_pad_x < RIGHT_MARGIN`。本项目把 RIGHT_MARGIN 收到 2，
-    /// 这里用 4（= TEXT_BOX_MIN_PAD_X）连光标宽度一起兜住。
-    /// 只保证不低于 [`TEXT_BOX_MIN_PAD_X`]。
-    ///
-    /// 原来这里还断言「内边距 > 编辑器右安全边距」，那个 2px 是本项目给
-    /// gpui-component 打的补丁值；迁移到 gpui-kit 后该常量属于 gpui-base 且回到上游
-    /// 默认的 **10px**，补丁没有跟着走（见 [`TEXT_BOX_MIN_PAD_X`] 的说明），断言已无法
-    /// 成立，故删除、保留说明。
-    ///
-    /// **待桌面验证**：小字号（14~28px，此时 pad = 4.9~9.8 < 10）下把光标停在长文本
-    /// 末尾，看文本框会不会横向滚动 / 首字被裁。若会，两条路：
-    ///   1. 调大本文件的 `TEXT_BOX_MIN_PAD_X`（代价：文本框变宽，不再是紧贴文字的窄框）；
-    ///   2. 像 tooltip 那样 vendored gpui-base，把 10 重新收到 2（代价：fork 编辑器核心）。
+    /// 只保证不低于 [`TEXT_BOX_MIN_PAD_X`]（真正的防裁字条件见下一个测试）。
     #[test]
     fn text_box_pad_x_stays_above_min() {
         for &fs in crate::overlay::toolbar::FONT_SIZES {
@@ -2349,6 +2346,26 @@ mod tests {
         assert!(text_box_pad_x(14.0) < text_box_pad_x(24.0));
         assert!(text_box_pad_x(24.0) < text_box_pad_x(30.0));
         assert_eq!(text_box_pad_x(64.0), 12.0, "上限封顶");
+    }
+
+    /// 防「光标到末尾时整行左移、首字被裁」的真正条件。
+    ///
+    /// 历史教训：这个条件**不能**只看 box 那层内边距（`text_box_pad_x`），必须算上 Input
+    /// 自带的 [`TEXT_INPUT_PAD_X`] —— 框宽 = 文字宽 + 2×inset_x，而编辑器视口比框宽小的
+    /// 那部分正是 box 那层内边距。化简后等价于 `text_box_inset_x(fs) > RIGHT_MARGIN`，
+    /// `RIGHT_MARGIN` 是 gpui-base `input/base/element.rs` 里编辑器留出的右安全边距
+    /// （上游默认 `px(10.)`，本项目过去的 10→2 补丁已不必要，见 [`TEXT_BOX_MIN_PAD_X`]）。
+    #[test]
+    fn text_box_inset_x_covers_editor_right_margin() {
+        /// gpui-base 编辑器元素的光标右安全边距。
+        const EDITOR_RIGHT_MARGIN: f32 = 10.0;
+        for &fs in crate::overlay::toolbar::FONT_SIZES {
+            let inset = text_box_inset_x(fs);
+            assert!(
+                inset > EDITOR_RIGHT_MARGIN,
+                "fs={fs}: 插入点总缩进 {inset} 必须大于编辑器右安全边距 {EDITOR_RIGHT_MARGIN}，否则光标到末尾时整行左移裁字"
+            );
+        }
     }
 
     /// 文本框内边距：随字号缩放、比旧实现小，且**成图路径真的加进去了**。
