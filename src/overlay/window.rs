@@ -1161,7 +1161,7 @@ impl OverlayView {
 
         // PopUp 窗口（override_redirect）在 X11 上可能不会被 WM 分配键盘焦点，
         // 手动调用 activate_window() 确保 X 服务器把键盘事件送到本窗口。
-        window.activate_window();
+        activate_and_focus(window);
 
         // 订阅编辑器事件：
         //   PressEnter → 提交（push Text 命令）
@@ -6509,6 +6509,53 @@ impl Render for PinWindowView {
     }
 }
 
+/// 激活窗口并把 X 的键盘输入焦点真正交给它。
+///
+/// 覆盖窗口是 `WindowKind::PopUp` ⇒ X11 上是 **override-redirect** 窗口：窗口管理器
+/// 不管理它、也永远不会给它键盘焦点；而 `Window::activate_window()` 走的是 WM 的
+/// `_NET_ACTIVE_WINDOW` 客户端消息（或 `XSetInputFocus` 之外的路径），对
+/// override-redirect 窗口无效。
+///
+/// 后果：键盘事件全部送到"别的窗口"。X11 里鼠标按坐标投递、键盘按焦点投递，所以
+/// 框选/工具栏点击一直正常，而 Esc 取消、Ctrl+Z、方向键、Enter、文字工具的 IME
+/// 全部失效 —— 用户可见表现就是「Esc 键没法取消」。
+///
+/// 这里显式 `XSetInputFocus`（不复用 `activate_window()`）：与 `_NET_WM_STATE_ABOVE`
+/// 一样属于"这批窗口本来就不受 WM 管理，只能自己来"的同一类处理，不引入任何 grab。
+#[cfg(target_os = "linux")]
+fn focus_overlay_window(window: &mut Window) {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt, InputFocus};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    if let (Ok(wh), Ok(dh)) = (window.window_handle(), window.display_handle()) {
+        if let (RawWindowHandle::Xcb(xcb_wh), RawDisplayHandle::Xcb(xcb_dh)) =
+            (wh.as_raw(), dh.as_raw())
+        {
+            if let Some(conn_ptr) = xcb_dh.connection {
+                let conn_result = unsafe {
+                    XCBConnection::from_raw_xcb_connection(conn_ptr.as_ptr().cast(), false)
+                };
+                if let Ok(conn) = conn_result {
+                    let win = x11rb::protocol::xproto::Window::from(xcb_wh.window.get());
+                    let _ = conn.set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME);
+                    let _ = conn.flush();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn focus_overlay_window(_window: &mut Window) {}
+
+/// 显示/复用覆盖窗口时统一的"抢焦点"入口：先让 gpui 激活窗口，再把 X 键盘焦点交给它。
+fn activate_and_focus(window: &mut Window) {
+    window.activate_window();
+    focus_overlay_window(window);
+}
+
 /// 通过 EWMH _NET_WM_STATE_ABOVE 切换窗口置顶状态
 #[cfg(target_os = "linux")]
 fn send_wm_state_above(window: &mut Window, add: bool) {
@@ -7138,7 +7185,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                             // 始终只有一个 OCR 模型窗口：已存在则聚焦到前台，不重复开
                             let alive = if let Some(h) = &ocr_models {
                                 h.update(async_cx, |_, window, _| {
-                                    window.activate_window();
+                                    activate_and_focus(window);
                                     true
                                 })
                                 .unwrap_or(false)
@@ -7156,7 +7203,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                             // 系统设置窗口同样只留一个：已存在就聚焦，不重复开
                             let alive = if let Some(h) = &settings_window {
                                 h.update(async_cx, |_, window, _| {
-                                    window.activate_window();
+                                    activate_and_focus(window);
                                     true
                                 })
                                 .unwrap_or(false)
@@ -7174,7 +7221,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                             // 始终只有一个更新提示窗：已存在则聚焦到前台，不重复开
                             let alive = if let Some(h) = &update_prompt {
                                 h.update(async_cx, |_, window, _| {
-                                    window.activate_window();
+                                    activate_and_focus(window);
                                     true
                                 })
                                 .unwrap_or(false)
@@ -7524,7 +7571,7 @@ fn reuse_overlay_window(
         // 4) 聚焦 + 激活（raise）
         let fh = view.read(cx).focus_handle.clone();
         fh.focus(window, cx);
-        window.activate_window();
+        activate_and_focus(window);
         let t_activate = std::time::Instant::now();
         tracing::info!(
             "[overlay] reuse 分段: downcast+start_session={:.0}ms unpark={:.0}ms focus+activate={:.0}ms",
