@@ -52,3 +52,20 @@ cargo run --example text_box_inset_probe -- 64
 # 对应的守卫测试
 cargo test --lib text_box_inset_x_covers_editor_right_margin
 ```
+
+## 本项目补丁 2：`set_root_bordered` —— 恢复旧版 `Root::bordered(false)`
+
+**问题**：0.7.3 把旧版 `Root::new(..).bordered(false)` 这个 builder 换成了 `RootPlugin`
+（`WindowState`）里**无条件**的 `window_border()`。而 gpui 的 `WindowDecorations` 只有
+`Server`（mutter 会给 37px 服务端标题栏、全屏客户端被挤扁）和 `Client`（CSD 阴影把内容
+四边内缩约 20px）两种，没有「无装饰」；`Window::set_client_inset(px(0.))` 也会被平台按
+`Client` 重新设回，实测无效。
+
+**表现**：alt+s 后遮罩里画面被四边内缩约 16~20px（用户报的「黑色画布 + 不是全屏」的
+后一半；前一半是 `paint_image` 的 `image_bounds` 填空 —— 见 commit `ee98c55`）。
+
+**补丁**：`src/root.rs` 加了 `pub fn set_root_bordered(bool)`（全局原子标志）+ `decorate()`
+里的分支；应用在建窗前的 `gpui::component::init(cx)` 之后调用
+`set_root_bordered(false)`。语义与 main 上 5 处 `.bordered(false)` 一致。
+
+**升级时**：重新取上游源码后需重打本处与补丁 1（`hide_tooltip`）。

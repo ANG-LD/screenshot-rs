@@ -435,6 +435,26 @@ impl WindowState {
     }
 }
 
+/// [本项目补丁] 是否给窗口套 CSD 阴影/边框（`window_border()`）。
+///
+/// 旧版 gpui-component 有 `Root::new(..).bordered(false)`，本项目 main 上共 5 处
+/// Root 全部用它（应用每个窗口都是「画布窗」：全屏遮罩、进度条、Pin 图等）。
+/// 升级到 0.7.3 后该 builder 被换成 `RootPlugin` 里**无条件**的 `window_border()`，
+/// 而 `WindowDecorations` 只有 Server（mutter 加 37px 服务端标题栏）和 Client
+/// （CSD 阴影把内容四边内缩约 20px）两种，没有「无装饰」选项，`set_client_inset(0)`
+/// 也会被平台按 Client 重新设回。于是这里把那一层做成可关，等价恢复 `bordered(false)`。
+static ROOT_BORDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// [本项目补丁] 关闭/开启所有窗口的 CSD 阴影边框，等价旧版 `Root::bordered(false)`。
+/// 需在创建窗口前调用（`WindowState` 插件每帧读取该标志）。
+pub fn set_root_bordered(bordered: bool) {
+    ROOT_BORDERED.store(bordered, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn root_bordered() -> bool {
+    ROOT_BORDERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl gpui_base::RootPlugin for WindowState {
     fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.set_rem_size(cx.theme().font_size);
@@ -458,7 +478,11 @@ impl gpui_base::RootPlugin for WindowState {
         _window: &mut Window,
         _cx: &mut App,
     ) -> impl IntoElement {
-        window_border().child(surface)
+        if root_bordered() {
+            window_border().child(surface).into_any_element()
+        } else {
+            surface
+        }
     }
 }
 

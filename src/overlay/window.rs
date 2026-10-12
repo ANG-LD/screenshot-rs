@@ -7035,6 +7035,13 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
         .run(move |cx: &mut App| {
             // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
             gpui::component::init(cx);
+            // 等价 main 上 5 处 `Root::new(..).bordered(false)`：本应用每个窗口都是
+            // 「画布窗」，不要 gpui-component 的 CSD 阴影/边框。0.7.3 把该 builder 换成
+            // 了 RootPlugin 里无条件的 `window_border()`，且 `WindowDecorations` 没有
+            // 「无装饰」选项（Server = mutter 加 37px 标题栏；Client = CSD 阴影把内容
+            // 四边内缩约 20px，正是"黑画布 + 不是全屏"的另一半原因），所以由
+            // third_party/gpui-component 的这个补丁开关来关。
+            gpui::component::root::set_root_bordered(false);
 
             // 全局切到**深色主题**：截图工具栏、二级弹层、Pin 标题栏、滚动进度窗、
             // OCR 面板都是深色玻璃风格，组件默认的浅色主题会让它们内部弹出的
