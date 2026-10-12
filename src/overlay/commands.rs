@@ -2290,14 +2290,16 @@ mod tests {
                 buffer.set_text("文字蚊子", &attrs, Shaping::Advanced, None);
                 buffer.set_size(None, None);
                 buffer.shape_until_scroll(font_system, false);
-                for run in buffer.layout_runs() {
+                // 只取首行。原写法是 `for run in ... { ...; break; }`，语义相同但会触发
+                // clippy 的 deny(never_loop)，导致 `cargo clippy --all-targets` 直接编译失败。
+                // 这是既有问题（a0f360ff，2026-08-19 的诊断测试），与本仓库 gpui 依赖迁移无关。
+                if let Some(run) = buffer.layout_runs().next() {
                     let first = run.glyphs.iter().next().unwrap();
                     let phys = first.physical((0.0, run.line_y), 1.0);
                     println!(
                         "DEBUG_COSMIC lh={:.1} line_y={:.1} baseline_phys.y={:.1}",
                         lh, run.line_y, phys.y
                     );
-                    break;
                 }
             });
         }

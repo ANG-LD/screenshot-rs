@@ -4332,17 +4332,17 @@ fn rasterize_shapes(
 
 /// 把已光栅化的形状层画到窗口
 fn paint_raster(window: &mut Window, image: &Arc<RenderImage>, bounds: ub::Bounds) {
-    let _ = window.paint_image(
-        Bounds {
-            origin: gpui::point(gpui::px(bounds.origin.x), gpui::px(bounds.origin.y)),
-            size: Size::new(gpui::px(bounds.size.x), gpui::px(bounds.size.y)),
-        },
-        Default::default(),
-        Default::default(), // 新增参数：图像圆角 corner_radii
-        image.clone(),
-        0,
-        false,
-    );
+    // gpui-kit(gpui-pre 0.3.9) 的 paint_image 有**两个** Bounds：
+    //   paint_image(bounds /*裁剪/可见区*/, image_bounds /*图像摆放区*/, corner_radii, ...)
+    // 只传一个、把 image_bounds 落成 Default::default()（空矩形）**不会编译报错**，但函数
+    // 开头的 `bounds.intersect(&image_bounds)` 宽高为 0 会直接 `return Ok(())` —— 图像被
+    // 静默跳过。用户可见表现就是本次报的 bug：alt+s 后遮罩里是黑画布，帧图像与形状层
+    // 全都画不出来（旧库只有一个 rect 参数，语义等于现在的 image_bounds，故两处传同一矩形）。
+    let rect = Bounds {
+        origin: gpui::point(gpui::px(bounds.origin.x), gpui::px(bounds.origin.y)),
+        size: Size::new(gpui::px(bounds.size.x), gpui::px(bounds.size.y)),
+    };
+    let _ = window.paint_image(rect, rect, Default::default(), image.clone(), 0, false);
 }
 
 /// 把一个 DrawCommand 渲染到 window 上（Phase 3 preview，Phase 4 也会复用）
@@ -4980,13 +4980,16 @@ impl Render for OverlayView {
                 let win_bounds = window.bounds();
 
                 // 1) 把捕获帧作为全屏背景（始终从 (0,0) 开始，确保 canvas 坐标与 frame_pixels 对齐）
+                // 两个 Bounds 都要传：把 image_bounds 省略成空矩形会让图像被静默跳过，
+                // 遮罩里只剩黑底（见 paint_raster 上的完整说明）。
+                let frame_rect = Bounds {
+                    origin: point(px(0.), px(0.)),
+                    size: win_bounds.size,
+                };
                 let _ = window.paint_image(
-                    Bounds {
-                        origin: point(px(0.), px(0.)),
-                        size: win_bounds.size,
-                    },
+                    frame_rect,
+                    frame_rect,
                     Default::default(),
-                    Default::default(), // 新增参数：图像圆角 corner_radii
                     frame_image.clone(),
                     0,
                     false,
@@ -6301,7 +6304,7 @@ impl Render for PinWindowView {
                     ),
                     size: Size::new(fit_w, fit_h),
                 };
-                let _ = window.paint_image(fit, Default::default(), Default::default(), image.clone(), 0, false);
+                let _ = window.paint_image(fit, fit, Default::default(), image.clone(), 0, false);
             },
         );
 
@@ -9831,7 +9834,7 @@ impl Render for OcrPinView {
                     ),
                     size: Size::new(px(draw_w), px(draw_h)),
                 };
-                let _ = window.paint_image(target, Default::default(), Default::default(), img.clone(), 0, false);
+                let _ = window.paint_image(target, target, Default::default(), img.clone(), 0, false);
             },
         )
         .size_full();
