@@ -9,7 +9,7 @@
 //!
 //! [`AppAssets`] 把它们**编译期内嵌**进二进制（`include_bytes!`，无文件系统
 //! 依赖、发行包不需要额外资源），并按前缀 `app-icons/` 暴露；其余路径原样
-//! 回退给 [`gpui_component_assets::Assets`]。这样两种图标可以混用：
+//! 回退给 [`gpui::assets::Assets`]。这样两种图标可以混用：
 //!
 //! ```ignore
 //! Icon::new(IconName::Check)                 // 组件内置：完成
@@ -128,7 +128,7 @@ impl AssetSource for AppAssets {
         if let Some(bytes) = load_app_icon(path) {
             return Ok(Some(bytes));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -137,7 +137,7 @@ impl AssetSource for AppAssets {
             .filter(|p| p.starts_with(path))
             .map(SharedString::from)
             .collect();
-        out.extend(gpui_component_assets::Assets.list(path)?);
+        out.extend(gpui::assets::Assets.list(path)?);
         Ok(out)
     }
 }

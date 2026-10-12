@@ -25,16 +25,16 @@ use gpui::{
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowKind,
     TitlebarOptions, WindowOptions, canvas, div, point, prelude::*, px, quad, rgba,
 };
-use gpui_component::button::Button;
-use gpui_component::button::{ButtonVariant, ButtonVariants};
-use gpui_component::ActiveTheme;
-use gpui_component::Disableable;
-use gpui_component::IconName;
-use gpui_component::Sizable;
-use gpui_component::Icon;
-use gpui_component::popover::Popover;
-use gpui_component::scroll::ScrollableElement;
-use gpui_platform::application;
+use gpui::component::button::Button;
+use gpui::component::button::{ButtonVariant, ButtonVariants};
+use gpui::component::ActiveTheme;
+use gpui::component::Disableable;
+use gpui::component::IconName;
+use gpui::component::Sizable;
+use gpui::component::Icon;
+use gpui::component::popover::Popover;
+use gpui::component::scroll::ScrollableElement;
+use gpui::platform::application;
 use image::{Frame, ImageBuffer, Rgba};
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
@@ -194,11 +194,11 @@ pub struct OverlayView {
     /// Text 是"点击→弹输入→输入文字→Enter 提交"。
     /// 因此用独立 state 跟踪文字编辑会话，不复用 `in_progress`。
     ///
-    /// 用 gpui_component::input::InputState 而不是手撸 String 拼接：
-    /// InputState 自带 IME 合成支持，能正确处理中文输入法（拼音/五笔等）
+    /// 用 gpui::component::input::TextareaState 而不是手撸 String 拼接：
+    /// 编辑器自带 IME 合成支持，能正确处理中文输入法（拼音/五笔等）
     /// 的组合过程——手撸 on_key_down 只能捕获单个按键事件，IME 合成期间
     /// 的事件（Process、compositionstart 等）全部丢失。
-    text_input: Option<Entity<gpui_component::input::InputState>>,
+    text_input: Option<Entity<gpui::component::input::TextareaState>>,
 
     /// Text 工具：文字锚点（逻辑像素）—— Text 命令的 anchor
     text_input_anchor: BoundsPoint,
@@ -1065,9 +1065,9 @@ impl OverlayView {
     ///
     /// 与 Rectangle/Arrow/Freehand 的"按下→拖动→松开"不同，Text 是
     /// "点击→弹输入→输入→Enter 提交"。所以这里不写 `in_progress`，
-    /// 而是把 InputState 实体存在 `self.text_input` 里。
+    /// 而是把 TextareaState 实体存在 `self.text_input` 里。
     ///
-    /// InputState 自带 IME 支持，能正确处理中文输入法（拼音/五笔等）
+    /// TextareaState 自带 IME 支持，能正确处理中文输入法（拼音/五笔等）
     /// 的组合过程——手撸 on_key_down 只能捕获单个按键事件，IME 合成期间
     /// 的事件（Process、compositionstart 等）全部丢失。
     fn open_text_input(
@@ -1099,7 +1099,7 @@ impl OverlayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use gpui_component::input::{InputEvent, InputState};
+        use gpui::component::input::{InputEvent, TextareaState};
         self.text_input_finalized = false;
         self.text_input_cmd_idx = None;
         self.text_measure = None;
@@ -1133,15 +1133,14 @@ impl OverlayView {
         );
 
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            // gpui-kit 里 `auto_grow` 只实现在 TextareaMode 上：多行、可按行数自动
+            // 增高，正是这块浮层文本框需要的（旧库用 InputState + 本项目补丁提供）。
+            // 旧的 `.editor_scrollbar(false)` 在新库中没有对应 API（滚动条由新编辑器
+            // 自己管理），先去掉，行为由桌面实测确认。
+            TextareaState::new(window, cx)
                 .placeholder("")
                 .auto_grow(1, 8)
                 .soft_wrap(false)
-                // 关掉编辑器自带滚动条：框体随文字自动扩宽，但 soft_wrap(false)
-                // 下编辑器只要有**任何**方向的滚动（换行/光标移动/IME 合成）就会
-                // 闪出**横向**滚动条（gpui-component 里 !soft_wrap 时固定用横向条），
-                // 在这么小的浮层框里纯属干扰。光标跟随滚动本身不受影响。
-                .editor_scrollbar(false)
         });
         // 预填旧内容（重新编辑场景）：直接移交所有权，避免 clone。
         // 先重新借用 window，使 move 闭包只捕获该借用而非整个 &mut Window，
@@ -1161,12 +1160,12 @@ impl OverlayView {
         // 手动调用 activate_window() 确保 X 服务器把键盘事件送到本窗口。
         window.activate_window();
 
-        // 订阅 InputState 事件：
+        // 订阅编辑器事件：
         //   PressEnter → 提交（push Text 命令）
         //   Blur       → 用户点击外部也提交（避免半截文字丢失）
         //   Change     → 通知重绘（输入框内容变化→重渲染）
         cx.subscribe_in(&input, window, |this, state, event, _window, cx| match event {
-            // submit_on_enter=false → Enter/Shift+Enter 都用于换行（InputState
+            // submit_on_enter=false → Enter/Shift+Enter 都用于换行（编辑器
             // 内部已插入 \n）。PressEnter 不触发 finalize，让用户继续编辑；
             // 完成输入靠 Blur：点输入框外 / 点 Finish / 点其他工具都会 Blur。
             InputEvent::PressEnter { .. } => {
@@ -1223,7 +1222,7 @@ impl OverlayView {
 
     fn finalize_text_input_impl(
         &mut self,
-        state: &gpui::Entity<gpui_component::input::InputState>,
+        state: &gpui::Entity<gpui::component::input::TextareaState>,
         cx: &mut Context<Self>,
     ) {
         let value = state.read(cx).value();
@@ -1796,7 +1795,7 @@ impl BtnSize {
 
 /// 自绘按钮（工具栏 / 弹层 / 浮窗通用）
 ///
-/// **为什么不用 `gpui_component::Button`**：它的 Custom 变体内部把背景色按
+/// **为什么不用 `gpui::component::Button`**：它的 Custom 变体内部把背景色按
 /// `color.mix_oklab(transparent, 0.2)` 处理，实测落到屏幕上只剩约 17% 不透明度
 /// ——绿色主操作按钮（0x2BB673）渲染出来是 (30,60,53) 的暗绿，蓝色激活态同样
 /// 发灰（截图逐像素核对过）。而且该变体**忽略** `foreground`，图标/文字颜色还得
@@ -1904,7 +1903,7 @@ struct ToolbarTrigger {
     selected: bool,
 }
 
-impl gpui_component::Selectable for ToolbarTrigger {
+impl gpui::component::Selectable for ToolbarTrigger {
     fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
@@ -4336,6 +4335,7 @@ fn paint_raster(window: &mut Window, image: &Arc<RenderImage>, bounds: ub::Bound
             size: Size::new(gpui::px(bounds.size.x), gpui::px(bounds.size.y)),
         },
         Default::default(),
+        Default::default(), // 新增参数：图像圆角 corner_radii
         image.clone(),
         0,
         false,
@@ -4983,6 +4983,7 @@ impl Render for OverlayView {
                         size: win_bounds.size,
                     },
                     Default::default(),
+                    Default::default(), // 新增参数：图像圆角 corner_radii
                     frame_image.clone(),
                     0,
                     false,
@@ -5434,11 +5435,11 @@ impl Render for OverlayView {
                                 .relative()
                                 .flex_1()
                                 .child(
-                                    gpui_component::input::Input::new(input)
+                                    gpui::component::input::Textarea::new(input)
                                         .appearance(false)
                                         .bordered(false)
                                         .text_color(gpui::rgba(rgba_u32(self.toolbar.current_color)))
-                                        .with_size(gpui_component::Size::Size(gpui::px(
+                                        .with_size(gpui::component::Size::Size(gpui::px(
                                             self.toolbar.current_size / 0.875 / self.scale_factor,
                                         )))
                                         .font_weight(match self.toolbar.current_weight {
@@ -5490,11 +5491,11 @@ impl Render for OverlayView {
                                 .relative()
                                 .flex_1()
                                 .child(
-                                    gpui_component::input::Input::new(input)
+                                    gpui::component::input::Textarea::new(input)
                                         .appearance(false)
                                         .bordered(false)
                                         .text_color(gpui::rgba(rgba_u32(self.toolbar.current_color)))
-                                        .with_size(gpui_component::Size::Size(gpui::px(
+                                        .with_size(gpui::component::Size::Size(gpui::px(
                                             self.toolbar.current_size / 0.875 / self.scale_factor,
                                         )))
                                         .font_weight(match self.toolbar.current_weight {
@@ -6297,7 +6298,7 @@ impl Render for PinWindowView {
                     ),
                     size: Size::new(fit_w, fit_h),
                 };
-                let _ = window.paint_image(fit, Default::default(), image.clone(), 0, false);
+                let _ = window.paint_image(fit, Default::default(), Default::default(), image.clone(), 0, false);
             },
         );
 
@@ -7027,17 +7028,17 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx: &mut App| {
             // gpui-component 必须在第一个窗口前初始化，否则全局主题/状态会 panic
-            gpui_component::init(cx);
+            gpui::component::init(cx);
 
             // 全局切到**深色主题**：截图工具栏、二级弹层、Pin 标题栏、滚动进度窗、
             // OCR 面板都是深色玻璃风格，组件默认的浅色主题会让它们内部弹出的
             // 组件（tooltip / Button 变体 / 滚动条 / 文本选区）白得发亮、风格割裂。
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
 
             // 文字输入的**光标颜色**：深色主题给的是近白色（#fafafa），而覆盖窗口底下
             // 往往是一张浅色截图（白底网页/文档），白光标叠在白底上几乎看不见 ——
             // 用户反馈的"输入光标不清晰"。改成工具栏强调蓝，浅底深底都够醒目。
-            gpui_component::Theme::global_mut(cx).caret =
+            gpui::component::Theme::global_mut(cx).caret =
                 gpui::rgba(theme::tokens::ACCENT).into();
 
             // 把内置 Noto Sans CJK SC Regular/Bold 注册进 GPUI text system，
@@ -7059,13 +7060,13 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                 let mut overlay: Option<OverlayWindowSlot> = async_cx.update(open_parked_overlay);
 
                 let mut progress: Option<WindowHandle<ProgressView>> = None;
-                let mut ocr_pin: Option<WindowHandle<gpui_component::Root>> = None;
+                let mut ocr_pin: Option<WindowHandle<gpui::component::Root>> = None;
                 // 翻译结果窗（与 OCR 结果窗互不干扰，各自只保留一个）
-                let mut trans_pin: Option<WindowHandle<gpui_component::Root>> = None;
-                let mut ocr_models: Option<WindowHandle<gpui_component::Root>> = None;
+                let mut trans_pin: Option<WindowHandle<gpui::component::Root>> = None;
+                let mut ocr_models: Option<WindowHandle<gpui::component::Root>> = None;
                 // 系统设置窗口（同一时刻只保留一个）
-                let mut settings_window: Option<WindowHandle<gpui_component::Root>> = None;
-                let mut update_prompt: Option<WindowHandle<gpui_component::Root>> = None;
+                let mut settings_window: Option<WindowHandle<gpui::component::Root>> = None;
+                let mut update_prompt: Option<WindowHandle<gpui::component::Root>> = None;
                 // UI 视觉调试：SCREENSHOT_RS_UI_PROBE=pin|progress|ocr|update 时，
                 // 应用一起来就把对应的独立窗口摆出来，方便用截图脚本核对样式
                 // （正常使用不带该环境变量，这里是空操作）。
@@ -7228,7 +7229,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
                                                 view.text = Some(text);
                                                 // 重建 TextViewState（markdown 解析），支持选中/复制/全选
                                                 view.text_state = Some(cx.new(|cx| {
-                                                    gpui_component::text::TextViewState::markdown(&md, cx)
+                                                    gpui::component::text::TextViewState::markdown(&md, cx)
                                                 }));
                                             }
                                             cx.notify();
@@ -7273,7 +7274,7 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
 
 /// 常驻覆盖窗口的句柄 + 上次会话的目标窗口尺寸（用于检测显示尺寸变化）
 struct OverlayWindowSlot {
-    window: WindowHandle<gpui_component::Root>,
+    window: WindowHandle<gpui::component::Root>,
     /// 上次会话的目标窗口尺寸（逻辑像素）
     target: (f32, f32),
 }
@@ -7346,7 +7347,7 @@ fn open_parked_overlay(cx: &mut App) -> Option<OverlayWindowSlot> {
                     cx,
                 )
             });
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+            cx.new(|cx| gpui::component::Root::new(view, window, cx))
         },
     );
     match result {
@@ -7408,7 +7409,7 @@ fn overlay_target_size(cx: &App, screen_bounds: &ub::Bounds) -> (f32, f32) {
 /// 整段耗时远低于重新建窗（~570ms 的 pipeline 编译没了）。
 #[allow(clippy::too_many_arguments)]
 fn reuse_overlay_window(
-    overlay_window: &WindowHandle<gpui_component::Root>,
+    overlay_window: &WindowHandle<gpui::component::Root>,
     frame: CapturedFrame,
     screen_bounds: ub::Bounds,
     reply: Sender<OverlayResult>,
@@ -7472,7 +7473,10 @@ fn reuse_overlay_window(
         // 注意：不能经 Root::tooltip_overlay 清除——本闭包内 root 实体正被
         // update 借用，再读会 panic；Root::hide_tooltip 内部直接更新
         // TooltipOverlay 实体，不触碰 root 自身。
-        root.hide_tooltip(window, cx);
+        // TODO(gpui-kit 迁移): 新库把 Root::tooltip_overlay 收成 pub(crate)，没有公开的
+        // 清理入口。这一句是"窗口复用时清掉跨会话残留 tooltip"的修复（见上方注释），
+        // 迁移期先停用，随后通过对 vendored gpui-component 打同样的补丁补回。
+        // root.hide_tooltip(window, cx);
         // 2) 放大到全屏：非 X11 平台 park 时缩成了 1×1，需要在这里恢复。
         //
         //    X11 下不需要 resize：park 只 unmap，`PopUp`/NOTIFICATION 类型不受工作区
@@ -7760,7 +7764,7 @@ fn unpark_overlay_window(_window: &mut Window) {}
 /// 多个值可用 `,` 组合。正常使用不带该变量，函数体不执行任何逻辑。
 fn probe_aux_windows(
     progress: &mut Option<WindowHandle<ProgressView>>,
-    update_prompt: &mut Option<WindowHandle<gpui_component::Root>>,
+    update_prompt: &mut Option<WindowHandle<gpui::component::Root>>,
     cx: &mut AsyncApp,
 ) {
     let Ok(spec) = std::env::var("SCREENSHOT_RS_UI_PROBE") else {
@@ -8295,7 +8299,7 @@ impl Render for UpdatePromptView {
 fn open_update_prompt_in_app(
     new_version: String,
     cx: &mut App,
-) -> AppResult<WindowHandle<gpui_component::Root>> {
+) -> AppResult<WindowHandle<gpui::component::Root>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -8345,7 +8349,7 @@ fn open_update_prompt_in_app(
             .detach();
             // 包 Root：与 OCR 模型窗一致——提供主题化、不透明的窗口背景，
             // 否则下层窗口颜色会穿透到更新提示窗，观感很差。
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+            cx.new(|cx| gpui::component::Root::new(view, window, cx))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开更新提示窗失败: {e}")))
@@ -8722,7 +8726,7 @@ impl Render for OcrModelsView {
                                 Button::new(format!("dl-file-{file_rows_tier}-{name_for_btn}"))
                                     .label(file_label)
                                     .with_variant(file_variant)
-                                    .with_size(gpui_component::Size::XSmall)
+                                    .with_size(gpui::component::Size::XSmall)
                                     .disabled(file_busy)
                                     .on_click({
                                         let weak = file_rows_weak.clone();
@@ -8809,13 +8813,13 @@ impl Render for OcrModelsView {
                                 Button::new(format!("active-{tier}"))
                                     .label("✓ 已激活")
                                     .with_variant(ButtonVariant::Ghost)
-                                    .with_size(gpui_component::Size::XSmall)
+                                    .with_size(gpui::component::Size::XSmall)
                                     .disabled(true)
                             } else {
                                 Button::new(format!("active-{tier}"))
                                     .label("激活")
                                     .with_variant(ButtonVariant::Success)
-                                    .with_size(gpui_component::Size::XSmall)
+                                    .with_size(gpui::component::Size::XSmall)
                                     .on_click({
                                     let weak = self.weak.clone();
                                     let tier = tier.clone();
@@ -8862,7 +8866,7 @@ impl Render for OcrModelsView {
                                 } else {
                                     ButtonVariant::Info
                                 })
-                                .with_size(gpui_component::Size::XSmall)
+                                .with_size(gpui::component::Size::XSmall)
                                 .disabled(busy)
                                 .on_click({
                                     let weak = self.weak.clone();
@@ -9026,7 +9030,7 @@ impl Render for OcrModelsView {
                             } else {
                                 ButtonVariant::Info
                             })
-                            .with_size(gpui_component::Size::XSmall)
+                            .with_size(gpui::component::Size::XSmall)
                             .disabled(t_downloading)
                             .on_click({
                                 let weak = self.weak.clone();
@@ -9279,7 +9283,7 @@ pub struct SettingsView {
     /// 自身弱引用：按钮回调（只拿 &mut App）用它更新视图并触发重绘
     weak: WeakEntity<Self>,
     /// 热键输入框（InputState 自带 IME 支持）
-    hotkey_input: Entity<gpui_component::input::InputState>,
+    hotkey_input: Entity<gpui::component::input::InputState>,
     /// 上次保存热键的结果：Ok=提示语，Err=失败原因
     hotkey_status: Option<Result<String, String>>,
 }
@@ -9288,7 +9292,7 @@ impl SettingsView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let current = crate::config::hotkey_screenshot();
         let hotkey_input = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
+            gpui::component::input::InputState::new(window, cx)
                 .placeholder(crate::config::DEFAULT_HOTKEY_SCREENSHOT)
                 .default_value(current)
         });
@@ -9411,7 +9415,7 @@ impl Render for SettingsView {
                             ),
                     )
                     .child(
-                        gpui_component::input::Input::new(&self.hotkey_input).w_full(),
+                        gpui::component::input::Input::new(&self.hotkey_input).w_full(),
                     )
                     // 写哪个文件、以及"改了到底算不算数"，都在这里说清楚：
                     // 少了这行，用户遇到"改了没生效"只能猜（环境变量优先级更高时就是这样）。
@@ -9444,7 +9448,7 @@ impl Render for SettingsView {
                                 Button::new("save-hotkey")
                                     .label("保存并生效")
                                     .with_variant(ButtonVariant::Info)
-                                    .with_size(gpui_component::Size::Small)
+                                    .with_size(gpui::component::Size::Small)
                                     .on_click({
                                         let weak = self.weak.clone();
                                         move |_, _, app| {
@@ -9456,7 +9460,7 @@ impl Render for SettingsView {
                             .child(
                                 Button::new("reset-hotkey")
                                     .label("恢复默认")
-                                    .with_size(gpui_component::Size::Small)
+                                    .with_size(gpui::component::Size::Small)
                                     .on_click({
                                         let weak = self.weak.clone();
                                         move |_, window, app| {
@@ -9495,7 +9499,7 @@ impl Render for SettingsView {
                                         "检查更新"
                                     })
                                     .with_variant(ButtonVariant::Info)
-                                    .with_size(gpui_component::Size::Small)
+                                    .with_size(gpui::component::Size::Small)
                                     .disabled(crate::update::is_checking())
                                     .on_click({
                                         let weak = self.weak.clone();
@@ -9545,7 +9549,7 @@ impl Render for SettingsView {
                                         Button::new("go-update")
                                             .label("更新")
                                             .with_variant(ButtonVariant::Info)
-                                            .with_size(gpui_component::Size::XSmall)
+                                            .with_size(gpui::component::Size::XSmall)
                                             .on_click(move |_, _, _| {
                                                 let _ = ensure_started().send(
                                                     OverlayCommand::PromptUpdate {
@@ -9568,7 +9572,7 @@ impl Render for SettingsView {
 }
 
 /// 在常驻应用里打开系统设置窗口（屏幕居中，fire-and-forget）。
-fn open_settings_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
+fn open_settings_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui::component::Root>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -9620,14 +9624,14 @@ fn open_settings_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component::
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
             // 包 Root：与其他辅助窗口一致（输入/选择控制器依赖 Root）
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+            cx.new(|cx| gpui::component::Root::new(view, window, cx))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开系统设置窗口失败: {e}")))
 }
 
 /// 在常驻应用里打开 OCR 模型管理窗口（屏幕居中，fire-and-forget）。
-fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component::Root>> {
+fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui::component::Root>> {
     let display_bounds = cx.primary_display().map(|d| d.bounds()).unwrap_or_else(|| {
         Bounds {
             origin: point(px(0.0), px(0.0)),
@@ -9679,7 +9683,7 @@ fn open_ocr_models_in_app(cx: &mut App) -> AppResult<WindowHandle<gpui_component
             let handle = view.read(cx).focus_handle.clone();
             handle.focus(window, cx);
             // 包 Root：与 OcrPinView 一致（TextView 选择控制器依赖 Root）
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+            cx.new(|cx| gpui::component::Root::new(view, window, cx))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开 OCR 模型窗口失败: {e}")))
@@ -9703,7 +9707,7 @@ struct OcrPinView {
     /// None=识别中;Some(text)=显示文字
     text: Option<String>,
     /// 文字视图状态：支持鼠标拖选 + Ctrl+C 复制 + Ctrl+A 全选
-    text_state: Option<Entity<gpui_component::text::TextViewState>>,
+    text_state: Option<Entity<gpui::component::text::TextViewState>>,
 }
 
 impl OcrPinView {
@@ -9777,16 +9781,16 @@ impl Render for OcrPinView {
                     .bg(gpui::rgba(0x000000FF))
                     .text_color(gpui::rgba(0xFFFFFFFF))
                     .py(px(2.0));
-                let tv_style = gpui_component::text::TextViewStyle {
+                let tv_style = gpui::component::text::TextViewStyle {
                     code_block: code_style,
                     ..Default::default()
                 };
                 let text_view = if let Some(state) = &self.text_state {
                     // 有状态句柄：支持拖选/Ctrl+C/Ctrl+A
-                    gpui_component::text::TextView::new(state).style(tv_style).selectable(true)
+                    gpui::component::text::TextView::new(state).style(tv_style).selectable(true)
                 } else {
                     let md = format!("```text\n{}\n```", text);
-                    gpui_component::text::TextView::markdown("ocr-pin-text", md)
+                    gpui::component::text::TextView::markdown("ocr-pin-text", md)
                         .style(tv_style)
                         .selectable(true)
                 };
@@ -9823,7 +9827,7 @@ impl Render for OcrPinView {
                     ),
                     size: Size::new(px(draw_w), px(draw_h)),
                 };
-                let _ = window.paint_image(target, Default::default(), img.clone(), 0, false);
+                let _ = window.paint_image(target, Default::default(), Default::default(), img.clone(), 0, false);
             },
         )
         .size_full();
@@ -9889,7 +9893,7 @@ fn open_result_pin_in_app(
     payload: PinPayload,
     translate: bool,
     cx: &mut App,
-) -> AppResult<WindowHandle<gpui_component::Root>> {
+) -> AppResult<WindowHandle<gpui::component::Root>> {
     let PinPayload { frame, sx, sy, .. } = payload;
     let img_w = frame.width as f32 / sx;
     let img_h = frame.height as f32 / sy;
@@ -9947,7 +9951,7 @@ fn open_result_pin_in_app(
             // 包 gpui-component Root：TextView 的鼠标选择控制器依赖 Root 的
             // selection scope（window.on_mouse_event + Root::update），
             // 不包 Root 则右侧文字无法拖选。
-            cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+            cx.new(|cx| gpui::component::Root::new(view, window, cx))
         },
     )
     .map_err(|e| AppError::Gpui(format!("打开 OCR 识别窗口失败: {e}")))

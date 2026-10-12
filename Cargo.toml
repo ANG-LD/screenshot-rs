@@ -21,12 +21,10 @@ ocr-openvino = ["oar-ocr/openvino"]
 
 [dependencies]
 # GPUI（Zed 团队，固定 commit 以保证可复现构建）
-gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "951e3de" }
-# 默认资源（图标 / 字体），与 gpui-component 同 rev 以避免 links 冲突
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "951e3de" }
+# GPUI 与组件库统一由 gpui-kit 提供（内部 = gpui-pre 0.3.9 / zed@93d7456 + gpui-component 0.7.x）。
+# 把它在 Cargo 里命名为 `gpui`：本仓既有的 `gpui::...` 路径继续有效（gpui-kit 的
+# `pub use ::gpui::*` + `pub use crate as gpui` 正是为此设计），组件走 `gpui::component::...`。
+gpui = { package = "gpui-kit", version = "0.7.3" }
 
 # 屏幕捕获（跨平台 crate）
 screenshots = "0.6"
@@ -138,9 +136,8 @@ embed-resource = "3"
 # gpui-component 的本地修补版：把 Root::tooltip_overlay 与 TooltipOverlay::hide
 # 从 pub(crate) 改为 pub，供项目在窗口复用会话开始时清除跨会话残留的 tooltip
 # 浮层（third_party/gpui-component 是 951e3de 的最小副本，仅 ui/macros/assets 三个 crate）。
-[patch."https://github.com/longbridge/gpui-component"]
-gpui-component = { path = "third_party/gpui-component/crates/ui" }
-gpui-component-assets = { path = "third_party/gpui-component/crates/assets" }
+# [patch."https://github.com/longbridge/gpui-component"]  ← 迁移期停用：vendored 的
+# gpui-component@951e3de 与 gpui-kit 用的 0.7.x 不是同一代，patch 会把旧代码强塞进去。
 
 [profile.dev]
 opt-level = 1            # 轻量优化，平衡编译速度和文件大小

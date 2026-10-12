@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::input::{Input, InputState};
-use gpui_component::Sizable;
-use gpui_platform::application;
+use gpui::component::input::{Textarea, TextareaState};
+use gpui::component::Sizable;
+use gpui::platform::application;
 use screenshot_rs::overlay::drawing::FontWeight;
 use screenshot_rs::overlay::font::TEXT_FONT_FAMILY;
 
@@ -18,7 +18,7 @@ use screenshot_rs::overlay::font::TEXT_FONT_FAMILY;
 static MEASURE_TASK: Mutex<Option<Task<()>>> = Mutex::new(None);
 
 struct BoxMeasure {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
 }
 
 impl Render for BoxMeasure {
@@ -36,11 +36,11 @@ impl Render for BoxMeasure {
                 .child(div().w_full().h(px(6.0)))
                 .child(
                     div().relative().flex_1().child(
-                        Input::new(&self.input)
+                        Textarea::new(&self.input)
                             .appearance(false)
                             .bordered(false)
                             .text_color(gpui::rgba(0x000000FF))
-                            .with_size(gpui_component::Size::Size(px(24.0 / 0.875)))
+                            .with_size(gpui::component::Size::Size(px(24.0 / 0.875)))
                             .font_weight(match FontWeight::Normal {
                                 FontWeight::Bold => gpui::FontWeight::BOLD,
                                 FontWeight::Normal => gpui::FontWeight::NORMAL,
@@ -55,10 +55,10 @@ impl Render for BoxMeasure {
 
 fn main() {
     application()
-        .with_assets(gpui_component_assets::Assets)
+        .with_assets(gpui::assets::Assets)
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx: &mut App| {
-            gpui_component::init(cx);
+            gpui::component::init(cx);
             let _ = cx.text_system().add_fonts(vec![
                 std::borrow::Cow::Owned(FontWeight::Normal.font_bytes().to_vec()),
                 std::borrow::Cow::Owned(FontWeight::Bold.font_bytes().to_vec()),
@@ -85,7 +85,7 @@ fn main() {
                     },
                     move |window, cx| {
                         let input = cx.new(|cx| {
-                            InputState::new(window, cx)
+                            TextareaState::new(window, cx)
                                 .placeholder("")
                                 .auto_grow(1, 8)
                                 .soft_wrap(false)
@@ -96,9 +96,9 @@ fn main() {
                                 state.set_value(SharedString::from("文字蚊子"), window, cx);
                             });
                         }
-                        let view = cx.new(|cx| BoxMeasure { input });
+                        let view = cx.new(|_cx| BoxMeasure { input });
                         handle.lock().unwrap().replace(view.clone());
-                        cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+                        cx.new(|cx| gpui::component::Root::new(view, window, cx))
                     },
                 )
                 .unwrap();

@@ -12,10 +12,10 @@ use gpui::{
     ParentElement, QuitMode, Render, RenderImage, Size, Window, WindowBackgroundAppearance,
     WindowBounds, WindowDecorations, WindowKind, WindowOptions,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::Sizable;
-use gpui_component::Size as ComponentSize;
-use gpui_platform::application;
+use gpui::component::input::{InputEvent, Textarea, TextareaState};
+use gpui::component::Sizable;
+use gpui::component::Size as ComponentSize;
+use gpui::platform::application;
 use screenshot_rs::capture::CapturedFrame;
 use screenshot_rs::overlay::commands::rasterize_text;
 use screenshot_rs::overlay::drawing::{FontWeight, RGBA};
@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 struct RotatableTextDemo {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     rotation: f32,
     font_size: f32,
     slider_dragging: bool,
@@ -33,7 +33,7 @@ fn main() {
     application()
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx: &mut App| {
-            gpui_component::init(cx);
+            gpui::component::init(cx);
 
             cx.open_window(
                 WindowOptions {
@@ -55,7 +55,7 @@ fn main() {
                 },
                 move |window, cx| {
                     let input = cx.new(|cx| {
-                        InputState::new(window, cx)
+                        TextareaState::new(window, cx)
                             .placeholder("输入文字...")
                             .auto_grow(3, 8)
                     });
@@ -73,14 +73,14 @@ fn main() {
                     let view_id = view.entity_id();
                     cx.subscribe(
                         &input,
-                        move |_entity: Entity<InputState>, _event: &InputEvent, cx: &mut App| {
+                        move |_entity: Entity<TextareaState>, _event: &InputEvent, cx: &mut App| {
                             cx.notify(view_id);
                         },
                     )
                     .detach();
 
                     window.activate_window();
-                    cx.new(|cx| gpui_component::Root::new(view, window, cx).bordered(false))
+                    cx.new(|cx| gpui::component::Root::new(view, window, cx))
                 },
             )
             .unwrap();
@@ -324,7 +324,7 @@ impl Render for RotatableTextDemo {
                                     .p(px(12.0))
                                     .min_h(px(80.0))
                                     .child(
-                                        Input::new(&input_entity)
+                                        Textarea::new(&input_entity)
                                             .appearance(false)
                                             .with_size(ComponentSize::Large)
                                             .text_color(rgba(0xCDD6F4FF)),
@@ -387,6 +387,7 @@ impl Render for RotatableTextDemo {
                                                                     px(h as f32),
                                                                 ),
                                                             },
+                                                            Default::default(),
                                                             Default::default(),
                                                             img,
                                                             0,
