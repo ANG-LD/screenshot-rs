@@ -135,9 +135,12 @@ embed-resource = "3"
 
 # gpui-component 的本地修补版：把 Root::tooltip_overlay 与 TooltipOverlay::hide
 # 从 pub(crate) 改为 pub，供项目在窗口复用会话开始时清除跨会话残留的 tooltip
-# 浮层（third_party/gpui-component 是 951e3de 的最小副本，仅 ui/macros/assets 三个 crate）。
-# [patch."https://github.com/longbridge/gpui-component"]  ← 迁移期停用：vendored 的
-# gpui-component@951e3de 与 gpui-kit 用的 0.7.x 不是同一代，patch 会把旧代码强塞进去。
+# 组件库（gpui-kit 的 component 特性）走 vendored 的 gpui-component，见文件末尾 [patch.crates-io]。
+[patch.crates-io]
+# 本项目对 gpui-component 0.7.3 的补丁只改可见性：把「清除当前窗口 tooltip 浮层」
+# 暴露成公开函数（上游是 pub(crate)，覆盖窗口复用时会残留上一个会话的浮层）。
+# 源码副本见 third_party/gpui-component；补丁处均有 `[本项目补丁]` 注释。
+gpui-component = { path = "third_party/gpui-component" }
 
 [profile.dev]
 opt-level = 1            # 轻量优化，平衡编译速度和文件大小

@@ -7473,10 +7473,11 @@ fn reuse_overlay_window(
         // 注意：不能经 Root::tooltip_overlay 清除——本闭包内 root 实体正被
         // update 借用，再读会 panic；Root::hide_tooltip 内部直接更新
         // TooltipOverlay 实体，不触碰 root 自身。
-        // TODO(gpui-kit 迁移): 新库把 Root::tooltip_overlay 收成 pub(crate)，没有公开的
-        // 清理入口。这一句是"窗口复用时清掉跨会话残留 tooltip"的修复（见上方注释），
-        // 迁移期先停用，随后通过对 vendored gpui-component 打同样的补丁补回。
-        // root.hide_tooltip(window, cx);
+        // gpui-kit 上游把这套浮层收成 pub(crate)、没有公开入口，为此本项目对
+        // vendored 的 gpui-component 打了最小可见性补丁（third_party/gpui-component）。
+        // 传 root 而不是 window：本闭包正处于 root 的 update 中，任何
+        // `window.root::<Root>()` 重读都会 panic。
+        gpui::component::root::hide_tooltip(root, cx);
         // 2) 放大到全屏：非 X11 平台 park 时缩成了 1×1，需要在这里恢复。
         //
         //    X11 下不需要 resize：park 只 unmap，`PopUp`/NOTIFICATION 类型不受工作区
