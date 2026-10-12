@@ -20,6 +20,13 @@
 
 升级该 crate 时：重新取上游源码、重打上面两处，再按下表复核失效情况。
 
+**与旧补丁的等价性**：旧补丁（`951e3de` 的 `crates/ui/src/root.rs`）补丁体是
+`self.tooltip_overlay.update(cx, |o, cx| o.hide(cx))`；本目录的包装调的是同一个实体的
+同一个方法，唯一区别是实体来源 —— 应用侧拿不到 `WindowState` 的私有字段，只能经
+`Root::plugin::<WindowState>()` 取。而 `TooltipOverlay::hide`（gpui-base `tooltip.rs`）
+第一件事就是 `self.content = None`（连带清 bounds / show_task / hide_task），
+即**必然清掉跨会话残留的浮层内容**。
+
 ## 迁移前 6 处本地补丁的去向
 
 迁移前的 vendored 副本是 `951e3de`（monorepo 布局，`crates/ui` 等），带 6 处本地补丁。
@@ -28,7 +35,7 @@
 | 旧补丁 | 现状 |
 | --- | --- |
 | `input/element.rs`：`RIGHT_MARGIN` 10 → 2 | **不需要带**。该常量现属 gpui-base（`src/input/base/element.rs`），值回到上游默认 `px(10.)`；本仓框宽已改成「文字宽 + 2×`inset_x`」（`inset_x = text_box_pad_x + Input 自带 8`），代入应用算式后滚动条件化简为 `pad_x < 2`，而 `pad_x ≥ 4`。实测（`examples/text_box_inset_probe.rs`，光标推到末尾）fs=14/24/64 的 `scroll_offset.x` 全为 `0px` |
-| `input/state.rs`：新增 `editor_scrollbar` 字段（默认开、可关） | **无法带**。新库把滚动条做进编辑器元素自身（gpui-base `EditorScrollbar`），没有公开开关。当初动机是浮层小框里闪**横向**滚动条，而横向已不溢出（同上实测）；只有超过 `auto_grow(1, 8)` 的 8 行时可能冒**纵向**条，待桌面确认 |
+| `input/state.rs`：新增 `editor_scrollbar` 字段（默认开、可关） | **无法带，但已确认不构成实际回归**。新库把滚动条做进编辑器元素自身（gpui-base `EditorScrollbar`），没有公开开关；`soft_wrap(false)` 下用的是双向 `Scrollbar`。不过 gpui-base 自己的语义是「无溢出就没有可交互轨道」（其测试 `no_overflow_has_no_interactive_track`），而本仓框宽永远贴住文字（横向实测 `scroll_offset.x = 0`）⇒ **横向条不会出现**（正是当年那个抱怨点）；纵向条只在超过 `auto_grow(1, 8)` 的 8 行、且正在滚动时出现、2 秒后淡出（`ScrollbarMode::Scrolling`），属标准行为 |
 | `popover.rs`：受控关闭时恢复焦点、`set_open` | **无对应调用点**。本仓没有直接调用 `set_open`（新库也没有该方法），弹层开关由 keyed state 管理。弹层关闭后的焦点行为列入桌面验证 |
 | `resizable/mod.rs`：总量非有限/≤0 时的防 NaN | **无需求**。本仓完全不使用 `Resizable`（0 处引用） |
 | `root.rs`：`clear_tooltip` | 本仓从未调用（0 处引用） |

@@ -1135,8 +1135,11 @@ impl OverlayView {
         let input = cx.new(|cx| {
             // gpui-kit 里 `auto_grow` 只实现在 TextareaMode 上：多行、可按行数自动
             // 增高，正是这块浮层文本框需要的（旧库用 InputState + 本项目补丁提供）。
-            // 旧的 `.editor_scrollbar(false)` 在新库中没有对应 API（滚动条由新编辑器
-            // 自己管理），先去掉，行为由桌面实测确认。
+            // 旧的 `.editor_scrollbar(false)`（本项目补丁 API）在新库没有对应开关：
+            // 滚动条由编辑器元素自己管（soft_wrap(false) ⇒ 双向 Scrollbar）。已核实不影响：
+            // 无溢出就没有可交互轨道（gpui-base 的 no_overflow_has_no_interactive_track），
+            // 而框宽永远贴住文字（实测 scroll_offset.x = 0）⇒ 横向条不出现；纵向条仅在
+            // 超过 auto_grow(1, 8) 的 8 行且正在滚动时短暂出现。详见 third_party/README.md。
             TextareaState::new(window, cx)
                 .placeholder("")
                 .auto_grow(1, 8)
