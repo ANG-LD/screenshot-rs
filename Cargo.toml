@@ -137,6 +137,17 @@ embed-resource = "3"
 # 从 pub(crate) 改为 pub，供项目在窗口复用会话开始时清除跨会话残留的 tooltip
 # 组件库（gpui-kit 的 component 特性）走 vendored 的 gpui-component，见文件末尾 [patch.crates-io]。
 [patch.crates-io]
+# 把 xim 那套 crate 钉回 git rev 16f35a2c（= 0.1.4 原先用的那份）。
+# 原因：gpui-pre 0.7.3 从 crates.io 拉的是 xim-ctext 0.3.0 的**旧实现** —— 它的
+# decode! 宏在输出缓冲满时不推进输入游标，且 compound_text_to_utf8 不按 ESC 分块
+# 处理字符集切换；中文输入法提交候选（按空格选词）送来的 COMPOUND_TEXT 于是一律
+# 解成 Err(UnsupportedEncoding)，而 zed-xim 里是
+#     xim_ctext::compound_text_to_utf8(&commited).expect("Encoding Error")
+# ⇒ 直接 panic，覆盖窗口（截图框）随之消失。用户报的「文字输入时按空格截图框没了」
+# 就是这个。git rev 16f35a2c 已修（分块 + 推进游标），实测 0.1.4 打字/空格均正常。
+zed-xim = { git = "https://github.com/zed-industries/xim-rs.git", rev = "16f35a2c881b815a2b6cdfd6687988e84f8447d8" }
+xim-ctext = { git = "https://github.com/zed-industries/xim-rs.git", rev = "16f35a2c881b815a2b6cdfd6687988e84f8447d8" }
+xim-parser = { git = "https://github.com/zed-industries/xim-rs.git", rev = "16f35a2c881b815a2b6cdfd6687988e84f8447d8" }
 # 本项目对 gpui-component 0.7.3 的补丁只改可见性：把「清除当前窗口 tooltip 浮层」
 # 暴露成公开函数（上游是 pub(crate)，覆盖窗口复用时会残留上一个会话的浮层）。
 # 源码副本见 third_party/gpui-component；补丁处均有 `[本项目补丁]` 注释。
