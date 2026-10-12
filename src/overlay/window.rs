@@ -7101,6 +7101,39 @@ fn run_overlay_app(rx: Receiver<OverlayCommand>) {
             gpui::component::Theme::global_mut(cx).caret =
                 gpui::rgba(theme::tokens::ACCENT).into();
 
+            // 关掉输入框自带的**编辑器滚动条**：等价旧库那处 `.editor_scrollbar(false)`
+            // 本项目补丁（迁移时判断"无实际影响"，实际上会闪出横向条）。
+            //
+            // gpui-base 的编辑器滚动条只有 Scrolling / Hover / Always 三档，没有"永不
+            // 显示"；默认 Scrolling —— 光标移动、或输入法预编辑串（拼音串比定型文字长
+            // 得多）一让视口滚动，文本框内就淡入一条**横向**滚动条。截图工具的文本框
+            // 只有一行高、宽度贴住文字（越过选区右边界还会被 clamp 住），这条横杠很
+            // 扎眼：用户反馈「文字功能输入后为啥会有左右滚动条，视觉不好」。
+            //
+            // 官方那处补丁是直接在 gpui-component 里加开关；新库把滚动条搬进了
+            // gpui-base（`input/base/element.rs` 的 EditorScrollbar），组件层不再有对应
+            // builder。这里改用基础主题的两个档位，等效达成"看不见"：
+            //   - `Hover`：不再"滚动就淡入"，只有鼠标主动移到条上/拖动时才显示（保留
+            //     可抓取性）；
+            //   - `idle = 0`：**这一条是关键** —— 可见性判据里还有
+            //     `last_scroll_time + idle > now`，即"最近滚动过就显示"。打字时光标
+            //     推进会让编辑器视口滚动、不断刷新该时间戳，所以只改 mode 无效（实测
+            //     条子照样出现）。idle 归零后，打字/输入法组合过程完全不显示。
+            {
+                let theme = gpui::base::Theme::global_mut(cx);
+                let scrollbar = theme
+                    .scrollbar
+                    .clone()
+                    .with_mode(gpui::base::ScrollbarMode::Hover)
+                    .with_motion(
+                        gpui::base::ScrollbarMotion::default()
+                            .with_idle(std::time::Duration::ZERO),
+                    );
+                theme.scrollbar = scrollbar;
+                let mode = gpui::base::Theme::global(cx).scrollbar.mode();
+                tracing::info!("[overlay] 编辑器滚动条 mode={mode:?} idle=0（仅悬停/拖动显示）");
+            }
+
             // 把内置 Noto Sans CJK SC Regular/Bold 注册进 GPUI text system，
             // 这样预览文字用 family="Noto Sans CJK SC" + weight=BOLD 时能命中
             // Bold face（与提交栅格化一致），而不是退化成系统字体/普通字重。
