@@ -171,4 +171,33 @@ mod tests {
         assert!(all.iter().any(|p| p.starts_with(APP_ICON_PREFIX)));
         assert!(all.iter().any(|p| p.starts_with("icons/")));
     }
+
+    /// 应用真正用到的**组件图标**都能从运行期资源里取到。
+    ///
+    /// 迁移到 gpui-kit 后这些图标来自 gpui-kit-assets（经 `gpui::assets::Assets` 兜底）。
+    /// 上面 `falls_back_to_component_icons` 只硬编码了 `icons/check.svg` 一条；这里按
+    /// `IconName::path()` 逐个取，能同时挡住「枚举改名 / kebab 命名对不上 / SVG 没打进包」——
+    /// 图标缺失只会静默画成空白，编译期发现不了。
+    #[test]
+    fn every_component_icon_used_by_app_is_loadable() {
+        use gpui::component::{IconName, IconNamed as _};
+        let names = [
+            IconName::ArrowLeft,
+            IconName::Check,
+            IconName::CircleCheck,
+            IconName::Close,
+            IconName::LoaderCircle,
+            IconName::Redo2,
+            IconName::TriangleAlert,
+            IconName::Undo2,
+        ];
+        for name in names {
+            let path = name.path();
+            let bytes = AppAssets
+                .load(&path)
+                .unwrap_or_else(|e| panic!("加载组件图标 {path} 出错: {e}"))
+                .unwrap_or_else(|| panic!("组件图标缺失: {path}"));
+            assert!(!bytes.is_empty(), "组件图标 {path} 字节为空");
+        }
+    }
 }
