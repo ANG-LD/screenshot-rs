@@ -4928,9 +4928,17 @@ impl Render for OverlayView {
                     let old_w = self.text_input_rect.size.x;
                     let old_h = self.text_input_rect.size.y;
                     self.text_input_rect.size = BoundsPoint::new(new_w, new_h);
-                    // 高度随行数增长后裁剪回截图框（selection）内，防止文字画出截图区域
-                    let limits = self.selection.current().unwrap_or(self.screen_bounds);
-                    self.text_input_rect = self.text_input_rect.clamp_inside(limits);
+                    // 宽度**跟文字长度自适应**：只受屏幕约束，不再裁回截图框（selection）。
+                    //
+                    // 用选区当边界会把框压窄（`clamp_inside` 一旦触边就**先缩 size**），
+                    // 文字一长内容就溢出视口 —— gpui-base 的编辑器随即画出一条横向滚动条
+                    // （`scroll_area_size > container_size` 才会画，否则整条隐藏）。用户要求：
+                    // 输入/预览都不许出现底部滚动条，且文字框要跟着文字长。
+                    //
+                    // 改用 `clamp_keeping_size`：先把框整体挪回屏幕内（左/上），实在放不下
+                    // （比整屏还宽/高）才收缩 —— 只有那种极端情况才会重新出现滚动条。
+                    self.text_input_rect =
+                        self.text_input_rect.clamp_keeping_size(self.screen_bounds);
                     if (old_w - new_w).abs() > 0.01 || (old_h - new_h).abs() > 0.01 {
                         tracing::info!(
                             "textbox auto-grow: value={:?} fs={:.1} sf={:.1} th_px={:.1} adv_px={:.1} box=({:.1},{:.1})->({:.1},{:.1})",
