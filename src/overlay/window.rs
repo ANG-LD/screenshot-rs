@@ -1135,15 +1135,17 @@ impl OverlayView {
         let input = cx.new(|cx| {
             // gpui-kit 里 `auto_grow` 只实现在 TextareaMode 上：多行、可按行数自动
             // 增高，正是这块浮层文本框需要的（旧库用 InputState + 本项目补丁提供）。
-            // 旧的 `.editor_scrollbar(false)`（本项目补丁 API）在新库没有对应开关：
-            // 滚动条由编辑器元素自己管（soft_wrap(false) ⇒ 双向 Scrollbar）。已核实不影响：
-            // 无溢出就没有可交互轨道（gpui-base 的 no_overflow_has_no_interactive_track），
-            // 而框宽永远贴住文字（实测 scroll_offset.x = 0）⇒ 横向条不出现；纵向条仅在
-            // 超过 auto_grow(1, 8) 的 8 行且正在滚动时短暂出现。详见 third_party/README.md。
+            //
+            // `.soft_wrap(true)`：文字在框内**自动换行**，与成图路径一致 ——
+            // `rasterize_text` 用 `Buffer::set_size(Some(max_width))` 折行，而编辑态过去是
+            // `soft_wrap(false)`（不折行，只在框底闪一条横向滚动条）⇒ 用户看到"编辑时一条
+            // 滚动条、成图却折了行"，而且框越出截图区。开折行后框宽只需封顶在截图区边界，
+            // 放不下的文字换行、框按行数向下长高（见 render 开头的 auto-grow 测量）。
+            // 宽度够时行为与过去完全一致。
             TextareaState::new(window, cx)
                 .placeholder("")
                 .auto_grow(1, 8)
-                .soft_wrap(false)
+                .soft_wrap(true)
         });
         // 预填旧内容（重新编辑场景）：直接移交所有权，避免 clone。
         // 先重新借用 window，使 move 闭包只捕获该借用而非整个 &mut Window，
@@ -4893,56 +4895,78 @@ impl Render for OverlayView {
                             (adv_px, th_px)
                         }
                     };
-                    // 盒子宽度：左右对称留白（文本插入点距框左 = 距框右 = TEXT_BOX_INSET）。
-                    // 同时它显著宽于单字内容（输入视口 ≈ adv + 10），避免编辑器左滚、
-                    // 出现横向滚动条。
-                    // 注意：不能再用大 MIN_W 撑宽。文字/字符少时 adv+2×inset < MIN_W，
-                    // 若框强撑到 MIN_W，文字贴左、右侧空出大段背景 → 左右内边距不一致。
-                    // 改为「框宽 = 文字宽 + 2×inset」，文字在框内左右居中。
+                    // 框宽：贴住文字（文字宽 + 2×对称留白），但**上限是截图区右边界** ——
+                    // 框永远不越出截图区（用户明确要求）。放不下的文字交给编辑器**自动换行**
+                    // （`soft_wrap(true)`，与成图 `rasterize_text` 的 `set_size(max_w)` 折行同一
+                    // 套），框再按折行行数向下长高 ⇒ 不越出截图区、视口不溢出（不溢出就不画
+                    // 滚动条，见 gpui-base scrollbar.rs 的 `scroll_area_size <= container_size`
+                    // 直接 continue），而且编辑态分行 == 最终图片分行。
                     const MIN_W: f32 = 100.0;
+                    /// 行数上限兜底，与 `TextareaState::auto_grow(1, 8)` 保持一致
+                    const MAX_TEXT_ROWS: usize = 8;
                     // 高度下限只兜底（正常由 行数×行盒 + 上下内边距 决定），
                     // 原来 40 对小字号偏空
                     let fs_logical = text_fs_logical(fs, sf);
                     let inset_x = crate::overlay::commands::text_box_inset_x(fs_logical);
                     let inset_y = crate::overlay::commands::text_box_inset_y(fs_logical);
                     let min_h = fs_logical + inset_y * 2.0;
-                    let new_w = if adv_px > 0.0 {
+                    // 截图区（无选区时退回整屏，与历史行为一致）+ 右侧可用宽度
+                    let sel = self.selection.current().unwrap_or(self.screen_bounds);
+                    let right_limit = sel.origin.x + sel.size.x;
+                    // 点击点太靠右时把 origin 左移，保证至少有 MIN_W 可写，
+                    // 否则文字会一字一行地竖着排。
+                    if right_limit - self.text_input_rect.origin.x < MIN_W {
+                        self.text_input_rect.origin.x =
+                            (right_limit - MIN_W).max(sel.origin.x);
+                    }
+                    let avail_w = (right_limit - self.text_input_rect.origin.x)
+                        .max(inset_x * 2.0)
+                        .max(1.0);
+                    let want_w = if adv_px > 0.0 {
                         (adv_px / sf + inset_x * 2.0).max(inset_x * 2.0)
                     } else {
                         MIN_W
                     };
+                    let new_w = want_w.min(avail_w);
                     // 高度按 Input 实际行盒计算，避免多行文字向下溢出编辑框：
                     // th_px 是字形包围盒高，对多行会低估行距（字形 < 行盒）。
                     // 注意：Input 实际行高是 1.5×字号（.line_height(relative(1.5))，
                     // 实测 range_to_bounds 的 lh = fs×1.5）。auto-grow 必须用 1.5×字号，
                     // 否则每行少算 0.1×字号（fs=24 时 2.4px），行数越多框越矮，文字在
                     // 框内相对下沉、多行越多越明显（单行无累积）。
-                    // auto_grow(1,8) → 框高度锁定在 1..8 行，超出 8 行 Input 内部滚动。
-                    let rows = value.matches('\n').count() + 1;
-                    let effective_rows = rows.clamp(1, 8);
+                    // 行数：显式 \n 与**自动折行**都由测量统一给出，且用的是与成图相同的
+                    // 折行宽度（框宽）—— 过去只数 `\n`，长文本折行后高度不变，文字被挤出
+                    // 框外，编辑器于是闪出滚动条（用户反馈的那条横条）。
+                    let rows = crate::overlay::commands::measure_wrapped_line_count(
+                        &value,
+                        fs,
+                        new_w * sf,
+                        weight,
+                    )
+                    .max(1);
                     let line_h = window.line_height().as_f32().max(fs / sf * 1.5);
+                    let effective_rows = rows.min(MAX_TEXT_ROWS);
                     // 高度 = 行数×行盒 + 上下内边距（对称、随字号）。
                     // 旧式 `+6+2+2+4`（顶部 spacer 6 + input_py×2 + 余量 4）是写死的，
                     // 小字号时框里空一大截 —— 用户反馈的"上下内边距太大"。
-                    let new_h = (effective_rows as f32 * line_h + inset_y * 2.0).max(min_h);
+                    // 上限：不越出截图区下边界（否则又多一处"超出截图区"）。
+                    let avail_h =
+                        (sel.origin.y + sel.size.y - self.text_input_rect.origin.y).max(min_h);
+                    let new_h = (effective_rows as f32 * line_h + inset_y * 2.0)
+                        .max(min_h)
+                        .min(avail_h);
                     let old_w = self.text_input_rect.size.x;
                     let old_h = self.text_input_rect.size.y;
                     self.text_input_rect.size = BoundsPoint::new(new_w, new_h);
-                    // 宽度**跟文字长度自适应**：只受屏幕约束，不再裁回截图框（selection）。
-                    //
-                    // 用选区当边界会把框压窄（`clamp_inside` 一旦触边就**先缩 size**），
-                    // 文字一长内容就溢出视口 —— gpui-base 的编辑器随即画出一条横向滚动条
-                    // （`scroll_area_size > container_size` 才会画，否则整条隐藏）。用户要求：
-                    // 输入/预览都不许出现底部滚动条，且文字框要跟着文字长。
-                    //
-                    // 改用 `clamp_keeping_size`：先把框整体挪回屏幕内（左/上），实在放不下
-                    // （比整屏还宽/高）才收缩 —— 只有那种极端情况才会重新出现滚动条。
-                    self.text_input_rect =
-                        self.text_input_rect.clamp_keeping_size(self.screen_bounds);
+                    // 位置兜底：整体留在截图区内。这里用 `clamp_keeping_size`（只挪位置、
+                    // **不缩尺寸**）而不是 `clamp_inside`（一触边就先缩 size）：宽高在上面
+                    // 已各自按截图区设了上限，这里再缩一次会把文字宽度压小、重新挤出视口，
+                    // 也就重新触发那条横向滚动条。
+                    self.text_input_rect = self.text_input_rect.clamp_keeping_size(sel);
                     if (old_w - new_w).abs() > 0.01 || (old_h - new_h).abs() > 0.01 {
                         tracing::info!(
-                            "textbox auto-grow: value={:?} fs={:.1} sf={:.1} th_px={:.1} adv_px={:.1} box=({:.1},{:.1})->({:.1},{:.1})",
-                            value, fs, sf, th_px, adv_px,
+                            "textbox auto-grow: value={:?} fs={:.1} sf={:.1} th_px={:.1} adv_px={:.1} rows={} avail_w={:.1} box=({:.1},{:.1})->({:.1},{:.1})",
+                            value, fs, sf, th_px, adv_px, rows, avail_w,
                             old_w, old_h, new_w, new_h,
                         );
                     }

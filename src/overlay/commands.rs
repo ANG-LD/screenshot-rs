@@ -305,6 +305,43 @@ pub fn measure_line_advance_px(
     })
 }
 
+/// 测量文字在 `max_width` 折行宽度下会排成**几行**。
+///
+/// 必须与 `rasterize_text` 用**完全相同**的 layout 参数（同字体/字重、行距 1.5×、
+/// `Buffer::set_size(Some(max_width))` 折行）：编辑态文字框的高度按行数增长，行数一旦
+/// 与成图不一致，用户就会看到"编辑时一行、成图两行"（或反之）。历史实现只按 `\n`
+/// 数行，长文本折行后高度不跟着长，文字被挤出框外 ⇒ 编辑器闪出滚动条。
+pub fn measure_wrapped_line_count(
+    content: &str,
+    font_size: f32,
+    max_width: f32,
+    weight: FontWeight,
+) -> usize {
+    if content.is_empty() || font_size <= 0.0 {
+        return 0;
+    }
+    // 宽度无效时退回"只数显式换行"
+    if max_width <= 0.0 {
+        return content.matches('\n').count() + 1;
+    }
+    let weight_attr = if weight == FontWeight::Normal {
+        Weight::NORMAL
+    } else {
+        Weight::BOLD
+    };
+    with_font_system(|font_system| {
+        let metrics = Metrics::new(font_size, font_size * 1.5);
+        let mut buffer = Buffer::new(font_system, metrics);
+        let attrs = Attrs::new()
+            .family(Family::Name(TEXT_FONT_FAMILY))
+            .weight(weight_attr);
+        buffer.set_text(content, &attrs, Shaping::Advanced, None);
+        buffer.set_size(Some(max_width), None);
+        buffer.shape_until_scroll(font_system, false);
+        buffer.layout_runs().count()
+    })
+}
+
 /// 把 commands 列表应用到 frame 的指定子区域
 ///
 /// - `frame` 是被裁剪到选区大小的 CapturedFrame
@@ -2511,6 +2548,30 @@ mod tests {
             (0..80).any(|col| f.pixels[(row * 80 + col) * 4] != 0)
         });
         assert!(bottom_written, "max_width=50 应迫使文字折多行，下半部分应有像素");
+    }
+
+    /// 宽度够 → 一行；宽度窄 → 折成多行（编辑态框高按它增长，必须与成图一致）
+    #[test]
+    fn wrapped_line_count_grows_as_width_shrinks() {
+        let text: String = "你好世界ABCDEFGHIJ".repeat(2);
+        let wide = measure_wrapped_line_count(&text, 24.0, 2000.0, FontWeight::Normal);
+        let narrow = measure_wrapped_line_count(&text, 24.0, 100.0, FontWeight::Normal);
+        assert_eq!(wide, 1, "够宽时应只有一行");
+        assert!(narrow > 1, "宽度 100 时应折成多行，实际 {narrow}");
+    }
+
+    #[test]
+    fn wrapped_line_count_counts_explicit_newlines() {
+        assert_eq!(
+            measure_wrapped_line_count("a\nb\nc", 24.0, 2000.0, FontWeight::Normal),
+            3
+        );
+        assert_eq!(measure_wrapped_line_count("", 24.0, 100.0, FontWeight::Normal), 0);
+        // 宽度无效时退回只数显式换行
+        assert_eq!(
+            measure_wrapped_line_count("a\nb", 24.0, 0.0, FontWeight::Normal),
+            2
+        );
     }
 
     #[test]
