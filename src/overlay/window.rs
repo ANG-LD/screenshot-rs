@@ -1232,10 +1232,15 @@ impl OverlayView {
     ) {
         let value = state.read(cx).value();
         if !value.is_empty() {
-            // 用当前 text_input_rect 的 origin 作 anchor、size.x 作 max_width。
-            // 用户可能拖动 / resize 过框，那时 anchor 已不是最初点击位置。
+            // anchor 用当前 text_input_rect 的 origin；**max_width 用编辑器实际可写宽度**
+            // 而不是框宽：预览（编辑器 soft_wrap）与成图必须同样折行，且成图是从
+            // `text_inset` 起画的，用框宽当折行宽会让文字往右溢出框外。
             let anchor = self.text_input_rect.origin;
-            let max_w = self.text_input_rect.size.x;
+            let fs_logical = text_fs_logical(self.toolbar.current_size, self.scale_factor);
+            let max_w = crate::overlay::commands::editor_text_width(
+                self.text_input_rect.size.x,
+                fs_logical,
+            );
             tracing::info!(
                 "finalize text: value={:?} anchor=({:.1},{:.1}) rect_size=({:.1},{:.1}) fs={:.1} sf={:.1}",
                 value.to_string(), anchor.x, anchor.y,
@@ -4923,7 +4928,13 @@ impl Render for OverlayView {
                         .max(inset_x * 2.0)
                         .max(1.0);
                     let want_w = if adv_px > 0.0 {
-                        (adv_px / sf + inset_x * 2.0).max(inset_x * 2.0)
+                        // 一行放得下所需的最小框宽：文字宽 + box 左内边距 + 编辑器自身
+                        // 左右内边距 + 右侧安全边距 + 余量。少算这部分就会出现"两个字被
+                        // 折成一行一个字"（用户反馈），因为编辑器能用的宽度比框宽小得多。
+                        crate::overlay::commands::text_box_width_for_line(
+                            adv_px / sf,
+                            fs_logical,
+                        )
                     } else {
                         MIN_W
                     };
@@ -4937,10 +4948,14 @@ impl Render for OverlayView {
                     // 行数：显式 \n 与**自动折行**都由测量统一给出，且用的是与成图相同的
                     // 折行宽度（框宽）—— 过去只数 `\n`，长文本折行后高度不变，文字被挤出
                     // 框外，编辑器于是闪出滚动条（用户反馈的那条横条）。
+                    // 行数：按**编辑器实际可写宽度**（edit_text_width）测量，显式 `\n` 与
+                    // 自动折行统一由它给出。用框宽算会少算行数 ⇒ 最后一行掉出框外。
+                    let measure_w =
+                        crate::overlay::commands::editor_text_width(new_w, fs_logical);
                     let rows = crate::overlay::commands::measure_wrapped_line_count(
                         &value,
                         fs,
-                        new_w * sf,
+                        measure_w * sf,
                         weight,
                     )
                     .max(1);

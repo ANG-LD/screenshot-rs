@@ -1315,6 +1315,33 @@ pub fn text_box_inset_x(font_size: f32) -> f32 {
     text_box_pad_x(font_size) + TEXT_INPUT_PAD_X
 }
 
+/// gpui-base 编辑器元素给光标预留的右安全边距（`input/base/element.rs` 的 `RIGHT_MARGIN`）。
+///
+/// 它直接从编辑器**可视宽度**里扣掉（`bounds.size.width - line_number_width - RIGHT_MARGIN`），
+/// 所以框宽必须把它算进去，否则一行文字会被提前折行。
+pub const EDITOR_RIGHT_MARGIN: f32 = 10.0;
+
+/// 为避免"刚好差半像素就折行"留的余量（框宽与行数测量都用同一份几何）。
+pub const TEXT_BOX_WIDTH_SAFETY: f32 = 4.0;
+
+/// 编辑器（Textarea）里文字**实际可用**的宽度（逻辑像素）。
+///
+/// 框宽依次扣掉：box 自身左内边距 → 编辑器自身左右内边距 → 右侧安全边距。
+/// 折行行数必须按这个宽度算（不是按框宽），否则行数会少算 —— 表现就是"两个字被拆成
+/// 一行一个字、第二个字掉到框外"（用户反馈）。
+pub fn editor_text_width(box_w: f32, font_size: f32) -> f32 {
+    (box_w - text_box_pad_x(font_size) - 2.0 * TEXT_INPUT_PAD_X - EDITOR_RIGHT_MARGIN)
+        .max(1.0)
+}
+
+/// 让**一行**宽 `adv` 的文字在编辑器里不折行所需的最小框宽（逻辑像素）。
+pub fn text_box_width_for_line(adv: f32, font_size: f32) -> f32 {
+    adv + text_box_pad_x(font_size)
+        + 2.0 * TEXT_INPUT_PAD_X
+        + EDITOR_RIGHT_MARGIN
+        + TEXT_BOX_WIDTH_SAFETY
+}
+
 /// 文字行盒顶距文本框顶的总缩进 = box 顶部 spacer + Input 自带垂直内边距。
 ///
 /// 与 [`text_box_inset_x`] 同理，编辑态/预览/成图三处必须一致：此前成图路径**没有**
@@ -2394,6 +2421,34 @@ mod tests {
     /// 那部分正是 box 那层内边距。化简后等价于 `text_box_inset_x(fs) > RIGHT_MARGIN`，
     /// `RIGHT_MARGIN` 是 gpui-base `input/base/element.rs` 里编辑器留出的右安全边距
     /// （上游默认 `px(10.)`，本项目过去的 10→2 补丁已不必要，见 [`TEXT_BOX_MIN_PAD_X`]）。
+    /// 一行文字必须能在编辑器里放下：框宽要覆盖 box 左内边距 + 编辑器自身左右内边距 +
+    /// 右侧安全边距。少算就会出现"两个字被折成一行一个字"（用户反馈）。
+    #[test]
+    fn text_box_width_fits_one_line_in_editor() {
+        for &fs in crate::overlay::toolbar::FONT_SIZES {
+            for chars in [1usize, 2, 4, 8] {
+                // CJK 行宽 ≈ 1em/字（实测 fs=24 时两个汉字 48px）
+                let adv = fs * chars as f32;
+                let box_w = text_box_width_for_line(adv, fs);
+                let usable = editor_text_width(box_w, fs);
+                assert!(
+                    usable >= adv,
+                    "fs={fs} {chars} 字：编辑器可写宽度 {usable} 必须 >= 文字宽 {adv}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editor_text_width_subtracts_editor_insets() {
+        let fs = 24.0;
+        let box_w = 200.0;
+        let expect = box_w - text_box_pad_x(fs) - 2.0 * TEXT_INPUT_PAD_X - EDITOR_RIGHT_MARGIN;
+        assert!((editor_text_width(box_w, fs) - expect).abs() < 0.01);
+        // 极窄框也必须返回正数：折行测量的 max_width=0 会被当成"不折行"
+        assert!(editor_text_width(1.0, fs) > 0.0);
+    }
+
     #[test]
     fn text_box_inset_x_covers_editor_right_margin() {
         /// gpui-base 编辑器元素的光标右安全边距。
